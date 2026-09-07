@@ -3,16 +3,14 @@
 import asyncio
 from logging.config import fileConfig
 
+from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-from alembic import context
 from app.core.config import get_settings
 from app.core.db import Base
-
-# Import every model module here so it registers on Base.metadata before autogenerate runs.
-# (populated as models land, starting phase 2 — see ARCHITECTURE.md #12)
+from app.models import *  # noqa: F401,F403 — registers every model on Base.metadata
 
 config = context.config
 if config.config_file_name is not None:
