@@ -65,6 +65,13 @@ class InsufficientRole(AppError):
     detail = "You don't have permission to do that."
 
 
+class MemberNotFound(AppError):
+    """Raised when the targeted user isn't a member of the workspace."""
+
+    status_code = 404
+    detail = "Member not found."
+
+
 class InvitationInvalid(AppError):
     """Raised for an invite token that's unknown, expired, already accepted, or wrong-email."""
 
