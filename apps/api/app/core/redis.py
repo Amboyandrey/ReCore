@@ -19,3 +19,9 @@ async def get_redis() -> AsyncGenerator[Redis]:
         yield client
     finally:
         await client.aclose()
+
+
+def new_redis_client() -> Redis:
+    """Return a Redis client bound to the shared pool — for code that isn't a request dependency,
+    like a background generation task that outlives the request that started it."""
+    return Redis(connection_pool=_pool)

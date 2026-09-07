@@ -105,3 +105,17 @@ class ModelNotFound(AppError):
 
     status_code = 404
     detail = "Model not found."
+
+
+class ConversationNotFound(AppError):
+    """Raised for a conversation that doesn't exist in the workspace."""
+
+    status_code = 404
+    detail = "Conversation not found."
+
+
+class GenerationNotFound(AppError):
+    """Raised when trying to resume or stop a generation that isn't running (or never existed)."""
+
+    status_code = 404
+    detail = "Generation not found."

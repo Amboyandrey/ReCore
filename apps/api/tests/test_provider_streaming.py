@@ -1,0 +1,182 @@
+"""Streaming for all three adapters, against canned SSE bodies shaped like each provider's real
+wire format. See test_provider_openai_compatible.py's module docstring for why MockTransport."""
+
+import httpx
+
+from app.providers.anthropic import AnthropicProvider
+from app.providers.base import ChatMessage, Done, StreamError, TextDelta, Usage
+from app.providers.google import GoogleProvider
+from app.providers.openai_compatible import OpenAICompatibleProvider
+
+
+def _sse(*lines: str) -> bytes:
+    """Join raw SSE data lines the way a real server would, blank-line-terminated."""
+    return ("\n\n".join(lines) + "\n\n").encode()
+
+
+MESSAGES = [ChatMessage(role="user", content="Hi there")]
+
+
+# ---------- OpenAI-compatible ----------
+
+
+async def test_openai_stream_yields_text_then_usage_then_done() -> None:
+    """A realistic OpenAI SSE body becomes TextDelta -> TextDelta -> Usage -> Done, in order."""
+    body = _sse(
+        'data: {"choices":[{"delta":{"content":"Hel"}}]}',
+        'data: {"choices":[{"delta":{"content":"lo"}}]}',
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+        '"usage":{"prompt_tokens":5,"completion_tokens":2}}',
+        "data: [DONE]",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    provider = OpenAICompatibleProvider(api_key="k", transport=httpx.MockTransport(handler))
+    chunks = [c async for c in provider.stream(model="gpt-5", messages=MESSAGES, max_tokens=100)]
+
+    assert chunks[0] == TextDelta(text="Hel")
+    assert chunks[1] == TextDelta(text="lo")
+    assert chunks[2] == Usage(input_tokens=5, output_tokens=2)
+    assert chunks[3] == Done(finish_reason="stop")
+
+
+async def test_openai_stream_reports_a_rejected_request() -> None:
+    """A 4xx response before any SSE body becomes a StreamError, not a crash."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, content=b'{"error":"invalid api key"}')
+
+    provider = OpenAICompatibleProvider(api_key="k", transport=httpx.MockTransport(handler))
+    chunks = [c async for c in provider.stream(model="gpt-5", messages=MESSAGES, max_tokens=100)]
+
+    assert len(chunks) == 1
+    assert isinstance(chunks[0], StreamError)
+    assert "401" in chunks[0].message
+
+
+# ---------- Anthropic ----------
+
+
+async def test_anthropic_stream_yields_text_then_usage_then_done() -> None:
+    """A realistic Anthropic SSE body — separate message_start/delta/stop events — parses correctly."""
+    body = _sse(
+        'data: {"type":"message_start","message":{"usage":{"input_tokens":8}}}',
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}',
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"!"}}',
+        'data: {"type":"content_block_stop","index":0}',
+        'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}',
+        'data: {"type":"message_stop"}',
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    provider = AnthropicProvider(api_key="k", transport=httpx.MockTransport(handler))
+    chunks = [
+        c async for c in provider.stream(model="claude-opus-5", messages=MESSAGES, max_tokens=100)
+    ]
+
+    assert [c for c in chunks if isinstance(c, TextDelta)] == [TextDelta(text="Hi"), TextDelta(text="!")]
+    assert Usage(input_tokens=8, output_tokens=3) in chunks
+    assert Done(finish_reason="end_turn") in chunks
+
+
+async def test_anthropic_stream_extracts_the_system_prompt() -> None:
+    """A system message is sent as Anthropic's top-level `system` field, not a messages turn."""
+    seen_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(200, content=_sse('data: {"type":"message_stop"}'))
+
+    provider = AnthropicProvider(api_key="k", transport=httpx.MockTransport(handler))
+    messages = [ChatMessage(role="system", content="Be terse."), ChatMessage(role="user", content="Hi")]
+    async for _ in provider.stream(model="claude-opus-5", messages=messages, max_tokens=50):
+        pass
+
+    import json
+
+    body = json.loads(seen_requests[0].content)
+    assert body["system"] == "Be terse."
+    assert body["messages"] == [{"role": "user", "content": "Hi"}]
+
+
+async def test_anthropic_stream_reports_an_error_event() -> None:
+    """An in-stream error event (as opposed to a rejected request) becomes a StreamError too."""
+    body = _sse('data: {"type":"error","error":{"message":"overloaded"}}')
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    provider = AnthropicProvider(api_key="k", transport=httpx.MockTransport(handler))
+    chunks = [
+        c async for c in provider.stream(model="claude-opus-5", messages=MESSAGES, max_tokens=100)
+    ]
+
+    assert chunks == [StreamError(message="overloaded")]
+
+
+# ---------- Google ----------
+
+
+async def test_google_stream_yields_text_then_usage_then_done() -> None:
+    """A realistic Gemini SSE body parses text out of candidates[].content.parts[].text."""
+    body = _sse(
+        'data: {"candidates":[{"content":{"parts":[{"text":"Hi"}],"role":"model"}}]}',
+        'data: {"candidates":[{"content":{"parts":[{"text":"!"}],"role":"model"},'
+        '"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":2}}',
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    provider = GoogleProvider(api_key="k", transport=httpx.MockTransport(handler))
+    chunks = [
+        c async for c in provider.stream(model="gemini-2.5-pro", messages=MESSAGES, max_tokens=100)
+    ]
+
+    assert [c for c in chunks if isinstance(c, TextDelta)] == [TextDelta(text="Hi"), TextDelta(text="!")]
+    assert Usage(input_tokens=4, output_tokens=2) in chunks
+    assert Done(finish_reason="STOP") in chunks
+
+
+async def test_google_stream_maps_assistant_role_to_model() -> None:
+    """Google calls the assistant's role "model", not "assistant", in conversation history."""
+    seen_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(200, content=_sse('data: {"candidates":[]}'))
+
+    provider = GoogleProvider(api_key="k", transport=httpx.MockTransport(handler))
+    messages = [
+        ChatMessage(role="user", content="Hi"),
+        ChatMessage(role="assistant", content="Hello"),
+        ChatMessage(role="user", content="How are you?"),
+    ]
+    async for _ in provider.stream(model="gemini-2.5-pro", messages=messages, max_tokens=50):
+        pass
+
+    import json
+
+    body = json.loads(seen_requests[0].content)
+    assert [c["role"] for c in body["contents"]] == ["user", "model", "user"]
+
+
+async def test_google_stream_reports_a_rejected_request() -> None:
+    """A 400 response (Google's shape for a bad key) becomes a StreamError, not a crash."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, content=b'{"error":{"message":"API key not valid"}}')
+
+    provider = GoogleProvider(api_key="k", transport=httpx.MockTransport(handler))
+    chunks = [
+        c async for c in provider.stream(model="gemini-2.5-pro", messages=MESSAGES, max_tokens=100)
+    ]
+
+    assert len(chunks) == 1
+    assert isinstance(chunks[0], StreamError)
+    assert "400" in chunks[0].message

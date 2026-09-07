@@ -12,7 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.core.redis as redis_module
-from app.core.db import engine
+from app.core.db import async_session_factory, engine
 from app.main import app
 
 API_ROOT = Path(__file__).resolve().parent.parent
@@ -40,7 +40,7 @@ async def _reset_state_after_test() -> AsyncGenerator[None]:
         await conn.execute(
             text(
                 "TRUNCATE TABLE users, workspaces, workspace_members, invitations, "
-                "provider_credentials, models CASCADE"
+                "provider_credentials, models, conversations, messages CASCADE"
             )
         )
     await engine.dispose()
@@ -71,6 +71,19 @@ async def db_session() -> AsyncGenerator[AsyncSession]:
         finally:
             await session.close()
             await trans.rollback()
+
+
+@pytest.fixture
+async def db() -> AsyncGenerator[AsyncSession]:
+    """Yield a genuinely committing session, like the app's own `get_db`.
+
+    Unlike `db_session`, nothing here is rolled back — use this (with the autouse TRUNCATE
+    above for cleanup) whenever the code under test opens a *separate* session of its own, e.g.
+    a background task, and needs to see rows this fixture wrote as truly committed. A row held
+    only in `db_session`'s uncommitted outer transaction is invisible to any other connection.
+    """
+    async with async_session_factory() as session:
+        yield session
 
 
 @pytest.fixture
