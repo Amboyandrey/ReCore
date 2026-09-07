@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.errors import InvitationInvalid
+from app.core.errors import InsufficientRole, InvitationInvalid
 from app.core.security import generate_token
 from app.models import Invitation, Role, User, WorkspaceMember
 
@@ -20,9 +20,21 @@ def _hash_token(token: str) -> str:
 
 
 async def create_invitation(
-    db: AsyncSession, *, workspace_id: uuid.UUID, invited_by: User, email: str, role: Role
+    db: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    invited_by: User,
+    acting_role: Role,
+    email: str,
+    role: Role,
 ) -> tuple[Invitation, str]:
-    """Create an invite and return it along with its plaintext token, visible this one time."""
+    """Create an invite and return it along with its plaintext token, visible this one time.
+
+    Only an owner may invite someone in *as* an owner — otherwise an admin could hand out full
+    control by inviting a colluding account, bypassing the same rule change_member_role enforces.
+    """
+    if role == Role.OWNER and acting_role != Role.OWNER:
+        raise InsufficientRole()
     token = generate_token()
     invitation = Invitation(
         workspace_id=workspace_id,

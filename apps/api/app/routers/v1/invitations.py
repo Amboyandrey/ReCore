@@ -45,7 +45,12 @@ async def create_invitation_route(
     if not allowed:
         raise RateLimited()
     invitation, token = await create_invitation(
-        db, workspace_id=ctx.workspace_id, invited_by=ctx.user, email=body.email, role=body.role
+        db,
+        workspace_id=ctx.workspace_id,
+        invited_by=ctx.user,
+        acting_role=ctx.role,
+        email=body.email,
+        role=body.role,
     )
     return InviteOut(
         id=invitation.id,

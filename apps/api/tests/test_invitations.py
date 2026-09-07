@@ -118,3 +118,24 @@ async def test_only_admins_can_invite(client: AsyncClient) -> None:
     )
 
     assert response.status_code == 403
+
+
+async def test_only_an_owner_can_invite_someone_as_owner(client: AsyncClient) -> None:
+    """An admin can't hand out full control by inviting a colluding account in as owner."""
+    workspace_id = await _owner_with_workspace(client)
+    invite = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/invitations",
+        json={"email": INVITEE["email"], "role": "admin"},
+    )
+    token = invite.json()["token"]
+    await client.post("/api/v1/auth/logout")
+    await client.post("/api/v1/auth/signup", json=INVITEE)
+    await client.post("/api/v1/auth/login", json=INVITEE)
+    await client.post(f"/api/v1/invitations/{token}/accept")
+
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/invitations",
+        json={"email": STRANGER["email"], "role": "owner"},
+    )
+
+    assert response.status_code == 403
