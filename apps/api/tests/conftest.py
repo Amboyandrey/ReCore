@@ -40,7 +40,7 @@ async def _reset_state_after_test() -> AsyncGenerator[None]:
         await conn.execute(
             text(
                 "TRUNCATE TABLE users, workspaces, workspace_members, invitations, "
-                "provider_credentials, models CASCADE"
+                "provider_credentials, models, conversations, messages CASCADE"
             )
         )
     await engine.dispose()
