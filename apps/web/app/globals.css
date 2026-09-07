@@ -1,0 +1,62 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #f7f8fb;
+  --surface: #ffffff;
+  --surface-sunk: #eef0f5;
+  --border: #e1e4eb;
+  --border-strong: #ccd1db;
+  --text: #14171f;
+  --text-soft: #4b5162;
+  --text-muted: #767d8c;
+  --accent: #3452e0;
+  --accent-soft: #e7ebfd;
+  --accent-contrast: #ffffff;
+  --success: #1a8754;
+  --warning: #b5790a;
+  --danger: #d1392b;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d0f15;
+    --surface: #151822;
+    --surface-sunk: #10121a;
+    --border: #232837;
+    --border-strong: #303650;
+    --text: #e8eaf2;
+    --text-soft: #b6bccb;
+    --text-muted: #838a9c;
+    --accent: #7d97ff;
+    --accent-soft: #1c2340;
+    --accent-contrast: #0d0f15;
+    --success: #52c98a;
+    --warning: #e0ac3f;
+    --danger: #f0685c;
+  }
+}
+
+/* Maps our tokens to Tailwind utilities (bg-bg, text-text-soft, border-border, etc). */
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-sunk: var(--surface-sunk);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-text: var(--text);
+  --color-text-soft: var(--text-soft);
+  --color-text-muted: var(--text-muted);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-accent-contrast: var(--accent-contrast);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --font-sans: var(--font-manrope);
+  --font-mono: var(--font-plex-mono);
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+}
