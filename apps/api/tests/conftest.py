@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from httpx import ASGITransport, AsyncClient
 from redis.asyncio import Redis
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.core.redis as redis_module
@@ -24,24 +25,30 @@ def apply_migrations() -> None:
 
 
 @pytest.fixture(autouse=True)
-async def _dispose_pools_after_test() -> AsyncGenerator[None]:
-    """Drop pooled Postgres and Redis connections after each test — pytest-asyncio gives every
-    test its own event loop, but both connection pools are module-level singletons, so a
-    connection left checked-in from this test's loop would otherwise be reused (and fail) in
-    the next one."""
+async def _reset_state_after_test() -> AsyncGenerator[None]:
+    """Reset everything a test could have touched. `db_session` is isolated by its own rolled-
+    back transaction, but a test that drives the app through `client` commits real rows via the
+    app's own `get_db` — so tables get truncated here too. Connection pools are also dropped:
+    pytest-asyncio gives every test its own event loop, but both pools are module-level
+    singletons, so a connection left checked-in from this test's loop would otherwise be reused
+    (and fail) in the next one."""
     yield
+    redis_client = Redis(connection_pool=redis_module._pool)
+    await redis_client.flushdb()
+    await redis_client.aclose()
+    async with engine.begin() as conn:
+        await conn.execute(text("TRUNCATE TABLE users"))
     await engine.dispose()
     await redis_module._pool.disconnect()
 
 
 @pytest.fixture
 async def redis_client() -> AsyncGenerator[Redis]:
-    """Yield a Redis client for the test, flushing the (dedicated test) database afterward."""
+    """Yield a Redis client bound to the app's own connection pool."""
     client = Redis(connection_pool=redis_module._pool)
     try:
         yield client
     finally:
-        await client.flushdb()
         await client.aclose()
 
 
