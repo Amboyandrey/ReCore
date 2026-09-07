@@ -23,7 +23,12 @@ from app.models import Conversation, LLMModel, Message, MessageRole, User
 from app.providers.base import ChatMessage, Done, LLMProvider, StreamError, TextDelta, Usage
 from app.providers.registry import build_provider
 from app.services.credentials import decrypt_credential_key, get_credential
-from app.services.generations import append_event, get_or_create_generation_id
+from app.services.generations import (
+    append_event,
+    clear_active_generation,
+    get_or_create_generation_id,
+    set_active_generation,
+)
 
 MAX_TOKENS = 4096
 TITLE_MAX_LENGTH = 60
@@ -159,6 +164,8 @@ async def send_message(
     api_key = decrypt_credential_key(credential)
     provider = build_provider(credential.provider, api_key=api_key, base_url=credential.base_url)
 
+    await set_active_generation(redis, conversation.id, generation_id)
+
     task = asyncio.create_task(
         _run_generation(
             generation_id,
@@ -248,6 +255,7 @@ async def _run_generation(
         await append_event(redis, generation_id, "error", {"message": error_message})
     else:
         await append_event(redis, generation_id, "done", {"finish_reason": finish_reason})
+    await clear_active_generation(redis, conversation_id)
 
     await pubsub.unsubscribe(f"gen:{generation_id}:stop")
     await pubsub.aclose()  # type: ignore[no-untyped-call]  # redis-py's stubs omit this method's types

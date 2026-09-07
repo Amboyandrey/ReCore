@@ -33,6 +33,13 @@ def _stop_channel(generation_id: str) -> str:
     return f"gen:{generation_id}:stop"
 
 
+def _active_key(conversation_id: uuid.UUID) -> str:
+    """Build the Redis key tracking which generation (if any) is currently running for a
+    conversation — so a freshly loaded page can discover a stream to resume after a reload,
+    when no in-memory state (like a Last-Event-ID) survives to ask for it directly."""
+    return f"conv:{conversation_id}:active_generation"
+
+
 @dataclass(frozen=True)
 class StreamEvent:
     """One entry read back from a generation's Redis stream."""
@@ -98,3 +105,19 @@ async def get_or_create_generation_id(redis: Redis, idempotency_key: str | None)
     existing_id = await redis.get(key)
     # decode_responses=True guarantees str here — redis-py's stubs just can't express that.
     return (str(existing_id) if existing_id else candidate_id), False
+
+
+async def set_active_generation(redis: Redis, conversation_id: uuid.UUID, generation_id: str) -> None:
+    """Record that a generation is now the one running for this conversation."""
+    await redis.set(_active_key(conversation_id), generation_id, ex=GENERATION_TTL_SECONDS)
+
+
+async def clear_active_generation(redis: Redis, conversation_id: uuid.UUID) -> None:
+    """Clear a conversation's active generation once it finishes, by any means."""
+    await redis.delete(_active_key(conversation_id))
+
+
+async def get_active_generation(redis: Redis, conversation_id: uuid.UUID) -> str | None:
+    """Return the generation currently running for a conversation, if any."""
+    value = await redis.get(_active_key(conversation_id))
+    return str(value) if value else None
