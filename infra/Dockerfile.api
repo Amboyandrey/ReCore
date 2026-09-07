@@ -1,0 +1,29 @@
+# Build context: apps/api (see infra/docker-compose.yml) — paths below are relative to it.
+
+FROM python:3.12-slim AS builder
+RUN pip install --no-cache-dir uv
+# Same path as the runtime stage's WORKDIR below — uv's console-script shebangs bake in an
+# absolute interpreter path at creation time, so the venv breaks if copied somewhere else.
+WORKDIR /app
+
+# Install dependencies before copying source so this layer only rebuilds when deps change.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+COPY app ./app
+
+FROM python:3.12-slim AS runtime
+RUN useradd --create-home --uid 1000 recore
+WORKDIR /app
+
+COPY --from=builder --chown=recore:recore /app/.venv /app/.venv
+COPY --from=builder --chown=recore:recore /app/app /app/app
+ENV PATH="/app/.venv/bin:$PATH"
+
+USER recore
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')" || exit 1
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
