@@ -24,17 +24,33 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def _set_session_cookie(response: Response, session_id: str) -> None:
-    """Attach the session cookie — httpOnly and, outside local dev, Secure — to the response."""
+def _set_auth_cookies(response: Response, session_id: str, csrf_token: str) -> None:
+    """Set the session cookie (httpOnly) and its paired CSRF cookie (readable by the frontend)."""
+    secure = settings.environment != "development"
     response.set_cookie(
         settings.session_cookie_name,
         session_id,
         max_age=settings.session_ttl_seconds,
         httponly=True,
-        secure=settings.environment != "development",
+        secure=secure,
         samesite="lax",
         path="/",
     )
+    response.set_cookie(
+        settings.csrf_cookie_name,
+        csrf_token,
+        max_age=settings.session_ttl_seconds,
+        httponly=False,
+        secure=secure,
+        samesite="lax",
+        path="/",
+    )
+
+
+def _clear_auth_cookies(response: Response) -> None:
+    """Clear both the session and CSRF cookies — used on logout."""
+    response.delete_cookie(settings.session_cookie_name, path="/")
+    response.delete_cookie(settings.csrf_cookie_name, path="/")
 
 
 @router.post("/signup", status_code=201, response_model=UserOut)
@@ -76,7 +92,7 @@ async def login_route(
             raise RateLimited()
     user = await authenticate(db, email=body.email, password=body.password)
     session_id, csrf_token = await start_session(redis, user)
-    _set_session_cookie(response, session_id)
+    _set_auth_cookies(response, session_id, csrf_token)
     return LoginResponse(user=UserOut.model_validate(user), csrf_token=csrf_token)
 
 
@@ -92,7 +108,7 @@ async def logout_route(
     session_id = request.cookies.get(settings.session_cookie_name)
     if session_id is not None:
         await end_session(redis, session_id)
-    response.delete_cookie(settings.session_cookie_name, path="/")
+    _clear_auth_cookies(response)
 
 
 @router.get("/me", response_model=UserOut)
