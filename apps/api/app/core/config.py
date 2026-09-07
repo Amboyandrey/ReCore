@@ -30,6 +30,17 @@ class Settings(BaseSettings):
     # Cookie name for the opaque session id issued at login
     session_cookie_name: str = "recore_session"
 
+    # Cookie name for the CSRF token — deliberately NOT httpOnly, so the frontend can read it
+    # and echo it back in a header (the "double submit cookie" pattern)
+    csrf_cookie_name: str = "recore_csrf"
+
+    # How long a session stays valid without activity (sliding — refreshed on every use)
+    session_ttl_seconds: int = 60 * 60 * 24 * 14
+
+    # Login/signup attempts allowed per window, per IP and per email, before a 429
+    auth_rate_limit_max: int = 5
+    auth_rate_limit_window_seconds: int = 300
+
 
 @lru_cache
 def get_settings() -> Settings:
