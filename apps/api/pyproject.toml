@@ -1,0 +1,54 @@
+[project]
+name = "recore-api"
+version = "0.1.0"
+description = "ReCore API — FastAPI backend for the multi-workspace LLM chat platform"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30",
+    "alembic>=1.14",
+    "redis>=5.2",
+    "argon2-cffi>=23.1",
+    "structlog>=24.4",
+    "httpx>=0.27",
+    "python-multipart>=0.0.12",
+    "orjson>=3.10",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.7",
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+]
+
+# This is an application, not a library — skip the build/install step uv
+# would otherwise require, since nothing ever imports `recore_api` as a package.
+[tool.uv]
+package = false
+
+[tool.ruff]
+# 110 gives the one-line module/function docstring convention (see ARCHITECTURE.md #13) room
+# without wrapping.
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+# B008: FastAPI's `Depends(...)` as an argument default is the framework's own idiom, not a bug.
+ignore = ["B008"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
