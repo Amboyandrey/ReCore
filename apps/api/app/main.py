@@ -8,7 +8,7 @@ from app.core.config import get_settings
 from app.core.errors import AppError
 from app.core.logging import configure_logging
 from app.core.middleware import request_context_middleware, security_headers_middleware
-from app.routers.v1 import auth, health
+from app.routers.v1 import auth, health, workspaces
 
 settings = get_settings()
 configure_logging(settings.debug)
@@ -28,6 +28,7 @@ app.add_middleware(
 
 app.include_router(health.router, prefix="/api/v1")
 app.include_router(auth.router, prefix="/api/v1")
+app.include_router(workspaces.router, prefix="/api/v1")
 
 
 @app.exception_handler(AppError)
