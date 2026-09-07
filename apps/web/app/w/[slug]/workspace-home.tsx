@@ -31,15 +31,15 @@ export function WorkspaceHome({ slug }: { slug: string }) {
       </p>
 
       <div className="mt-8 rounded-lg border border-border bg-surface p-6">
-        <p className="text-sm text-text-soft">
-          Chat is coming in a later phase. For now, manage who&apos;s here:
-        </p>
-        <Link
-          href={`/w/${workspace.slug}/settings/members`}
-          className="mt-3 inline-block text-sm text-accent"
-        >
-          Members &amp; invitations →
-        </Link>
+        <p className="text-sm text-text-soft">Chat is coming in a later phase. For now:</p>
+        <div className="mt-3 flex flex-col gap-2">
+          <Link href={`/w/${workspace.slug}/settings/members`} className="text-sm text-accent">
+            Members &amp; invitations →
+          </Link>
+          <Link href={`/w/${workspace.slug}/settings/providers`} className="text-sm text-accent">
+            LLM providers →
+          </Link>
+        </div>
       </div>
     </div>
   );
