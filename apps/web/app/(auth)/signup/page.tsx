@@ -20,7 +20,9 @@ export default function SignupPage() {
     setSubmitting(true);
     try {
       await signup(email, password);
-      router.push("/login?created=1");
+      const next = new URLSearchParams(window.location.search).get("next");
+      const target = next ? `/login?created=1&next=${encodeURIComponent(next)}` : "/login?created=1";
+      router.push(target);
     } catch (err) {
       setError(err instanceof AuthError ? err.message : "Something went wrong.");
     } finally {

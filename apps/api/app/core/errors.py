@@ -46,3 +46,41 @@ class RateLimited(AppError):
 
     status_code = 429
     detail = "Too many attempts. Please try again later."
+
+
+class WorkspaceNotFound(AppError):
+    """Raised for a workspace that doesn't exist, is deleted, or the caller isn't a member of.
+
+    404, not 403 — telling a non-member a workspace exists would itself leak information.
+    """
+
+    status_code = 404
+    detail = "Workspace not found."
+
+
+class InsufficientRole(AppError):
+    """Raised when the caller's role in the workspace doesn't meet what the action requires."""
+
+    status_code = 403
+    detail = "You don't have permission to do that."
+
+
+class MemberNotFound(AppError):
+    """Raised when the targeted user isn't a member of the workspace."""
+
+    status_code = 404
+    detail = "Member not found."
+
+
+class InvitationInvalid(AppError):
+    """Raised for an invite token that's unknown, expired, already accepted, or wrong-email."""
+
+    status_code = 400
+    detail = "This invitation is invalid or has expired."
+
+
+class LastOwnerError(AppError):
+    """Raised when an action would leave a workspace with no owner at all."""
+
+    status_code = 409
+    detail = "A workspace must always have at least one owner."

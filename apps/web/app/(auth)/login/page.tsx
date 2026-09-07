@@ -29,7 +29,8 @@ export default function LoginPage() {
     setSubmitting(true);
     try {
       await login(email, password);
-      router.push("/");
+      const next = new URLSearchParams(window.location.search).get("next");
+      router.push(next || "/");
     } catch (err) {
       setError(err instanceof AuthError ? err.message : "Something went wrong.");
     } finally {
