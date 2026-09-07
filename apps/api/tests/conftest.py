@@ -37,7 +37,12 @@ async def _reset_state_after_test() -> AsyncGenerator[None]:
     await redis_client.flushdb()
     await redis_client.aclose()
     async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE TABLE users, workspaces, workspace_members, invitations CASCADE"))
+        await conn.execute(
+            text(
+                "TRUNCATE TABLE users, workspaces, workspace_members, invitations, "
+                "provider_credentials, models CASCADE"
+            )
+        )
     await engine.dispose()
     await redis_module._pool.disconnect()
 

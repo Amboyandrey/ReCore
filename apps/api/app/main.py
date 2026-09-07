@@ -8,7 +8,7 @@ from app.core.config import get_settings
 from app.core.errors import AppError
 from app.core.logging import configure_logging
 from app.core.middleware import request_context_middleware, security_headers_middleware
-from app.routers.v1 import auth, health, invitations, members, workspaces
+from app.routers.v1 import auth, credentials, health, invitations, members, models, workspaces
 
 settings = get_settings()
 configure_logging(settings.debug)
@@ -32,6 +32,9 @@ app.include_router(workspaces.router, prefix="/api/v1")
 app.include_router(members.router, prefix="/api/v1")
 app.include_router(invitations.workspace_router, prefix="/api/v1")
 app.include_router(invitations.token_router, prefix="/api/v1")
+app.include_router(credentials.router, prefix="/api/v1")
+app.include_router(models.credentials_router, prefix="/api/v1")
+app.include_router(models.models_router, prefix="/api/v1")
 
 
 @app.exception_handler(AppError)

@@ -84,3 +84,24 @@ class LastOwnerError(AppError):
 
     status_code = 409
     detail = "A workspace must always have at least one owner."
+
+
+class CredentialNotFound(AppError):
+    """Raised for a provider credential that doesn't exist in the workspace."""
+
+    status_code = 404
+    detail = "Credential not found."
+
+
+class CredentialValidationFailed(AppError):
+    """Raised when a provider rejects a key at registration time — it's never stored unvalidated."""
+
+    status_code = 422
+    detail = "The provider rejected this key."
+
+
+class ModelNotFound(AppError):
+    """Raised for an enabled model that doesn't exist in the workspace."""
+
+    status_code = 404
+    detail = "Model not found."
