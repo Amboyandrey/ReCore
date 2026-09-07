@@ -7,8 +7,10 @@ from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import app.core.redis as redis_module
 from app.core.db import engine
 from app.main import app
 
@@ -22,12 +24,25 @@ def apply_migrations() -> None:
 
 
 @pytest.fixture(autouse=True)
-async def _dispose_engine_after_test() -> AsyncGenerator[None]:
-    """Drop pooled connections after each test — pytest-asyncio gives every test its own event
-    loop, but the app's connection pool is a module-level singleton, so a connection left
-    checked-in from this test's loop would otherwise be reused (and fail) in the next one."""
+async def _dispose_pools_after_test() -> AsyncGenerator[None]:
+    """Drop pooled Postgres and Redis connections after each test — pytest-asyncio gives every
+    test its own event loop, but both connection pools are module-level singletons, so a
+    connection left checked-in from this test's loop would otherwise be reused (and fail) in
+    the next one."""
     yield
     await engine.dispose()
+    await redis_module._pool.disconnect()
+
+
+@pytest.fixture
+async def redis_client() -> AsyncGenerator[Redis]:
+    """Yield a Redis client for the test, flushing the (dedicated test) database afterward."""
+    client = Redis(connection_pool=redis_module._pool)
+    try:
+        yield client
+    finally:
+        await client.flushdb()
+        await client.aclose()
 
 
 @pytest.fixture
