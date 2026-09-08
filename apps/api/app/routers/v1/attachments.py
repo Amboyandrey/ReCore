@@ -27,7 +27,9 @@ async def upload_attachment_route(
     db: AsyncSession = Depends(get_db),
 ) -> AttachmentOut:
     """Upload a file into a conversation — 404s entirely while the `attachments` flag is off."""
-    await get_conversation(db, workspace_id=ctx.workspace_id, conversation_id=conversation_id)
+    await get_conversation(
+        db, workspace_id=ctx.workspace_id, conversation_id=conversation_id, viewer_id=ctx.user.id
+    )
     data = await file.read()
     attachment = await save_attachment(
         db,
@@ -48,6 +50,8 @@ async def list_attachments_route(
     db: AsyncSession = Depends(get_db),
 ) -> list[AttachmentOut]:
     """List every attachment uploaded into a conversation."""
-    await get_conversation(db, workspace_id=ctx.workspace_id, conversation_id=conversation_id)
+    await get_conversation(
+        db, workspace_id=ctx.workspace_id, conversation_id=conversation_id, viewer_id=ctx.user.id
+    )
     attachments = await list_attachments(db, conversation_id=conversation_id)
     return [AttachmentOut.model_validate(a, from_attributes=True) for a in attachments]

@@ -347,6 +347,105 @@ async def test_non_member_cannot_send_messages(client: AsyncClient) -> None:
     assert response.status_code == 404
 
 
+async def test_a_private_conversation_is_hidden_from_teammates_until_shared(
+    client: AsyncClient,
+) -> None:
+    """Full round trip: a fellow workspace member can't see or list a conversation they weren't
+    invited into, but can once its owner flips the sharing flag on."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    conversation_id = (
+        await client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id}
+        )
+    ).json()["id"]
+    invite = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/invitations",
+        json={"email": MEMBER["email"], "role": "member"},
+    )
+    token = invite.json()["token"]
+    await client.post("/api/v1/auth/logout")
+    await client.post("/api/v1/auth/signup", json=MEMBER)
+    await client.post("/api/v1/auth/login", json=MEMBER)
+    await client.post(f"/api/v1/invitations/{token}/accept")
+
+    hidden = await client.get(f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}")
+    listed = await client.get(f"/api/v1/workspaces/{workspace_id}/conversations")
+    assert hidden.status_code == 404
+    assert listed.json() == []
+
+    await client.post("/api/v1/auth/logout")
+    await client.post("/api/v1/auth/login", json=OWNER)
+    shared = await client.patch(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}", json={"shared": True}
+    )
+    assert shared.status_code == 200
+    assert shared.json()["shared"] is True
+
+    await client.post("/api/v1/auth/logout")
+    await client.post("/api/v1/auth/login", json=MEMBER)
+    now_visible = await client.get(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}"
+    )
+    listed_again = await client.get(f"/api/v1/workspaces/{workspace_id}/conversations")
+    assert now_visible.status_code == 200
+    assert conversation_id in {c["id"] for c in listed_again.json()}
+
+
+async def test_a_private_conversation_cannot_be_shared_by_a_non_owner(client: AsyncClient) -> None:
+    """A teammate can't even attempt to share a conversation that's still private to someone
+    else — there's nothing to be refused permission on, so it 404s, not 403s."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    conversation_id = (
+        await client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id}
+        )
+    ).json()["id"]
+    invite = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/invitations",
+        json={"email": MEMBER["email"], "role": "admin"},
+    )
+    token = invite.json()["token"]
+    await client.post("/api/v1/auth/logout")
+    await client.post("/api/v1/auth/signup", json=MEMBER)
+    await client.post("/api/v1/auth/login", json=MEMBER)
+    await client.post(f"/api/v1/invitations/{token}/accept")
+
+    response = await client.patch(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}", json={"shared": True}
+    )
+
+    assert response.status_code == 404
+
+
+async def test_a_non_owner_cannot_unshare_a_shared_conversation(client: AsyncClient) -> None:
+    """Once shared, a teammate can see and use the conversation — but can't revoke that access
+    for everyone else by unsharing it. Only its owner controls that flag."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    conversation_id = (
+        await client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id}
+        )
+    ).json()["id"]
+    await client.patch(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}", json={"shared": True}
+    )
+    invite = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/invitations",
+        json={"email": MEMBER["email"], "role": "member"},
+    )
+    token = invite.json()["token"]
+    await client.post("/api/v1/auth/logout")
+    await client.post("/api/v1/auth/signup", json=MEMBER)
+    await client.post("/api/v1/auth/login", json=MEMBER)
+    await client.post(f"/api/v1/invitations/{token}/accept")
+
+    response = await client.patch(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}", json={"shared": False}
+    )
+
+    assert response.status_code == 403
+
+
 async def test_sending_is_blocked_while_the_model_s_provider_is_disabled(
     client: AsyncClient, db: AsyncSession, redis_client: Redis
 ) -> None:

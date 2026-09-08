@@ -1,10 +1,9 @@
 "use client";
 
-import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import { useRequireAuth } from "@/lib/auth-context";
-import { AttachmentError, uploadAttachment, type Attachment } from "@/lib/attachment-client";
+import { AttachmentError, listAttachments, uploadAttachment, type Attachment } from "@/lib/attachment-client";
 import {
   ChatError,
   deleteConversation,
@@ -15,24 +14,28 @@ import {
   resumeGeneration,
   sendMessage,
   stopGeneration,
-  updateConversationModel,
+  updateConversation,
   type Conversation,
   type Message,
 } from "@/lib/chat-client";
 import { setLastModelId } from "@/lib/last-model";
+import { takePendingFirstMessage } from "@/lib/pending-first-message";
 import { listModels, type EnabledModel } from "@/lib/provider-client";
 import { useWorkspaceFlags } from "@/lib/use-workspace-flags";
 import { useWorkspaceBySlug } from "@/lib/workspace-context";
+import { ConversationSidebar } from "@/components/conversation-sidebar";
+import { PendingAttachmentChips, SentAttachmentChips, hasBlockedImage } from "@/components/attachment-chips";
 
-// What each attachment's chip shows next to its filename — silence here is exactly how the last
-// three attachment bugs went unnoticed for as long as they did.
-const EXTRACT_STATUS_LABEL: Record<Attachment["extract_status"], string> = {
-  pending: "processing…",
-  done: "text extracted",
-  passthrough: "sent as image",
-  unsupported: "format not supported",
-  failed: "couldn't be read",
-};
+// Groups a conversation's attachments by the message they were sent with — what lets a message
+// already sitting in history show it had a file attached, not just the composer at send time.
+function groupByMessageId(attachments: Attachment[]): Record<string, Attachment[]> {
+  const grouped: Record<string, Attachment[]> = {};
+  for (const attachment of attachments) {
+    if (!attachment.message_id) continue;
+    (grouped[attachment.message_id] ??= []).push(attachment);
+  }
+  return grouped;
+}
 
 // A locally-synthesized user turn shown the instant it's sent, before the server confirms it —
 // swapped for the real persisted list once the reply finishes.
@@ -51,7 +54,7 @@ function pendingUserMessage(content: string): Message {
 }
 
 export function ChatThread({ slug, conversationId }: { slug: string; conversationId: string }) {
-  const { loading: authLoading } = useRequireAuth();
+  const { user, loading: authLoading } = useRequireAuth();
   const { workspace, loading: wsLoading } = useWorkspaceBySlug(slug);
   const { flags } = useWorkspaceFlags(workspace?.id);
   const router = useRouter();
@@ -69,13 +72,62 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
   const [activeGenerationId, setActiveGenerationId] = useState<string | null>(null);
   const [pendingAttachments, setPendingAttachments] = useState<Attachment[]>([]);
   const [uploading, setUploading] = useState(false);
+  // Every attachment in this conversation, keyed by the message it was sent with — so a message
+  // already in history can show it had a file attached, not just the composer at send time.
+  const [attachmentsByMessageId, setAttachmentsByMessageId] = useState<Record<string, Attachment[]>>(
+    {}
+  );
   // The workspace's enabled models — for the model switcher, and to look up whether the current
   // one accepts images (Conversation only carries a model_id, not the model's own fields).
   const [models, setModels] = useState<EnabledModel[]>([]);
   const [modelSupportsVision, setModelSupportsVision] = useState(false);
   const [switchingModel, setSwitchingModel] = useState(false);
+  const [togglingShared, setTogglingShared] = useState(false);
 
   const bottomRef = useRef<HTMLDivElement>(null);
+
+  // The actual send, independent of the composer form — also how a draft chat's first message
+  // (queued by the c/new page before it navigated here, see lib/pending-first-message.ts) gets
+  // sent the instant this page mounts, without the user having to retype or re-click anything.
+  // Wrapped in useCallback (stable as long as workspace/conversationId don't change) so the load
+  // effect below can call it without either re-running on every render or lying about its deps.
+  const sendChat = useCallback(
+    async (content: string, attachmentIds: string[]) => {
+      if (!workspace) return;
+      setSending(true);
+      setStreamingText("");
+      setError(null);
+      setMessages((prev) => [...prev, pendingUserMessage(content)]);
+
+      // Best-effort: grab the generation id shortly after starting, so Stop has something to call.
+      getActiveGeneration(workspace.id, conversationId).then((id) => id && setActiveGenerationId(id));
+
+      try {
+        for await (const evt of sendMessage(
+          workspace.id,
+          conversationId,
+          content,
+          undefined,
+          attachmentIds
+        )) {
+          if (evt.event === "delta") setStreamingText((prev) => prev + evt.data.text);
+        }
+      } catch (err) {
+        setError(err instanceof ChatError ? err.message : "Something went wrong.");
+      } finally {
+        const [msgs, attachments] = await Promise.all([
+          listMessages(workspace.id, conversationId),
+          attachmentsEnabled ? listAttachments(workspace.id, conversationId) : Promise.resolve([]),
+        ]);
+        setMessages(msgs);
+        setAttachmentsByMessageId(groupByMessageId(attachments));
+        setStreamingText("");
+        setActiveGenerationId(null);
+        setSending(false);
+      }
+    },
+    [workspace, conversationId, attachmentsEnabled]
+  );
 
   // Initial load, then — the only way a page reload can discover a reply was mid-stream — check
   // for and resume an in-flight generation. Every setState here happens strictly after an
@@ -87,22 +139,34 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     async function load() {
       if (!workspace) return;
       try {
-        const [conv, convs, msgs, activeId, fetchedModels] = await Promise.all([
+        const [conv, convs, msgs, activeId, fetchedModels, attachments] = await Promise.all([
           getConversation(workspace.id, conversationId),
           listConversations(workspace.id),
           listMessages(workspace.id, conversationId),
           getActiveGeneration(workspace.id, conversationId),
           listModels(workspace.id),
+          attachmentsEnabled ? listAttachments(workspace.id, conversationId) : Promise.resolve([]),
         ]);
         if (cancelled) return;
         setConversation(conv);
         setSiblings(convs);
         setMessages(msgs);
+        setAttachmentsByMessageId(groupByMessageId(attachments));
         setModels(fetchedModels);
         setModelSupportsVision(
           fetchedModels.find((m) => m.id === conv.model_id)?.supports_vision ?? false
         );
         setLoadingData(false);
+
+        // A draft chat's first message, queued by c/new right before it navigated here (see
+        // lib/pending-first-message.ts) — sent now, the instant this conversation actually
+        // exists, rather than making the user retype or re-click Send.
+        const pending = takePendingFirstMessage(conversationId);
+        if (pending) {
+          if (cancelled) return;
+          await sendChat(pending.content, pending.attachmentIds);
+          return;
+        }
 
         if (activeId) {
           setActiveGenerationId(activeId);
@@ -125,7 +189,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     return () => {
       cancelled = true;
     };
-  }, [workspace, conversationId]);
+  }, [workspace, conversationId, sendChat, attachmentsEnabled]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -133,33 +197,13 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
 
   async function handleSend(e: FormEvent) {
     e.preventDefault();
-    const blockedImage =
-      !modelSupportsVision && pendingAttachments.some((a) => a.extract_status === "passthrough");
-    if (!workspace || !input.trim() || sending || blockedImage) return;
+    if (!workspace || !input.trim() || sending || hasBlockedImage(pendingAttachments, modelSupportsVision))
+      return;
     const content = input;
     const attachmentIds = pendingAttachments.map((a) => a.id);
     setInput("");
     setPendingAttachments([]);
-    setSending(true);
-    setStreamingText("");
-    setError(null);
-    setMessages((prev) => [...prev, pendingUserMessage(content)]);
-
-    // Best-effort: grab the generation id shortly after starting, so Stop has something to call.
-    getActiveGeneration(workspace.id, conversationId).then((id) => id && setActiveGenerationId(id));
-
-    try {
-      for await (const evt of sendMessage(workspace.id, conversationId, content, undefined, attachmentIds)) {
-        if (evt.event === "delta") setStreamingText((prev) => prev + evt.data.text);
-      }
-    } catch (err) {
-      setError(err instanceof ChatError ? err.message : "Something went wrong.");
-    } finally {
-      setMessages(await listMessages(workspace.id, conversationId));
-      setStreamingText("");
-      setActiveGenerationId(null);
-      setSending(false);
-    }
+    await sendChat(content, attachmentIds);
   }
 
   async function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
@@ -216,7 +260,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     setSwitchingModel(true);
     setError(null);
     try {
-      const updated = await updateConversationModel(workspace.id, conversationId, modelId);
+      const updated = await updateConversation(workspace.id, conversationId, { model_id: modelId });
       setConversation(updated);
       setModelSupportsVision(models.find((m) => m.id === modelId)?.supports_vision ?? false);
       setLastModelId(workspace.id, modelId);
@@ -224,6 +268,21 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
       setError(err instanceof ChatError ? err.message : "Something went wrong.");
     } finally {
       setSwitchingModel(false);
+    }
+  }
+
+  // Only the conversation's owner may share or unshare it — enforced server-side too; this just
+  // keeps the UI from offering a control that would 403.
+  async function handleToggleShared(shared: boolean) {
+    if (!workspace) return;
+    setTogglingShared(true);
+    setError(null);
+    try {
+      setConversation(await updateConversation(workspace.id, conversationId, { shared }));
+    } catch (err) {
+      setError(err instanceof ChatError ? err.message : "Something went wrong.");
+    } finally {
+      setTogglingShared(false);
     }
   }
 
@@ -238,78 +297,64 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     );
   }
 
-  const hasBlockedImage =
-    !modelSupportsVision && pendingAttachments.some((a) => a.extract_status === "passthrough");
+  const blockedImage = hasBlockedImage(pendingAttachments, modelSupportsVision);
+
+  const isOwner = conversation.user_id === user?.id;
 
   return (
     <div className="mx-auto flex max-w-5xl gap-6 px-6 py-8">
-      <aside className="hidden w-56 shrink-0 sm:block">
-        <Link
-          href={`/w/${slug}/c/new`}
-          className="block rounded-md border border-border px-3 py-2 text-center text-sm text-accent"
-        >
-          + New chat
-        </Link>
-        <ul className="mt-4 flex flex-col gap-1">
-          {siblings.map((c) => (
-            <li key={c.id} className="group relative">
-              <Link
-                href={`/w/${slug}/c/${c.id}`}
-                className={`block truncate rounded-md py-1.5 pl-2 pr-7 text-sm ${
-                  c.id === conversationId
-                    ? "bg-surface-sunk text-text"
-                    : "text-text-soft hover:bg-surface-sunk"
-                }`}
-              >
-                {c.title}
-              </Link>
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.preventDefault();
-                  handleDeleteConversation(c.id);
-                }}
-                aria-label={`Delete ${c.title}`}
-                title="Delete conversation"
-                className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-1 text-text-muted opacity-0 hover:text-danger group-hover:opacity-100"
-              >
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  viewBox="0 0 20 20"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.5"
-                  className="h-3.5 w-3.5"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    d="M4.5 5.5h11m-9 0v-1.25A1.25 1.25 0 0 1 7.75 3h4.5a1.25 1.25 0 0 1 1.25 1.25V5.5m1.75 0-.6 9.6A1.5 1.5 0 0 1 13.15 16.5h-6.3a1.5 1.5 0 0 1-1.5-1.4l-.6-9.6"
-                  />
-                </svg>
-              </button>
-            </li>
-          ))}
-        </ul>
-      </aside>
+      <ConversationSidebar
+        slug={slug}
+        currentUserId={user?.id}
+        activeConversationId={conversationId}
+        conversations={siblings}
+        onDelete={handleDeleteConversation}
+      />
 
       <div className="flex min-h-[70vh] flex-1 flex-col">
         <div className="flex items-center justify-between gap-3">
           <h1 className="truncate text-lg font-semibold text-text">{conversation.title}</h1>
-          {models.length > 0 && (
-            <select
-              value={conversation.model_id}
-              onChange={(e) => handleModelChange(e.target.value)}
-              disabled={switchingModel || sending}
-              className="shrink-0 rounded-md border border-border bg-surface px-2 py-1 text-xs text-text-soft outline-none focus:border-accent disabled:opacity-60"
-            >
-              {models.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.display_name}
-                </option>
-              ))}
-            </select>
-          )}
+          <div className="flex shrink-0 items-center gap-2">
+            {isOwner ? (
+              <button
+                type="button"
+                onClick={() => handleToggleShared(!conversation.shared)}
+                disabled={togglingShared}
+                title={
+                  conversation.shared
+                    ? "Visible to the whole workspace — click to make private"
+                    : "Private to you — click to share with the workspace"
+                }
+                className={`rounded-md border px-2 py-1 text-xs disabled:opacity-60 ${
+                  conversation.shared
+                    ? "border-accent/40 bg-accent/10 text-accent"
+                    : "border-border text-text-soft hover:border-border-strong"
+                }`}
+              >
+                {conversation.shared ? "Shared" : "Private"}
+              </button>
+            ) : (
+              conversation.shared && (
+                <span className="rounded-md border border-accent/40 bg-accent/10 px-2 py-1 text-xs text-accent">
+                  Shared with you
+                </span>
+              )
+            )}
+            {models.length > 0 && (
+              <select
+                value={conversation.model_id}
+                onChange={(e) => handleModelChange(e.target.value)}
+                disabled={switchingModel || sending}
+                className="rounded-md border border-border bg-surface px-2 py-1 text-xs text-text-soft outline-none focus:border-accent disabled:opacity-60"
+              >
+                {models.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.display_name}
+                  </option>
+                ))}
+              </select>
+            )}
+          </div>
         </div>
 
         {error && (
@@ -320,7 +365,10 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
 
         <div className="mt-4 flex-1 space-y-4 overflow-y-auto">
           {messages.map((m) => (
-            <div key={m.id} className={m.role === "user" ? "flex justify-end" : "flex justify-start"}>
+            <div
+              key={m.id}
+              className={`flex flex-col ${m.role === "user" ? "items-end" : "items-start"}`}
+            >
               <div
                 className={`max-w-[75%] whitespace-pre-wrap rounded-lg px-3 py-2 text-sm ${
                   m.role === "user"
@@ -331,6 +379,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
                 {m.content}
                 {m.error && <p className="mt-1 text-xs text-danger">{m.error}</p>}
               </div>
+              <SentAttachmentChips attachments={attachmentsByMessageId[m.id] ?? []} />
             </div>
           ))}
           {streamingText && (
@@ -344,38 +393,15 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
           <div ref={bottomRef} />
         </div>
 
-        {attachmentsEnabled && pendingAttachments.length > 0 && (
-          <ul className="mt-4 flex flex-wrap gap-2">
-            {pendingAttachments.map((a) => {
-              const blocked = a.extract_status === "passthrough" && !modelSupportsVision;
-              return (
-                <li
-                  key={a.id}
-                  className={`flex items-center gap-2 rounded-full border px-3 py-1 text-xs ${
-                    blocked || a.extract_status === "failed" || a.extract_status === "unsupported"
-                      ? "border-danger/40 bg-danger/10 text-danger"
-                      : "border-border bg-surface text-text-soft"
-                  }`}
-                >
-                  <span className="max-w-[12rem] truncate">{a.original_filename}</span>
-                  <span className="text-[0.65rem] uppercase tracking-wide opacity-80">
-                    {blocked ? "model can't read images" : EXTRACT_STATUS_LABEL[a.extract_status]}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => handleRemoveAttachment(a.id)}
-                    className="text-text-muted hover:text-danger"
-                    aria-label={`Remove ${a.original_filename}`}
-                  >
-                    ×
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
+        {attachmentsEnabled && (
+          <PendingAttachmentChips
+            attachments={pendingAttachments}
+            modelSupportsVision={modelSupportsVision}
+            onRemove={handleRemoveAttachment}
+          />
         )}
 
-        {hasBlockedImage && (
+        {blockedImage && (
           <p className="mt-2 text-xs text-danger">
             This model can&apos;t read images. Remove the image or switch to a vision-capable model.
           </p>
@@ -407,7 +433,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
           ) : (
             <button
               type="submit"
-              disabled={sending || !input.trim() || hasBlockedImage}
+              disabled={sending || !input.trim() || blockedImage}
               className="rounded-md bg-accent px-3 py-2 text-sm font-medium text-accent-contrast disabled:opacity-60"
             >
               Send

@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.db import async_session_factory, set_workspace_scope
 from app.core.errors import (
     ConversationNotFound,
+    InsufficientRole,
     ModelDoesNotSupportImages,
     ModelNotFound,
     ProviderDisabled,
@@ -107,21 +108,41 @@ async def create_conversation(
     return conversation
 
 
-async def update_conversation_model(
-    db: AsyncSession, *, workspace_id: uuid.UUID, conversation_id: uuid.UUID, model_id: uuid.UUID
+async def update_conversation(
+    db: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    viewer_id: uuid.UUID,
+    model_id: uuid.UUID | None = None,
+    shared: bool | None = None,
 ) -> Conversation:
-    """Switch a conversation to a different one of the workspace's enabled models — mid-session,
-    not just at the start. Already-sent history isn't rewritten or resent to the new model; only
-    the turn that follows the switch goes to it, same as a human switching who they're talking to
-    mid-conversation doesn't hand the new person a transcript unless asked.
+    """Change a conversation's model and/or its sharing state — only the fields actually passed.
+
+    Switching models is mid-session, not just at the start: already-sent history isn't rewritten
+    or resent to the new model, only the turn that follows the switch goes to it, same as a human
+    switching who they're talking to mid-conversation doesn't hand the new person a transcript
+    unless asked. Available to anyone who can already see this conversation (its owner, or anyone
+    it's been shared with) — same as sending a message into it always has been.
+
+    Sharing is different: only the owner may flip it, in either direction. Letting anyone who can
+    already see a shared conversation also un-share (or re-share) it would make "shared" a
+    one-way ratchet nobody but the very first sharer could undo.
     """
-    conversation = await get_conversation(db, workspace_id=workspace_id, conversation_id=conversation_id)
-    model = await db.scalar(
-        select(LLMModel).where(LLMModel.id == model_id, LLMModel.workspace_id == workspace_id)
+    conversation = await get_conversation(
+        db, workspace_id=workspace_id, conversation_id=conversation_id, viewer_id=viewer_id
     )
-    if model is None:
-        raise ModelNotFound()
-    conversation.model_id = model_id
+    if shared is not None and conversation.user_id != viewer_id:
+        raise InsufficientRole()
+    if model_id is not None:
+        model = await db.scalar(
+            select(LLMModel).where(LLMModel.id == model_id, LLMModel.workspace_id == workspace_id)
+        )
+        if model is None:
+            raise ModelNotFound()
+        conversation.model_id = model_id
+    if shared is not None:
+        conversation.shared = shared
     await db.flush()
     # `updated_at`'s onupdate=func.now() runs server-side, so the flush above leaves that
     # attribute expired rather than populated — the route below serializes this object
@@ -133,37 +154,56 @@ async def update_conversation_model(
 
 
 async def delete_conversation(
-    db: AsyncSession, *, workspace_id: uuid.UUID, conversation_id: uuid.UUID
+    db: AsyncSession, *, workspace_id: uuid.UUID, conversation_id: uuid.UUID, viewer_id: uuid.UUID
 ) -> None:
     """Permanently remove a conversation — its messages, attachments, and usage-event history all
     cascade-delete with it (see each model's ondelete="CASCADE" foreign key). There's no undo and
     no soft-delete here, unlike Workspace: a chat thread has no membership or billing of its own
-    to keep around after it's gone, just the history a deleted conversation asks to forget too."""
-    conversation = await get_conversation(db, workspace_id=workspace_id, conversation_id=conversation_id)
+    to keep around after it's gone, just the history a deleted conversation asks to forget too.
+
+    Owner-only, even once shared: a collaborator who can see and chat in a shared conversation
+    still shouldn't be able to delete it out from under whoever started it.
+    """
+    conversation = await get_conversation(
+        db, workspace_id=workspace_id, conversation_id=conversation_id, viewer_id=viewer_id
+    )
+    if conversation.user_id != viewer_id:
+        raise InsufficientRole()
     await db.delete(conversation)
     await db.flush()
 
 
-async def list_conversations(db: AsyncSession, *, workspace_id: uuid.UUID) -> list[Conversation]:
-    """List a workspace's conversations, most recently active first."""
+async def list_conversations(
+    db: AsyncSession, *, workspace_id: uuid.UUID, viewer_id: uuid.UUID
+) -> list[Conversation]:
+    """List every conversation in the workspace this viewer is allowed to see: their own, plus
+    anyone else's that's been explicitly shared — most recently active first."""
     stmt = (
         select(Conversation)
-        .where(Conversation.workspace_id == workspace_id)
+        .where(
+            Conversation.workspace_id == workspace_id,
+            (Conversation.user_id == viewer_id) | (Conversation.shared.is_(True)),
+        )
         .order_by(Conversation.updated_at.desc())
     )
     return list((await db.scalars(stmt)).all())
 
 
 async def get_conversation(
-    db: AsyncSession, *, workspace_id: uuid.UUID, conversation_id: uuid.UUID
+    db: AsyncSession, *, workspace_id: uuid.UUID, conversation_id: uuid.UUID, viewer_id: uuid.UUID
 ) -> Conversation:
-    """Load one conversation by id, scoped to its workspace, or raise if it isn't there."""
+    """Load one conversation by id, scoped to its workspace — or raise if it isn't there, *or* if
+    it is but is private to someone else. Both cases raise the same "not found": whether a
+    private conversation exists at all isn't this viewer's business either.
+    """
     conversation = await db.scalar(
         select(Conversation).where(
             Conversation.id == conversation_id, Conversation.workspace_id == workspace_id
         )
     )
     if conversation is None:
+        raise ConversationNotFound()
+    if conversation.user_id != viewer_id and not conversation.shared:
         raise ConversationNotFound()
     return conversation
 
