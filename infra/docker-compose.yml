@@ -34,7 +34,13 @@ services:
       context: ../apps/api
       dockerfile: ../../infra/Dockerfile.api
     environment:
+      # Migrations (run on boot, see Dockerfile.api) always use the owner role above them both.
       DATABASE_URL: postgresql+asyncpg://recore:recore@postgres:5432/recore
+      # The running API serves requests as the low-privilege role the RLS migration creates —
+      # granted CRUD, no DDL, and actually subject to the row-level security policies (the owner
+      # role above is exempt from RLS by Postgres default, which is why migrations use it and
+      # requests don't). Dev-only password, same treatment as MASTER_KEY below.
+      APP_DATABASE_URL: postgresql+asyncpg://recore_app:recore_app_dev_only@postgres:5432/recore
       REDIS_URL: redis://redis:6379/0
       CORS_ORIGINS: '["http://localhost:3000"]'
       DEBUG: "false"

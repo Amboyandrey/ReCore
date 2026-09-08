@@ -17,7 +17,7 @@ from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.db import async_session_factory
+from app.core.db import async_session_factory, set_workspace_scope
 from app.core.errors import ConversationNotFound, ModelNotFound, ProviderDisabled
 from app.core.redis import new_redis_client
 from app.core.tracing import get_tracer
@@ -290,6 +290,9 @@ async def _run_generation(
     latency_ms = int((time.monotonic() - started_at) * 1000)
 
     async with async_session_factory() as db:
+        # This connection never went through get_workspace_ctx (it's a background task, not a
+        # request) — row-level security would otherwise block its own reads below.
+        await set_workspace_scope(db, workspace_id)
         model = await db.get(LLMModel, model_id)
         cost_usd = None
         if model is not None and model.cost_per_mtok_in is not None and model.cost_per_mtok_out is not None:
