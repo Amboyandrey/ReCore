@@ -8,6 +8,7 @@ keeps writing to Redis (and, at the end, the database) whether or not anyone is 
 """
 
 import asyncio
+import time
 import uuid
 from datetime import UTC, datetime
 from typing import Literal, cast
@@ -19,7 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.db import async_session_factory
 from app.core.errors import ConversationNotFound, ModelNotFound, ProviderDisabled
 from app.core.redis import new_redis_client
-from app.models import Attachment, Conversation, LLMModel, Message, MessageRole, User
+from app.core.tracing import get_tracer
+from app.models import Attachment, Conversation, LLMModel, Message, MessageRole, Provider, User
 from app.providers.base import ChatMessage, Done, LLMProvider, StreamError, TextDelta, Usage
 from app.providers.registry import build_provider
 from app.services.attachments import attach_to_message
@@ -31,6 +33,9 @@ from app.services.generations import (
     get_or_create_generation_id,
     set_active_generation,
 )
+from app.services.usage import record_usage_event
+
+tracer = get_tracer(__name__)
 
 MAX_TOKENS = 4096
 TITLE_MAX_LENGTH = 60
@@ -202,9 +207,12 @@ async def send_message(
     task = asyncio.create_task(
         _run_generation(
             generation_id,
+            workspace_id=workspace_id,
+            user_id=conversation.user_id,
             conversation_id=conversation.id,
             model_id=model.id,
-            provider=provider,
+            adapter=provider,
+            provider=credential.provider,
             provider_model_id=model.provider_model_id,
             history=history,
         )
@@ -218,9 +226,12 @@ async def send_message(
 async def _run_generation(
     generation_id: str,
     *,
+    workspace_id: uuid.UUID,
+    user_id: uuid.UUID,
     conversation_id: uuid.UUID,
     model_id: uuid.UUID,
-    provider: LLMProvider,
+    adapter: LLMProvider,
+    provider: Provider,
     provider_model_id: str,
     history: list[ChatMessage],
 ) -> None:
@@ -238,26 +249,45 @@ async def _run_generation(
     output_tokens: int | None = None
     finish_reason = "stop"
     error_message: str | None = None
+    started_at = time.monotonic()
 
-    try:
-        stream = provider.stream(model=provider_model_id, messages=history, max_tokens=MAX_TOKENS)
-        async for chunk in stream:
-            stop_signal = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.01)
-            if stop_signal is not None:
-                finish_reason = "stopped"
-                break
-            if isinstance(chunk, TextDelta):
-                text_parts.append(chunk.text)
-                await append_event(redis, generation_id, "delta", {"text": chunk.text})
-            elif isinstance(chunk, Usage):
-                input_tokens, output_tokens = chunk.input_tokens, chunk.output_tokens
-            elif isinstance(chunk, Done):
-                finish_reason = chunk.finish_reason
-            elif isinstance(chunk, StreamError):
-                error_message = chunk.message
-                break
-    except Exception as exc:  # noqa: BLE001 — any transport failure still needs a terminal event
-        error_message = f"Streaming failed: {exc}"
+    with tracer.start_as_current_span(
+        "llm.generate",
+        attributes={
+            "generation_id": generation_id,
+            "conversation_id": str(conversation_id),
+            "model_id": str(model_id),
+            "provider": provider.value,
+            "provider_model_id": provider_model_id,
+        },
+    ) as span:
+        try:
+            stream = adapter.stream(model=provider_model_id, messages=history, max_tokens=MAX_TOKENS)
+            async for chunk in stream:
+                stop_signal = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.01)
+                if stop_signal is not None:
+                    finish_reason = "stopped"
+                    break
+                if isinstance(chunk, TextDelta):
+                    text_parts.append(chunk.text)
+                    await append_event(redis, generation_id, "delta", {"text": chunk.text})
+                elif isinstance(chunk, Usage):
+                    input_tokens, output_tokens = chunk.input_tokens, chunk.output_tokens
+                elif isinstance(chunk, Done):
+                    finish_reason = chunk.finish_reason
+                elif isinstance(chunk, StreamError):
+                    error_message = chunk.message
+                    break
+        except Exception as exc:  # noqa: BLE001 — any transport failure still needs a terminal event
+            error_message = f"Streaming failed: {exc}"
+
+        span.set_attribute("finish_reason", finish_reason)
+        span.set_attribute("tokens_in", input_tokens or 0)
+        span.set_attribute("tokens_out", output_tokens or 0)
+        if error_message:
+            span.set_attribute("error", error_message)
+
+    latency_ms = int((time.monotonic() - started_at) * 1000)
 
     async with async_session_factory() as db:
         model = await db.get(LLMModel, model_id)
@@ -267,21 +297,37 @@ async def _run_generation(
                 (input_tokens or 0) / 1_000_000 * model.cost_per_mtok_in
                 + (output_tokens or 0) / 1_000_000 * model.cost_per_mtok_out
             )
-        db.add(
-            Message(
-                conversation_id=conversation_id,
-                role=MessageRole.ASSISTANT,
-                content="".join(text_parts),
-                tokens_in=input_tokens,
-                tokens_out=output_tokens,
-                cost_usd=cost_usd,
-                finish_reason=None if error_message else finish_reason,
-                error=error_message,
-            )
+        assistant_message = Message(
+            conversation_id=conversation_id,
+            role=MessageRole.ASSISTANT,
+            content="".join(text_parts),
+            tokens_in=input_tokens,
+            tokens_out=output_tokens,
+            cost_usd=cost_usd,
+            finish_reason=None if error_message else finish_reason,
+            error=error_message,
         )
+        db.add(assistant_message)
         conversation = await db.get(Conversation, conversation_id)
         if conversation is not None:
             conversation.updated_at = datetime.now(UTC)
+        if not error_message:
+            # A stopped-but-partial reply still used real tokens and is still billable; only an
+            # outright failure (never reaching a "done") produces nothing worth metering.
+            await db.flush()  # materializes assistant_message.id for the usage event's FK
+            await record_usage_event(
+                db,
+                workspace_id=workspace_id,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                message_id=assistant_message.id,
+                model_id=model_id,
+                provider=provider,
+                tokens_in=input_tokens or 0,
+                tokens_out=output_tokens or 0,
+                cost_usd=cost_usd or 0,
+                latency_ms=latency_ms,
+            )
         await db.commit()
 
     if error_message:

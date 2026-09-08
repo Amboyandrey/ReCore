@@ -2,15 +2,17 @@
 
 import uuid
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.redis import get_redis
+from app.core.request_ip import client_ip
 from app.deps.workspace import WorkspaceCtx, require_role
 from app.models import LLMModel, Provider, Role
 from app.schemas.model import AvailableModelOut, EnableModelRequest, ModelOut
+from app.services.audit import record_audit
 from app.services.credentials import get_credential
 from app.services.flags import evaluate_flag
 from app.services.models import disable_model, enable_model, list_available_models, list_models
@@ -58,6 +60,7 @@ async def list_available_models_route(
 @models_router.post("", status_code=201, response_model=ModelOut)
 async def enable_model_route(
     body: EnableModelRequest,
+    request: Request,
     ctx: WorkspaceCtx = Depends(require_role(Role.ADMIN)),
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
@@ -74,6 +77,16 @@ async def enable_model_route(
         cost_per_mtok_out=body.cost_per_mtok_out,
     )
     credential = await get_credential(db, workspace_id=ctx.workspace_id, credential_id=body.credential_id)
+    await record_audit(
+        db,
+        actor_id=ctx.user.id,
+        workspace_id=ctx.workspace_id,
+        action="model.enabled",
+        target_type="model",
+        target_id=str(model.id),
+        ip=client_ip(request),
+        metadata={"provider_model_id": model.provider_model_id},
+    )
     return await _to_model_out(db, redis, ctx=ctx, model=model, provider=credential.provider)
 
 
@@ -94,8 +107,18 @@ async def list_models_route(
 @models_router.delete("/{model_id}", status_code=204)
 async def disable_model_route(
     model_id: uuid.UUID,
+    request: Request,
     ctx: WorkspaceCtx = Depends(require_role(Role.ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> None:
     """Remove a model from the workspace's enabled catalog."""
     await disable_model(db, workspace_id=ctx.workspace_id, model_id=model_id)
+    await record_audit(
+        db,
+        actor_id=ctx.user.id,
+        workspace_id=ctx.workspace_id,
+        action="model.disabled",
+        target_type="model",
+        target_id=str(model_id),
+        ip=client_ip(request),
+    )

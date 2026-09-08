@@ -172,3 +172,10 @@ class AttachmentTooLarge(AppError):
 
     status_code = 413
     detail = "This file is too large."
+
+
+class InvalidCursor(AppError):
+    """Raised when a cursor-paginated list gets a `before`/`cursor` value it can't parse."""
+
+    status_code = 400
+    detail = "Invalid pagination cursor."

@@ -2,13 +2,15 @@
 
 import uuid
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
+from app.core.request_ip import client_ip
 from app.deps.workspace import WorkspaceCtx, require_role
 from app.models import Role, User
 from app.schemas.member import MemberOut, RoleUpdate
+from app.services.audit import record_audit
 from app.services.members import change_member_role, list_members, remove_member
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/members", tags=["members"])
@@ -28,6 +30,7 @@ async def list_members_route(
 async def change_role_route(
     user_id: uuid.UUID,
     body: RoleUpdate,
+    request: Request,
     ctx: WorkspaceCtx = Depends(require_role(Role.ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> MemberOut:
@@ -41,14 +44,34 @@ async def change_role_route(
     )
     user = await db.get(User, user_id)
     assert user is not None  # change_member_role already confirmed this membership exists
+    await record_audit(
+        db,
+        actor_id=ctx.user.id,
+        workspace_id=ctx.workspace_id,
+        action="member.role_changed",
+        target_type="user",
+        target_id=str(user_id),
+        ip=client_ip(request),
+        metadata={"new_role": member.role.value},
+    )
     return MemberOut(user_id=user.id, email=user.email, role=member.role, joined_at=member.joined_at)
 
 
 @router.delete("/{user_id}", status_code=204)
 async def remove_member_route(
     user_id: uuid.UUID,
+    request: Request,
     ctx: WorkspaceCtx = Depends(require_role(Role.ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> None:
     """Remove a member from the workspace."""
     await remove_member(db, workspace_id=ctx.workspace_id, acting_role=ctx.role, target_user_id=user_id)
+    await record_audit(
+        db,
+        actor_id=ctx.user.id,
+        workspace_id=ctx.workspace_id,
+        action="member.removed",
+        target_type="user",
+        target_id=str(user_id),
+        ip=client_ip(request),
+    )

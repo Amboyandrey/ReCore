@@ -3,16 +3,18 @@
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.redis import get_redis
+from app.core.request_ip import client_ip
 from app.deps.flags import require_superuser
 from app.deps.workspace import WorkspaceCtx, require_role
-from app.models import Role, User
+from app.models import FlagScope, Role, User
 from app.schemas.flag import FlagCreate, FlagOut, FlagUpdate, OverrideCreate, OverrideOut
+from app.services.audit import record_audit
 from app.services.flags import (
     create_flag,
     delete_override,
@@ -40,7 +42,8 @@ async def evaluate_flags_route(
 @admin_router.post("", status_code=201, response_model=FlagOut)
 async def create_flag_route(
     body: FlagCreate,
-    _admin: User = Depends(require_superuser),
+    request: Request,
+    admin: User = Depends(require_superuser),
     db: AsyncSession = Depends(get_db),
 ) -> FlagOut:
     """Define a new flag, superuser only."""
@@ -50,6 +53,16 @@ async def create_flag_route(
         description=body.description,
         default_value=body.default_value,
         rollout_percentage=body.rollout_percentage,
+    )
+    await record_audit(
+        db,
+        actor_id=admin.id,
+        workspace_id=None,
+        action="flag.created",
+        target_type="flag",
+        target_id=str(flag.id),
+        ip=client_ip(request),
+        metadata={"key": flag.key},
     )
     return FlagOut.model_validate(flag, from_attributes=True)
 
@@ -68,12 +81,24 @@ async def list_flags_route(
 async def update_flag_route(
     flag_id: uuid.UUID,
     body: FlagUpdate,
-    _admin: User = Depends(require_superuser),
+    request: Request,
+    admin: User = Depends(require_superuser),
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
 ) -> FlagOut:
     """Edit a flag's description, default, rollout, or archived state — only what's sent changes."""
-    flag = await update_flag(db, redis, flag_id=flag_id, changes=body.model_dump(exclude_unset=True))
+    changes = body.model_dump(exclude_unset=True)
+    flag = await update_flag(db, redis, flag_id=flag_id, changes=changes)
+    await record_audit(
+        db,
+        actor_id=admin.id,
+        workspace_id=None,
+        action="flag.updated",
+        target_type="flag",
+        target_id=str(flag.id),
+        ip=client_ip(request),
+        metadata={"changes": {k: v for k, v in changes.items() if k != "description"}},
+    )
     return FlagOut.model_validate(flag, from_attributes=True)
 
 
@@ -92,13 +117,24 @@ async def list_overrides_route(
 async def set_override_route(
     flag_id: uuid.UUID,
     body: OverrideCreate,
-    _admin: User = Depends(require_superuser),
+    request: Request,
+    admin: User = Depends(require_superuser),
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
 ) -> OverrideOut:
     """Pin a flag to a value for one user or workspace — the killswitch and per-tenant demo lever."""
     override = await set_override(
         db, redis, flag_id=flag_id, scope=body.scope, scope_id=body.scope_id, value=body.value
+    )
+    await record_audit(
+        db,
+        actor_id=admin.id,
+        workspace_id=body.scope_id if body.scope == FlagScope.WORKSPACE else None,
+        action="flag.override_set",
+        target_type="flag",
+        target_id=str(flag_id),
+        ip=client_ip(request),
+        metadata={"scope": body.scope.value, "scope_id": str(body.scope_id), "value": body.value},
     )
     return OverrideOut.model_validate(override, from_attributes=True)
 
@@ -107,9 +143,20 @@ async def set_override_route(
 async def delete_override_route(
     flag_id: uuid.UUID,
     override_id: uuid.UUID,
-    _admin: User = Depends(require_superuser),
+    request: Request,
+    admin: User = Depends(require_superuser),
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
 ) -> None:
     """Remove an override, falling its target back to the rollout/default resolution."""
     await delete_override(db, redis, flag_id=flag_id, override_id=override_id)
+    await record_audit(
+        db,
+        actor_id=admin.id,
+        workspace_id=None,
+        action="flag.override_deleted",
+        target_type="flag",
+        target_id=str(flag_id),
+        ip=client_ip(request),
+        metadata={"override_id": str(override_id)},
+    )

@@ -10,12 +10,22 @@ from collections.abc import AsyncIterator, Sequence
 
 import pytest
 from redis.asyncio import Redis
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import encrypt_secret
 from app.core.errors import ConversationNotFound, ModelNotFound
-from app.models import LLMModel, Provider, ProviderCredential, Role, User, Workspace, WorkspaceMember
-from app.providers.base import ChatMessage, Chunk, Done, TextDelta, Usage
+from app.models import (
+    LLMModel,
+    Provider,
+    ProviderCredential,
+    Role,
+    UsageEvent,
+    User,
+    Workspace,
+    WorkspaceMember,
+)
+from app.providers.base import ChatMessage, Chunk, Done, StreamError, TextDelta, Usage
 from app.providers.fake import VALID_KEY, FakeProvider
 from app.services.chat import (
     create_conversation,
@@ -40,6 +50,16 @@ class SlowFakeProvider(FakeProvider):
         yield Done(finish_reason="stop")
 
 
+class ErrorFakeProvider(FakeProvider):
+    """Fails partway through a stream — for proving a failed generation bills nothing."""
+
+    async def stream(
+        self, *, model: str, messages: Sequence[ChatMessage], max_tokens: int
+    ) -> AsyncIterator[Chunk]:
+        yield TextDelta(text="partial ")
+        yield StreamError(message="the provider disconnected")
+
+
 def _fake_build_provider(provider: Provider, *, api_key: str, base_url: str | None) -> FakeProvider:
     return FakeProvider(api_key=api_key, base_url=base_url)
 
@@ -50,6 +70,15 @@ def slow_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "app.services.chat.build_provider",
         lambda provider, *, api_key, base_url: SlowFakeProvider(api_key=api_key, base_url=base_url),
+    )
+
+
+@pytest.fixture
+def error_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Swap in ErrorFakeProvider for this test only, instead of the default fast FakeProvider."""
+    monkeypatch.setattr(
+        "app.services.chat.build_provider",
+        lambda provider, *, api_key, base_url: ErrorFakeProvider(api_key=api_key, base_url=base_url),
     )
 
 
@@ -256,3 +285,94 @@ async def test_stopping_mid_stream_truncates_the_reply(
     assert events[-1].data["finish_reason"] == "stopped"
     delta_count = len([e for e in events if e.type == "delta"])
     assert 0 < delta_count < 4  # stopped before all four words streamed
+
+
+async def test_send_message_records_a_usage_event_on_completion(
+    db: AsyncSession, redis_client: Redis
+) -> None:
+    """A normal completion appends exactly one usage event, priced the same as the message."""
+    user, workspace, model = await _workspace_with_model(db)
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db,
+        redis_client,
+        workspace_id=workspace.id,
+        conversation=conversation,
+        content="Hi there",
+        idempotency_key=None,
+    )
+    async for _ in read_events(redis_client, generation_id, block_ms=50):
+        pass
+
+    events = (
+        await db.scalars(select(UsageEvent).where(UsageEvent.workspace_id == workspace.id))
+    ).all()
+    assert len(events) == 1
+    assert events[0].user_id == user.id
+    assert events[0].provider == Provider.ANTHROPIC
+    assert events[0].tokens_out == 5
+    assert events[0].cost_usd == pytest.approx(2 / 1_000_000 + 10 / 1_000_000)
+
+
+async def test_stopping_mid_stream_still_records_a_usage_event(
+    db: AsyncSession, redis_client: Redis, slow_provider: None
+) -> None:
+    """A stopped reply still used real tokens — it's billable, not free."""
+    user, workspace, model = await _workspace_with_model(db)
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db,
+        redis_client,
+        workspace_id=workspace.id,
+        conversation=conversation,
+        content="Hi",
+        idempotency_key=None,
+    )
+    await asyncio.sleep(0.08)
+    await request_stop(redis_client, generation_id)
+    async for _ in read_events(redis_client, generation_id, block_ms=50):
+        pass
+
+    events = (
+        await db.scalars(select(UsageEvent).where(UsageEvent.workspace_id == workspace.id))
+    ).all()
+    # A row lands either way — FakeProvider only reports usage in its final Usage chunk, so a
+    # stop before that chunk arrives means real providers' partial-token accounting isn't
+    # exercised here, but the event itself (proof a generation ran and should bill something)
+    # still must exist.
+    assert len(events) == 1
+
+
+async def test_a_failed_generation_records_no_usage_event(
+    db: AsyncSession, redis_client: Redis, error_provider: None
+) -> None:
+    """A generation that never reaches 'done' bills nothing — there's no completed reply to price."""
+    user, workspace, model = await _workspace_with_model(db)
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db,
+        redis_client,
+        workspace_id=workspace.id,
+        conversation=conversation,
+        content="Hi",
+        idempotency_key=None,
+    )
+    events = [e async for e in read_events(redis_client, generation_id, block_ms=50)]
+    assert events[-1].type == "error"
+
+    usage_events = (
+        await db.scalars(select(UsageEvent).where(UsageEvent.workspace_id == workspace.id))
+    ).all()
+    assert usage_events == []

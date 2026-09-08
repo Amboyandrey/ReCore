@@ -1,6 +1,7 @@
 """Import every model here so it registers on Base.metadata before Alembic autogenerate runs."""
 
 from app.models.attachment import Attachment
+from app.models.audit_log import AuditLog
 from app.models.conversation import Conversation
 from app.models.credential import ProviderCredential
 from app.models.extract_status import ExtractStatus
@@ -14,11 +15,13 @@ from app.models.message import Message
 from app.models.message_role import MessageRole
 from app.models.provider import Provider
 from app.models.role import Role
+from app.models.usage_event import UsageEvent
 from app.models.user import User
 from app.models.workspace import Workspace, WorkspaceMember
 
 __all__ = [
     "Attachment",
+    "AuditLog",
     "Conversation",
     "ExtractStatus",
     "FeatureFlag",
@@ -32,6 +35,7 @@ __all__ = [
     "Provider",
     "ProviderCredential",
     "Role",
+    "UsageEvent",
     "User",
     "Workspace",
     "WorkspaceMember",
