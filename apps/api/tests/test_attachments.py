@@ -6,10 +6,12 @@ Routes provider calls through FakeProvider via monkeypatch, same as test_chat_ro
 import uuid
 from io import BytesIO
 
+import pillow_heif
 import pytest
 from docx import Document as DocxDocument
 from httpx import AsyncClient
 from openpyxl import Workbook
+from PIL import Image
 from pptx import Presentation
 from pptx.util import Inches
 from pypdf import PdfWriter
@@ -17,9 +19,29 @@ from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.models import FeatureFlag, FlagScope
 from app.providers.fake import VALID_KEY, FakeProvider
+from app.services.attachments import MAX_IMAGE_DIMENSION
 from app.services.flags import set_override
+
+
+def _minimal_png(size: tuple[int, int] = (50, 30), color: tuple[int, int, int] = (255, 0, 0)) -> bytes:
+    """A real, valid PNG of the given size — Pillow both writes and reads them."""
+    buffer = BytesIO()
+    Image.new("RGB", size, color=color).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _rotated_jpeg() -> bytes:
+    """A real JPEG, landscape, tagged via EXIF as needing a 90-degree correction — the shape a
+    portrait phone photo takes if a client doesn't already bake the rotation into the pixels."""
+    image = Image.new("RGB", (100, 50), color=(0, 255, 0))
+    exif = image.getexif()
+    exif[0x0112] = 6  # Orientation: rotate 270 CW to display correctly
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG", exif=exif)
+    return buffer.getvalue()
 
 
 def _minimal_pdf(text: bytes) -> bytes:
@@ -163,10 +185,14 @@ async def test_uploading_a_text_file_extracts_its_content(
     assert body["message_id"] is None  # not attached to a message yet
 
 
-async def test_uploading_a_binary_file_is_marked_unsupported(
+async def test_uploading_an_unsupported_binary_file_is_marked_unsupported(
     client: AsyncClient, db: AsyncSession, redis_client: Redis
 ) -> None:
-    """A mime type this phase doesn't know how to read is stored but flagged, not silently empty."""
+    """A mime type this phase doesn't know how to read is stored but flagged, not silently empty.
+
+    image/bmp specifically: not text-like, not one of PDF/DOCX/PPTX/XLSX, and not one of the
+    image formats _normalize_image decodes — genuinely nothing this phase can do with it.
+    """
     workspace_id, model_id = await _workspace_with_model(client)
     await _enable_attachments(db, redis_client, workspace_id=workspace_id)
     conversation_id = (
@@ -175,7 +201,7 @@ async def test_uploading_a_binary_file_is_marked_unsupported(
 
     response = await client.post(
         f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/attachments",
-        files={"file": ("photo.png", b"\x89PNG\r\n\x1a\n\x00\x00", "image/png")},
+        files={"file": ("photo.bmp", b"BM\x00\x00\x00\x00", "image/bmp")},
     )
 
     assert response.status_code == 201
@@ -377,3 +403,140 @@ async def test_uploading_an_xlsx_extracts_its_cells(
     assert body["extracted_text"] is not None
     assert "Name\tScore" in body["extracted_text"]
     assert "Alice\t95" in body["extracted_text"]
+
+
+async def test_uploading_a_png_is_marked_passthrough_with_no_extracted_text(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    """An image gets no text extraction attempt at all — it's handed to the model directly."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    await _enable_attachments(db, redis_client, workspace_id=workspace_id)
+    conversation_id = (
+        await client.post(f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id})
+    ).json()["id"]
+
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/attachments",
+        files={"file": ("photo.png", _minimal_png(), "image/png")},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["extract_status"] == "passthrough"
+    assert body["extracted_text"] is None
+    assert body["mime"] == "image/png"
+
+
+async def test_an_oversized_image_is_downscaled_to_the_max_dimension(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    """A phone-photo-sized image is shrunk to MAX_IMAGE_DIMENSION on its long edge, not rejected."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    await _enable_attachments(db, redis_client, workspace_id=workspace_id)
+    conversation_id = (
+        await client.post(f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id})
+    ).json()["id"]
+
+    huge = _minimal_png(size=(MAX_IMAGE_DIMENSION * 2, MAX_IMAGE_DIMENSION))
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/attachments",
+        files={"file": ("big.png", huge, "image/png")},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["extract_status"] == "passthrough"
+    # The stored file is what was actually downscaled — read it back and check its dimensions
+    # rather than trusting a byte-count proxy, which a differently-compressible image could fake.
+    stored = Image.open(f"{get_settings().storage_dir}/{workspace_id}/{body['id']}")
+    assert max(stored.size) == MAX_IMAGE_DIMENSION
+
+
+async def test_a_smaller_image_is_not_upscaled(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    """An image already under the cap is left at its own size, not stretched up to it."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    await _enable_attachments(db, redis_client, workspace_id=workspace_id)
+    conversation_id = (
+        await client.post(f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id})
+    ).json()["id"]
+
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/attachments",
+        files={"file": ("small.png", _minimal_png(size=(50, 30)), "image/png")},
+    )
+
+    body = response.json()
+    stored = Image.open(f"{get_settings().storage_dir}/{workspace_id}/{body['id']}")
+    assert stored.size == (50, 30)
+
+
+async def test_a_rotated_photo_is_corrected_before_storage(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    """EXIF orientation is baked into the pixels, not left for the model to guess at — a
+    landscape-stored, rotate-to-portrait JPEG comes out actually portrait."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    await _enable_attachments(db, redis_client, workspace_id=workspace_id)
+    conversation_id = (
+        await client.post(f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id})
+    ).json()["id"]
+
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/attachments",
+        files={"file": ("rotated.jpg", _rotated_jpeg(), "image/jpeg")},
+    )
+
+    body = response.json()
+    assert body["extract_status"] == "passthrough"
+    stored = Image.open(f"{get_settings().storage_dir}/{workspace_id}/{body['id']}")
+    # The source was 100x50 landscape; orientation 6 means "rotate to display", so the
+    # corrected, storage-ready image should be the transposed 50x100 portrait.
+    assert stored.size == (50, 100)
+
+
+async def test_a_heic_photo_is_transcoded_to_jpeg(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    """The default iPhone photo format comes out as the one format every provider accepts."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    await _enable_attachments(db, redis_client, workspace_id=workspace_id)
+    conversation_id = (
+        await client.post(f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id})
+    ).json()["id"]
+
+    heic_buffer = BytesIO()
+    pillow_heif.from_pillow(Image.new("RGB", (40, 40), color=(0, 0, 255))).save(heic_buffer)
+    heic_bytes = heic_buffer.getvalue()
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/attachments",
+        files={"file": ("photo.heic", heic_bytes, "image/heic")},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["extract_status"] == "passthrough"
+    assert body["mime"] == "image/jpeg"
+
+
+async def test_a_corrupt_image_falls_back_to_the_original_bytes_marked_failed(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    """A file claiming to be an image but that Pillow can't decode doesn't crash the upload — it
+    fails clearly, the same "never reject the whole upload" contract every extractor follows."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    await _enable_attachments(db, redis_client, workspace_id=workspace_id)
+    conversation_id = (
+        await client.post(f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id})
+    ).json()["id"]
+
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/attachments",
+        files={"file": ("broken.png", b"not actually a png", "image/png")},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["extract_status"] == "failed"
+    assert body["extracted_text"] is None

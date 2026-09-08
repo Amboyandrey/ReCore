@@ -11,3 +11,7 @@ class ExtractStatus(enum.StrEnum):
     DONE = "done"
     FAILED = "failed"
     UNSUPPORTED = "unsupported"
+    # An image (or other format the model reads directly): no text was extracted because none
+    # was needed, not because extraction failed or was skipped. DONE with empty text would be
+    # indistinguishable from a failure; UNSUPPORTED would simply be a lie.
+    PASSTHROUGH = "passthrough"

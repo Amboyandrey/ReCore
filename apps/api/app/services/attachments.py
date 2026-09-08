@@ -1,20 +1,26 @@
 """Uploading a file into a conversation, extracting whatever text it holds, and reading it back.
 
 Extraction is synchronous, on the request path, and covers what people actually attach: plain
-text/markdown/JSON/CSV decoded directly, plus real parsing for the modern (XML-based) Office
-formats — PDF, DOCX, PPTX, XLSX. Anything else is stored but marked unsupported: legacy binary
-Office formats (.doc/.xls/.ppt) need a much heavier tool (LibreOffice headless, typically) than a
-pure-Python library, and images/audio/video need OCR or transcription, not text extraction at
-all — genuinely different features, not a missing case of this one. "Attached" and "extracted"
-are tracked separately, so adding either later is a new branch here, not a schema change.
+text/markdown/JSON/CSV decoded directly, real parsing for the modern (XML-based) Office formats —
+PDF, DOCX, PPTX, XLSX — and images, normalized (oriented, downscaled, HEIC transcoded to JPEG) and
+handed to the model directly rather than OCR'd, since a vision-capable model reads layout,
+diagrams and handwriting far better than OCR ever will. Anything else is stored but marked
+unsupported: legacy binary Office formats (.doc/.xls/.ppt) need a much heavier tool (LibreOffice
+headless, typically) than a pure-Python library, and audio/video need transcription, not text
+extraction at all — genuinely different features, not a missing case of this one. "Attached" and
+"extracted" are tracked separately, so adding either later is a new branch here, not a schema
+change.
 """
 
+import asyncio
 import uuid
 from io import BytesIO
 from pathlib import Path
 
+import pillow_heif
 from docx import Document as DocxDocument
 from openpyxl import load_workbook
+from PIL import Image, ImageOps
 from pptx import Presentation
 from pypdf import PdfReader
 from sqlalchemy import select
@@ -26,12 +32,26 @@ from app.models import Attachment, ExtractStatus
 
 settings = get_settings()
 
+# Lets Pillow's own Image.open() decode HEIC/HEIF transparently — the default format for photos
+# straight off an iPhone, and by far the most likely image a user actually attaches.
+pillow_heif.register_heif_opener()  # type: ignore[attr-defined]  # not in pillow_heif's __all__
+
 _TEXT_MIME_PREFIXES = ("text/",)
 _TEXT_MIME_TYPES = {"application/json", "application/xml", "application/x-yaml"}
 _PDF_MIME = "application/pdf"
 _DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 _PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+# The intersection every provider adapter's vision input actually accepts (after normalization,
+# HEIC/HEIF becomes JPEG — see _normalize_image — so they're accepted on the way in, not out).
+_IMAGE_MIMES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+_HEIC_MIMES = {"image/heic", "image/heif"}
+
+# Anthropic documents no quality benefit above this on the long edge; the other providers cap
+# similarly. Downscaling here means a 12MB phone photo reaches the model at all, rather than
+# being rejected by the size cap below before it ever gets a chance to shrink.
+MAX_IMAGE_DIMENSION = 1568
 
 # Caps how much of one file's text reaches the model — a single huge document otherwise crowds
 # out the rest of the conversation's context budget entirely.
@@ -41,6 +61,12 @@ MAX_EXTRACTED_CHARS = 100_000
 def _is_text_like(mime: str) -> bool:
     """Whether this is read as plain UTF-8 text, no parsing library involved."""
     return mime.startswith(_TEXT_MIME_PREFIXES) or mime in _TEXT_MIME_TYPES
+
+
+def _is_image(mime: str) -> bool:
+    """Whether this is a format _normalize_image knows how to decode — PNG/JPEG/GIF/WebP
+    directly, HEIC/HEIF via pillow-heif's opener registered above."""
+    return mime in _IMAGE_MIMES or mime in _HEIC_MIMES
 
 
 def _cap(text: str) -> str:
@@ -121,7 +147,8 @@ def _extract_xlsx_text(data: bytes) -> tuple[str | None, ExtractStatus, str | No
 
 
 def _extract_text(data: bytes, mime: str) -> tuple[str | None, ExtractStatus, str | None]:
-    """Dispatch to the right extractor for this mime type, or mark it unsupported."""
+    """Dispatch to the right extractor for this mime type, or mark it unsupported. Images never
+    reach this — save_attachment routes them to _normalize_image before extraction would run."""
     if _is_text_like(mime):
         return _extract_plain_text(data)
     if mime == _PDF_MIME:
@@ -135,6 +162,30 @@ def _extract_text(data: bytes, mime: str) -> tuple[str | None, ExtractStatus, st
     return None, ExtractStatus.UNSUPPORTED, None
 
 
+def _normalize_image(data: bytes, mime: str) -> tuple[bytes, str, ExtractStatus, str | None]:
+    """Correct EXIF orientation, downscale to MAX_IMAGE_DIMENSION, and transcode HEIC/HEIF to
+    JPEG — the one format every provider's vision input reliably accepts. Runs in a thread (see
+    the caller): Pillow's decode/resize is CPU-bound and this process serves every other request
+    too.
+
+    On any decode failure (corrupt file, a decompression-bomb-sized image, ...) this falls back
+    to storing the upload exactly as received, marked failed with a reason — the same "never
+    reject the whole upload" contract every other extractor in this file follows.
+    """
+    try:
+        opened = Image.open(BytesIO(data))
+        image = ImageOps.exif_transpose(opened) or opened
+        image.thumbnail((MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION))
+        buffer = BytesIO()
+        if mime == "image/png":
+            image.save(buffer, format="PNG")
+            return buffer.getvalue(), "image/png", ExtractStatus.PASSTHROUGH, None
+        image.convert("RGB").save(buffer, format="JPEG", quality=85)
+        return buffer.getvalue(), "image/jpeg", ExtractStatus.PASSTHROUGH, None
+    except Exception as exc:  # noqa: BLE001 — Pillow/pillow-heif raise several distinct errors
+        return data, mime, ExtractStatus.FAILED, str(exc)
+
+
 async def save_attachment(
     db: AsyncSession,
     *,
@@ -145,7 +196,20 @@ async def save_attachment(
     mime: str,
     data: bytes,
 ) -> Attachment:
-    """Write an uploaded file to disk under the workspace, extract its text, and record both."""
+    """Write an uploaded file to disk under the workspace, extract its text (or, for an image,
+    normalize it for the model), and record both."""
+    extracted_text: str | None
+    if _is_image(mime):
+        data, mime, extract_status, extract_error = await asyncio.to_thread(
+            _normalize_image, data, mime
+        )
+        extracted_text = None
+    else:
+        extracted_text, extract_status, extract_error = _extract_text(data, mime)
+
+    # Checked after normalization, not before: the whole point of downscaling is that a 10-12MB
+    # phone photo reaches the model at all, rather than being rejected here before it ever
+    # shrinks. Non-image files are untouched above, so this behaves exactly as it did before.
     if len(data) > settings.max_attachment_size_bytes:
         raise AttachmentTooLarge()
 
@@ -155,7 +219,6 @@ async def save_attachment(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
 
-    extracted_text, extract_status, extract_error = _extract_text(data, mime)
     attachment = Attachment(
         id=attachment_id,
         workspace_id=workspace_id,
@@ -172,6 +235,14 @@ async def save_attachment(
     db.add(attachment)
     await db.flush()
     return attachment
+
+
+def read_attachment_bytes(attachment: Attachment) -> bytes:
+    """Read an attachment's stored bytes back off disk — used to hand an image attachment to a
+    provider adapter as an ImagePart. Synchronous, matching save_attachment's own direct
+    `path.write_bytes()` call above: these are local files under a bind-mounted volume, not a
+    network store, so there's no request-serving benefit to a thread hop here."""
+    return (Path(settings.storage_dir) / attachment.storage_key).read_bytes()
 
 
 async def list_attachments(db: AsyncSession, *, conversation_id: uuid.UUID) -> list[Attachment]:
