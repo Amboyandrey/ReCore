@@ -25,8 +25,8 @@ from app.models import Role
 from app.schemas.chat import (
     ActiveGenerationOut,
     ConversationCreate,
-    ConversationModelUpdate,
     ConversationOut,
+    ConversationUpdate,
     MessageOut,
     SendMessageRequest,
 )
@@ -38,7 +38,7 @@ from app.services.chat import (
     list_conversations,
     list_messages,
     send_message,
-    update_conversation_model,
+    update_conversation,
 )
 from app.services.generations import get_active_generation, read_events, request_stop
 
@@ -75,8 +75,9 @@ async def list_conversations_route(
     ctx: WorkspaceCtx = Depends(require_role(Role.VIEWER)),
     db: AsyncSession = Depends(get_db),
 ) -> list[ConversationOut]:
-    """List the workspace's conversations, most recently active first."""
-    conversations = await list_conversations(db, workspace_id=ctx.workspace_id)
+    """List every conversation this caller can see: their own, plus any of the workspace's
+    conversations that have been shared."""
+    conversations = await list_conversations(db, workspace_id=ctx.workspace_id, viewer_id=ctx.user.id)
     return [ConversationOut.model_validate(c, from_attributes=True) for c in conversations]
 
 
@@ -86,23 +87,30 @@ async def get_conversation_route(
     ctx: WorkspaceCtx = Depends(require_role(Role.VIEWER)),
     db: AsyncSession = Depends(get_db),
 ) -> ConversationOut:
-    """Fetch one conversation."""
+    """Fetch one conversation — 404s the same way for one that doesn't exist and one that's
+    private to someone else."""
     conversation = await get_conversation(
-        db, workspace_id=ctx.workspace_id, conversation_id=conversation_id
+        db, workspace_id=ctx.workspace_id, conversation_id=conversation_id, viewer_id=ctx.user.id
     )
     return ConversationOut.model_validate(conversation, from_attributes=True)
 
 
 @router.patch("/{conversation_id}", response_model=ConversationOut)
-async def update_conversation_model_route(
+async def update_conversation_route(
     conversation_id: uuid.UUID,
-    body: ConversationModelUpdate,
+    body: ConversationUpdate,
     ctx: WorkspaceCtx = Depends(require_role(Role.VIEWER)),
     db: AsyncSession = Depends(get_db),
 ) -> ConversationOut:
-    """Switch a conversation to a different one of the workspace's enabled models."""
-    conversation = await update_conversation_model(
-        db, workspace_id=ctx.workspace_id, conversation_id=conversation_id, model_id=body.model_id
+    """Switch a conversation's model and/or toggle its sharing — only the owner may share/unshare."""
+    changes = body.model_dump(exclude_unset=True)
+    conversation = await update_conversation(
+        db,
+        workspace_id=ctx.workspace_id,
+        conversation_id=conversation_id,
+        viewer_id=ctx.user.id,
+        model_id=changes.get("model_id"),
+        shared=changes.get("shared"),
     )
     return ConversationOut.model_validate(conversation, from_attributes=True)
 
@@ -114,8 +122,11 @@ async def delete_conversation_route(
     ctx: WorkspaceCtx = Depends(require_role(Role.VIEWER)),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    """Permanently delete a conversation, its messages, attachments, and usage history."""
-    await delete_conversation(db, workspace_id=ctx.workspace_id, conversation_id=conversation_id)
+    """Permanently delete a conversation, its messages, attachments, and usage history — only
+    the conversation's own owner may, even if it's been shared."""
+    await delete_conversation(
+        db, workspace_id=ctx.workspace_id, conversation_id=conversation_id, viewer_id=ctx.user.id
+    )
     await record_audit(
         db,
         actor_id=ctx.user.id,
@@ -135,7 +146,7 @@ async def list_messages_route(
 ) -> list[MessageOut]:
     """List a conversation's messages, oldest first."""
     conversation = await get_conversation(
-        db, workspace_id=ctx.workspace_id, conversation_id=conversation_id
+        db, workspace_id=ctx.workspace_id, conversation_id=conversation_id, viewer_id=ctx.user.id
     )
     messages = await list_messages(db, conversation_id=conversation.id)
     return [MessageOut.model_validate(m, from_attributes=True) for m in messages]
@@ -150,7 +161,9 @@ async def get_active_generation_route(
 ) -> ActiveGenerationOut:
     """Report whether a generation is currently running — for a freshly loaded page to know
     whether there's a reply already in progress to resume."""
-    await get_conversation(db, workspace_id=ctx.workspace_id, conversation_id=conversation_id)
+    await get_conversation(
+        db, workspace_id=ctx.workspace_id, conversation_id=conversation_id, viewer_id=ctx.user.id
+    )
     generation_id = await get_active_generation(redis, conversation_id)
     return ActiveGenerationOut(generation_id=generation_id)
 
@@ -166,7 +179,7 @@ async def send_message_route(
 ) -> StreamingResponse:
     """Send a message and stream the reply back as SSE."""
     conversation = await get_conversation(
-        db, workspace_id=ctx.workspace_id, conversation_id=conversation_id
+        db, workspace_id=ctx.workspace_id, conversation_id=conversation_id, viewer_id=ctx.user.id
     )
     generation_id = await send_message(
         db,
@@ -192,7 +205,9 @@ async def resume_generation_route(
     redis: Redis = Depends(get_redis),
 ) -> StreamingResponse:
     """Resume tailing a generation, from its Last-Event-ID header or an explicit ?after= param."""
-    await get_conversation(db, workspace_id=ctx.workspace_id, conversation_id=conversation_id)
+    await get_conversation(
+        db, workspace_id=ctx.workspace_id, conversation_id=conversation_id, viewer_id=ctx.user.id
+    )
     after = request.headers.get("last-event-id") or request.query_params.get("after") or "0"
     return StreamingResponse(
         _sse_body(redis, generation_id, after=after),
@@ -210,5 +225,7 @@ async def stop_generation_route(
     redis: Redis = Depends(get_redis),
 ) -> None:
     """Signal a running generation to stop."""
-    await get_conversation(db, workspace_id=ctx.workspace_id, conversation_id=conversation_id)
+    await get_conversation(
+        db, workspace_id=ctx.workspace_id, conversation_id=conversation_id, viewer_id=ctx.user.id
+    )
     await request_stop(redis, generation_id)

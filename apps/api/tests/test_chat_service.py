@@ -16,7 +16,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import encrypt_secret
-from app.core.errors import ConversationNotFound, ModelDoesNotSupportImages, ModelNotFound
+from app.core.errors import (
+    ConversationNotFound,
+    InsufficientRole,
+    ModelDoesNotSupportImages,
+    ModelNotFound,
+)
 from app.models import (
     Attachment,
     LLMModel,
@@ -39,7 +44,7 @@ from app.services.chat import (
     list_conversations,
     list_messages,
     send_message,
-    update_conversation_model,
+    update_conversation,
 )
 from app.services.generations import read_events, request_stop
 
@@ -131,6 +136,17 @@ async def _workspace_with_model(db: AsyncSession) -> tuple[User, Workspace, LLMM
     return user, workspace, model
 
 
+async def _add_member(db: AsyncSession, *, workspace_id: uuid.UUID, email: str) -> User:
+    """A second workspace member — for the tests that check what one member can and can't see
+    of another's conversations."""
+    user = User(email=email, password_hash="hashed")
+    db.add(user)
+    await db.flush()
+    db.add(WorkspaceMember(workspace_id=workspace_id, user_id=user.id, role=Role.MEMBER))
+    await db.flush()
+    return user
+
+
 async def _upload_image(
     db: AsyncSession, *, workspace_id: uuid.UUID, conversation_id: uuid.UUID, uploaded_by: uuid.UUID
 ) -> Attachment:
@@ -185,8 +201,12 @@ async def test_update_conversation_model_switches_which_model_is_used(db: AsyncS
     )
     await db.commit()
 
-    updated = await update_conversation_model(
-        db, workspace_id=workspace.id, conversation_id=conversation.id, model_id=other_model.id
+    updated = await update_conversation(
+        db,
+        workspace_id=workspace.id,
+        conversation_id=conversation.id,
+        viewer_id=user.id,
+        model_id=other_model.id,
     )
 
     assert updated.model_id == other_model.id
@@ -227,8 +247,12 @@ async def test_update_conversation_model_rejects_a_model_from_another_workspace(
     await db.flush()
 
     with pytest.raises(ModelNotFound):
-        await update_conversation_model(
-            db, workspace_id=workspace.id, conversation_id=conversation.id, model_id=other_model.id
+        await update_conversation(
+            db,
+            workspace_id=workspace.id,
+            conversation_id=conversation.id,
+            viewer_id=user.id,
+            model_id=other_model.id,
         )
 
 
@@ -254,11 +278,15 @@ async def test_delete_conversation_removes_it_and_its_messages(
         pass  # let the background task's own session commit the assistant reply before deleting
     conversation_id = conversation.id
 
-    await delete_conversation(db, workspace_id=workspace.id, conversation_id=conversation_id)
+    await delete_conversation(
+        db, workspace_id=workspace.id, conversation_id=conversation_id, viewer_id=user.id
+    )
     await db.commit()
 
     with pytest.raises(ConversationNotFound):
-        await get_conversation(db, workspace_id=workspace.id, conversation_id=conversation_id)
+        await get_conversation(
+            db, workspace_id=workspace.id, conversation_id=conversation_id, viewer_id=user.id
+        )
     remaining = (
         await db.scalars(select(Message).where(Message.conversation_id == conversation_id))
     ).all()
@@ -278,7 +306,7 @@ async def test_delete_conversation_rejects_one_from_another_workspace(db: AsyncS
 
     with pytest.raises(ConversationNotFound):
         await delete_conversation(
-            db, workspace_id=other_workspace.id, conversation_id=conversation.id
+            db, workspace_id=other_workspace.id, conversation_id=conversation.id, viewer_id=user.id
         )
 
 
@@ -380,7 +408,7 @@ async def test_list_conversations_only_returns_the_workspaces_own(db: AsyncSessi
         db, workspace_id=workspace_a.id, user=user, model_id=model_a.id, system_prompt=None
     )
 
-    conversations = await list_conversations(db, workspace_id=workspace_b.id)
+    conversations = await list_conversations(db, workspace_id=workspace_b.id, viewer_id=user.id)
 
     assert conversations == []
 
@@ -394,7 +422,98 @@ async def test_get_conversation_from_another_workspace_is_not_found(db: AsyncSes
     other_id = uuid.uuid4()
 
     with pytest.raises(ConversationNotFound):
-        await get_conversation(db, workspace_id=other_id, conversation_id=conversation.id)
+        await get_conversation(
+            db, workspace_id=other_id, conversation_id=conversation.id, viewer_id=user.id
+        )
+
+
+async def test_a_private_conversation_is_invisible_to_other_workspace_members(
+    db: AsyncSession,
+) -> None:
+    """A conversation nobody has shared only shows up for whoever started it — conversations are
+    private by default, not just visible to the whole workspace."""
+    owner, workspace, model = await _workspace_with_model(db)
+    teammate = await _add_member(db, workspace_id=workspace.id, email="teammate1@example.com")
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=owner, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+
+    visible_to_owner = await list_conversations(db, workspace_id=workspace.id, viewer_id=owner.id)
+    visible_to_teammate = await list_conversations(db, workspace_id=workspace.id, viewer_id=teammate.id)
+
+    assert conversation.id in {c.id for c in visible_to_owner}
+    assert visible_to_teammate == []
+    with pytest.raises(ConversationNotFound):
+        await get_conversation(
+            db, workspace_id=workspace.id, conversation_id=conversation.id, viewer_id=teammate.id
+        )
+
+
+async def test_sharing_a_conversation_makes_it_visible_to_the_rest_of_the_workspace(
+    db: AsyncSession,
+) -> None:
+    """Once its owner shares it, a conversation shows up for (and can be opened by) anyone else
+    in the workspace — the "collab" half of sharing."""
+    owner, workspace, model = await _workspace_with_model(db)
+    teammate = await _add_member(db, workspace_id=workspace.id, email="teammate2@example.com")
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=owner, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+
+    await update_conversation(
+        db, workspace_id=workspace.id, conversation_id=conversation.id, viewer_id=owner.id, shared=True
+    )
+
+    visible_to_teammate = await list_conversations(db, workspace_id=workspace.id, viewer_id=teammate.id)
+    assert conversation.id in {c.id for c in visible_to_teammate}
+    fetched = await get_conversation(
+        db, workspace_id=workspace.id, conversation_id=conversation.id, viewer_id=teammate.id
+    )
+    assert fetched.id == conversation.id
+
+
+async def test_only_the_owner_can_share_or_unshare_a_conversation(db: AsyncSession) -> None:
+    """A collaborator a conversation has been shared with can see and use it, but can't revoke
+    (or re-extend) that access for everyone else — only the owner controls the sharing flag."""
+    owner, workspace, model = await _workspace_with_model(db)
+    teammate = await _add_member(db, workspace_id=workspace.id, email="teammate3@example.com")
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=owner, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+    await update_conversation(
+        db, workspace_id=workspace.id, conversation_id=conversation.id, viewer_id=owner.id, shared=True
+    )
+
+    with pytest.raises(InsufficientRole):
+        await update_conversation(
+            db,
+            workspace_id=workspace.id,
+            conversation_id=conversation.id,
+            viewer_id=teammate.id,
+            shared=False,
+        )
+
+
+async def test_only_the_owner_can_delete_a_shared_conversation(db: AsyncSession) -> None:
+    """A collaborator can chat in a shared conversation but can't delete it out from under its
+    owner."""
+    owner, workspace, model = await _workspace_with_model(db)
+    teammate = await _add_member(db, workspace_id=workspace.id, email="teammate4@example.com")
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=owner, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+    await update_conversation(
+        db, workspace_id=workspace.id, conversation_id=conversation.id, viewer_id=owner.id, shared=True
+    )
+
+    with pytest.raises(InsufficientRole):
+        await delete_conversation(
+            db, workspace_id=workspace.id, conversation_id=conversation.id, viewer_id=teammate.id
+        )
 
 
 async def test_stopping_mid_stream_truncates_the_reply(
