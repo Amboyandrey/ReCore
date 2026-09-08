@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.redis import get_redis
+from app.core.request_ip import client_ip
 from app.deps.workspace import WorkspaceCtx, require_role
 from app.models import Role
 from app.schemas.chat import (
@@ -29,8 +30,10 @@ from app.schemas.chat import (
     MessageOut,
     SendMessageRequest,
 )
+from app.services.audit import record_audit
 from app.services.chat import (
     create_conversation,
+    delete_conversation,
     get_conversation,
     list_conversations,
     list_messages,
@@ -102,6 +105,26 @@ async def update_conversation_model_route(
         db, workspace_id=ctx.workspace_id, conversation_id=conversation_id, model_id=body.model_id
     )
     return ConversationOut.model_validate(conversation, from_attributes=True)
+
+
+@router.delete("/{conversation_id}", status_code=204)
+async def delete_conversation_route(
+    conversation_id: uuid.UUID,
+    request: Request,
+    ctx: WorkspaceCtx = Depends(require_role(Role.VIEWER)),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Permanently delete a conversation, its messages, attachments, and usage history."""
+    await delete_conversation(db, workspace_id=ctx.workspace_id, conversation_id=conversation_id)
+    await record_audit(
+        db,
+        actor_id=ctx.user.id,
+        workspace_id=ctx.workspace_id,
+        action="conversation.deleted",
+        target_type="conversation",
+        target_id=str(conversation_id),
+        ip=client_ip(request),
+    )
 
 
 @router.get("/{conversation_id}/messages", response_model=list[MessageOut])

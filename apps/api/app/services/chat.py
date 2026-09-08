@@ -132,6 +132,18 @@ async def update_conversation_model(
     return conversation
 
 
+async def delete_conversation(
+    db: AsyncSession, *, workspace_id: uuid.UUID, conversation_id: uuid.UUID
+) -> None:
+    """Permanently remove a conversation — its messages, attachments, and usage-event history all
+    cascade-delete with it (see each model's ondelete="CASCADE" foreign key). There's no undo and
+    no soft-delete here, unlike Workspace: a chat thread has no membership or billing of its own
+    to keep around after it's gone, just the history a deleted conversation asks to forget too."""
+    conversation = await get_conversation(db, workspace_id=workspace_id, conversation_id=conversation_id)
+    await db.delete(conversation)
+    await db.flush()
+
+
 async def list_conversations(db: AsyncSession, *, workspace_id: uuid.UUID) -> list[Conversation]:
     """List a workspace's conversations, most recently active first."""
     stmt = (

@@ -164,6 +164,26 @@ async def test_updating_a_conversation_s_model_switches_which_model_it_uses(
     assert updated.json()["model_id"] == other_model_id
 
 
+async def test_deleting_a_conversation_removes_it_from_the_list(client: AsyncClient) -> None:
+    """A deleted conversation 404s directly and disappears from the workspace's list."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    conversation_id = (
+        await client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id}
+        )
+    ).json()["id"]
+
+    deleted = await client.delete(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}"
+    )
+
+    assert deleted.status_code == 204
+    fetched = await client.get(f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}")
+    assert fetched.status_code == 404
+    listed = await client.get(f"/api/v1/workspaces/{workspace_id}/conversations")
+    assert conversation_id not in {c["id"] for c in listed.json()}
+
+
 async def test_idempotency_key_prevents_a_duplicate_send(client: AsyncClient) -> None:
     """Two sends with the same Idempotency-Key produce only one user/assistant pair."""
     workspace_id, model_id = await _workspace_with_model(client)
