@@ -26,6 +26,14 @@ class Settings(BaseSettings):
     # policies become real for the app's own traffic instead of silently bypassed by the owner.
     app_database_url: str | None = Field(default=None)
 
+    # SQLAlchemy's own defaults (5 + 10 overflow = 15) are quickly exhausted here: a streaming
+    # chat response holds its request's connection open for the SSE response's whole duration
+    # (FastAPI only tears down a `yield` dependency once the response body is fully sent), not
+    # just for the brief query that starts it — found by actually load-testing concurrent
+    # streams, not by guessing a number. Tune alongside Postgres's own max_connections.
+    db_pool_size: int = 20
+    db_max_overflow: int = 20
+
     # Redis connection string used for sessions, rate limits, streams and caching
     redis_url: str = Field(default="redis://localhost:6379/0")
 

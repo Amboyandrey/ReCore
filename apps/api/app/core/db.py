@@ -15,7 +15,11 @@ settings = get_settings()
 # `app_database_url`, when set, is a distinct low-privilege role RLS actually applies to — the
 # table owner (`database_url`) is exempt from row-level security by Postgres default.
 engine = create_async_engine(
-    settings.app_database_url or settings.database_url, echo=settings.debug, pool_pre_ping=True
+    settings.app_database_url or settings.database_url,
+    echo=settings.debug,
+    pool_pre_ping=True,
+    pool_size=settings.db_pool_size,
+    max_overflow=settings.db_max_overflow,
 )
 
 async_session_factory = async_sessionmaker(engine, expire_on_commit=False)
