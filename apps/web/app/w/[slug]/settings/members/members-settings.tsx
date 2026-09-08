@@ -8,6 +8,7 @@ import {
   listInvitations,
   listMembers,
   removeMember,
+  revokeInvitation,
   MemberError,
   type Invitation,
   type Member,
@@ -32,6 +33,7 @@ export function MembersSettings({ slug }: { slug: string }) {
   const [inviteRole, setInviteRole] = useState<Role>("member");
   const [inviting, setInviting] = useState(false);
   const [newInviteLink, setNewInviteLink] = useState<string | null>(null);
+  const [linkCopied, setLinkCopied] = useState(false);
 
   useEffect(() => {
     if (!workspace) return;
@@ -72,15 +74,40 @@ export function MembersSettings({ slug }: { slug: string }) {
     setError(null);
     setInviting(true);
     setNewInviteLink(null);
+    setLinkCopied(false);
     try {
       const invitation = await createInvitation(workspace.id, inviteEmail, inviteRole);
-      setInvitations((prev) => [invitation, ...prev]);
+      // An email that already had a pending invite gets the *same* row re-sent (see
+      // create_invitation's dedup on the backend) rather than a second one — replace it in
+      // place here instead of prepending, so the list doesn't show that address twice either.
+      setInvitations((prev) => [invitation, ...prev.filter((i) => i.id !== invitation.id)]);
       setNewInviteLink(`${window.location.origin}/invite/${invitation.token}`);
       setInviteEmail("");
     } catch (err) {
       setError(err instanceof MemberError ? err.message : "Something went wrong.");
     } finally {
       setInviting(false);
+    }
+  }
+
+  async function handleCopyLink() {
+    if (!newInviteLink) return;
+    try {
+      await navigator.clipboard.writeText(newInviteLink);
+      setLinkCopied(true);
+    } catch {
+      setError("Couldn't copy — copy the link manually.");
+    }
+  }
+
+  async function handleRevokeInvitation(invitationId: string) {
+    if (!workspace) return;
+    setError(null);
+    try {
+      await revokeInvitation(workspace.id, invitationId);
+      setInvitations((prev) => prev.filter((i) => i.id !== invitationId));
+    } catch (err) {
+      setError(err instanceof MemberError ? err.message : "Something went wrong.");
     }
   }
 
@@ -194,10 +221,19 @@ export function MembersSettings({ slug }: { slug: string }) {
               </button>
             </form>
             {newInviteLink && (
-              <p className="mt-3 break-all rounded-md border border-success/30 bg-success/10 px-3 py-2 text-sm text-success">
-                Invite created — share this link:{" "}
-                <span className="font-mono">{newInviteLink}</span>
-              </p>
+              <div className="mt-3 flex items-center justify-between gap-3 rounded-md border border-success/30 bg-success/10 px-3 py-2 text-sm text-success">
+                <p className="break-all">
+                  Invite created — share this link:{" "}
+                  <span className="font-mono">{newInviteLink}</span>
+                </p>
+                <button
+                  type="button"
+                  onClick={handleCopyLink}
+                  className="shrink-0 rounded-md border border-success/40 px-2 py-1 text-xs text-success hover:bg-success/10"
+                >
+                  {linkCopied ? "Copied!" : "Copy"}
+                </button>
+              </div>
             )}
           </div>
 
@@ -211,7 +247,16 @@ export function MembersSettings({ slug }: { slug: string }) {
                     className="flex items-center justify-between rounded-md border border-border bg-surface px-3 py-2 text-sm"
                   >
                     <span className="text-text-soft">{i.email}</span>
-                    <span className="font-mono text-xs text-text-muted">{i.role}</span>
+                    <div className="flex items-center gap-3">
+                      <span className="font-mono text-xs text-text-muted">{i.role}</span>
+                      <button
+                        type="button"
+                        onClick={() => handleRevokeInvitation(i.id)}
+                        className="text-xs text-danger hover:underline"
+                      >
+                        Revoke
+                      </button>
+                    </div>
                   </li>
                 ))}
               </ul>
