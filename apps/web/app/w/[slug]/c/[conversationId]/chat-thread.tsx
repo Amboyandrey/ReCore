@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import { useRequireAuth } from "@/lib/auth-context";
+import { AttachmentError, uploadAttachment, type Attachment } from "@/lib/attachment-client";
 import {
   ChatError,
   getActiveGeneration,
@@ -15,6 +16,7 @@ import {
   type Conversation,
   type Message,
 } from "@/lib/chat-client";
+import { useWorkspaceFlags } from "@/lib/use-workspace-flags";
 import { useWorkspaceBySlug } from "@/lib/workspace-context";
 
 // A locally-synthesized user turn shown the instant it's sent, before the server confirms it —
@@ -36,6 +38,8 @@ function pendingUserMessage(content: string): Message {
 export function ChatThread({ slug, conversationId }: { slug: string; conversationId: string }) {
   const { loading: authLoading } = useRequireAuth();
   const { workspace, loading: wsLoading } = useWorkspaceBySlug(slug);
+  const { flags } = useWorkspaceFlags(workspace?.id);
+  const attachmentsEnabled = flags.attachments === true;
 
   const [conversation, setConversation] = useState<Conversation | null>(null);
   const [siblings, setSiblings] = useState<Conversation[]>([]);
@@ -47,6 +51,8 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
   const [sending, setSending] = useState(false);
   const [streamingText, setStreamingText] = useState("");
   const [activeGenerationId, setActiveGenerationId] = useState<string | null>(null);
+  const [pendingAttachments, setPendingAttachments] = useState<Attachment[]>([]);
+  const [uploading, setUploading] = useState(false);
 
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -103,7 +109,9 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     e.preventDefault();
     if (!workspace || !input.trim() || sending) return;
     const content = input;
+    const attachmentIds = pendingAttachments.map((a) => a.id);
     setInput("");
+    setPendingAttachments([]);
     setSending(true);
     setStreamingText("");
     setError(null);
@@ -113,7 +121,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     getActiveGeneration(workspace.id, conversationId).then((id) => id && setActiveGenerationId(id));
 
     try {
-      for await (const evt of sendMessage(workspace.id, conversationId, content)) {
+      for await (const evt of sendMessage(workspace.id, conversationId, content, undefined, attachmentIds)) {
         if (evt.event === "delta") setStreamingText((prev) => prev + evt.data.text);
       }
     } catch (err) {
@@ -124,6 +132,26 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
       setActiveGenerationId(null);
       setSending(false);
     }
+  }
+
+  async function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // let the same file be picked again later
+    if (!workspace || !file) return;
+    setUploading(true);
+    setError(null);
+    try {
+      const attachment = await uploadAttachment(workspace.id, conversationId, file);
+      setPendingAttachments((prev) => [...prev, attachment]);
+    } catch (err) {
+      setError(err instanceof AttachmentError ? err.message : "Something went wrong.");
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  function handleRemoveAttachment(id: string) {
+    setPendingAttachments((prev) => prev.filter((a) => a.id !== id));
   }
 
   function handleKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
@@ -211,7 +239,34 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
           <div ref={bottomRef} />
         </div>
 
+        {attachmentsEnabled && pendingAttachments.length > 0 && (
+          <ul className="mt-4 flex flex-wrap gap-2">
+            {pendingAttachments.map((a) => (
+              <li
+                key={a.id}
+                className="flex items-center gap-2 rounded-full border border-border bg-surface px-3 py-1 text-xs text-text-soft"
+              >
+                <span className="max-w-[12rem] truncate">{a.original_filename}</span>
+                <button
+                  type="button"
+                  onClick={() => handleRemoveAttachment(a.id)}
+                  className="text-text-muted hover:text-danger"
+                  aria-label={`Remove ${a.original_filename}`}
+                >
+                  ×
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+
         <form onSubmit={handleSend} className="mt-4 flex items-end gap-2">
+          {attachmentsEnabled && (
+            <label className="cursor-pointer rounded-md border border-border px-3 py-2 text-sm text-text-soft hover:border-border-strong">
+              {uploading ? "…" : "+ File"}
+              <input type="file" onChange={handleFileSelect} disabled={uploading} className="hidden" />
+            </label>
+          )}
           <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}

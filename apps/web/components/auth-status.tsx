@@ -27,6 +27,11 @@ export function AuthStatus() {
 
   return (
     <div className="flex items-center gap-4 text-sm">
+      {user.is_superuser && (
+        <Link href="/admin/flags" className="text-text-soft hover:text-text">
+          Flags
+        </Link>
+      )}
       <span className="text-text-soft">{user.email}</span>
       <button
         onClick={() => logout()}

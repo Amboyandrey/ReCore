@@ -17,11 +17,15 @@ export type AvailableModel = { id: string; display_name: string; context_window:
 export type EnabledModel = {
   id: string;
   credential_id: string;
+  provider: ProviderId;
   provider_model_id: string;
   display_name: string;
   context_window: number | null;
   cost_per_mtok_in: number | null;
   cost_per_mtok_out: number | null;
+  // Reflects that provider's killswitch flag — false greys the model out in pickers rather than
+  // removing it from the catalog (see ARCHITECTURE.md #8's provider-killswitch demo).
+  provider_enabled: boolean;
 };
 
 export class ProviderError extends Error {}

@@ -59,11 +59,15 @@ export function NewChat({ slug }: { slug: string }) {
             <button
               key={m.id}
               type="button"
-              disabled={creating}
+              disabled={creating || !m.provider_enabled}
               onClick={() => handlePick(m.id)}
-              className="rounded-md border border-border bg-surface px-3 py-2 text-left text-sm text-text hover:border-border-strong disabled:opacity-60"
+              title={m.provider_enabled ? undefined : "This provider has been disabled by an administrator."}
+              className="flex items-center justify-between rounded-md border border-border bg-surface px-3 py-2 text-left text-sm text-text hover:border-border-strong disabled:opacity-40"
             >
               {m.display_name}
+              {!m.provider_enabled && (
+                <span className="font-mono text-xs text-text-muted">disabled</span>
+              )}
             </button>
           ))}
         </div>

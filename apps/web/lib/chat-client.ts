@@ -122,14 +122,15 @@ export async function* sendMessage(
   workspaceId: string,
   conversationId: string,
   content: string,
-  idempotencyKey?: string
+  idempotencyKey?: string,
+  attachmentIds?: string[]
 ): AsyncGenerator<SSEEvent> {
   const headers: Record<string, string> = {};
   if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
   const res = await api(`/api/v1/workspaces/${workspaceId}/conversations/${conversationId}/messages`, {
     method: "POST",
     headers,
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ content, attachment_ids: attachmentIds ?? [] }),
   });
   await throwIfNotOk(res);
   yield* consumeSSE(res);
