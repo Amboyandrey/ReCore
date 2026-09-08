@@ -91,6 +91,21 @@ export async function createConversation(workspaceId: string, modelId: string): 
   return (await res.json()) as Conversation;
 }
 
+// Switches a conversation to a different one of the workspace's enabled models — mid-session,
+// not just at the start. History already sent isn't resent to the new model.
+export async function updateConversationModel(
+  workspaceId: string,
+  conversationId: string,
+  modelId: string
+): Promise<Conversation> {
+  const res = await api(`/api/v1/workspaces/${workspaceId}/conversations/${conversationId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ model_id: modelId }),
+  });
+  await throwIfNotOk(res);
+  return (await res.json()) as Conversation;
+}
+
 // Fetches one conversation.
 export async function getConversation(workspaceId: string, conversationId: string): Promise<Conversation> {
   const res = await api(`/api/v1/workspaces/${workspaceId}/conversations/${conversationId}`);

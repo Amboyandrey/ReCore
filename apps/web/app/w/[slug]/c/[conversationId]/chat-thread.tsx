@@ -13,10 +13,12 @@ import {
   resumeGeneration,
   sendMessage,
   stopGeneration,
+  updateConversationModel,
   type Conversation,
   type Message,
 } from "@/lib/chat-client";
-import { listModels } from "@/lib/provider-client";
+import { setLastModelId } from "@/lib/last-model";
+import { listModels, type EnabledModel } from "@/lib/provider-client";
 import { useWorkspaceFlags } from "@/lib/use-workspace-flags";
 import { useWorkspaceBySlug } from "@/lib/workspace-context";
 
@@ -64,10 +66,11 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
   const [activeGenerationId, setActiveGenerationId] = useState<string | null>(null);
   const [pendingAttachments, setPendingAttachments] = useState<Attachment[]>([]);
   const [uploading, setUploading] = useState(false);
-  // Whether this conversation's model accepts images — looked up from the workspace's enabled
-  // models (list_models only requires VIEWER, so any member can call it), not the conversation
-  // itself, since Conversation only carries a model_id.
+  // The workspace's enabled models — for the model switcher, and to look up whether the current
+  // one accepts images (Conversation only carries a model_id, not the model's own fields).
+  const [models, setModels] = useState<EnabledModel[]>([]);
   const [modelSupportsVision, setModelSupportsVision] = useState(false);
+  const [switchingModel, setSwitchingModel] = useState(false);
 
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -81,7 +84,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     async function load() {
       if (!workspace) return;
       try {
-        const [conv, convs, msgs, activeId, models] = await Promise.all([
+        const [conv, convs, msgs, activeId, fetchedModels] = await Promise.all([
           getConversation(workspace.id, conversationId),
           listConversations(workspace.id),
           listMessages(workspace.id, conversationId),
@@ -92,7 +95,10 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
         setConversation(conv);
         setSiblings(convs);
         setMessages(msgs);
-        setModelSupportsVision(models.find((m) => m.id === conv.model_id)?.supports_vision ?? false);
+        setModels(fetchedModels);
+        setModelSupportsVision(
+          fetchedModels.find((m) => m.id === conv.model_id)?.supports_vision ?? false
+        );
         setLoadingData(false);
 
         if (activeId) {
@@ -185,6 +191,24 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     await stopGeneration(workspace.id, conversationId, activeGenerationId);
   }
 
+  // Switches which model this conversation talks to, mid-session — already-sent history isn't
+  // resent to the new model, only the next turn goes to it.
+  async function handleModelChange(modelId: string) {
+    if (!workspace || modelId === conversation?.model_id) return;
+    setSwitchingModel(true);
+    setError(null);
+    try {
+      const updated = await updateConversationModel(workspace.id, conversationId, modelId);
+      setConversation(updated);
+      setModelSupportsVision(models.find((m) => m.id === modelId)?.supports_vision ?? false);
+      setLastModelId(workspace.id, modelId);
+    } catch (err) {
+      setError(err instanceof ChatError ? err.message : "Something went wrong.");
+    } finally {
+      setSwitchingModel(false);
+    }
+  }
+
   if (authLoading || wsLoading || loadingData) {
     return <div className="mx-auto max-w-5xl px-6 py-16 text-sm text-text-muted">Loading…</div>;
   }
@@ -227,7 +251,23 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
       </aside>
 
       <div className="flex min-h-[70vh] flex-1 flex-col">
-        <h1 className="truncate text-lg font-semibold text-text">{conversation.title}</h1>
+        <div className="flex items-center justify-between gap-3">
+          <h1 className="truncate text-lg font-semibold text-text">{conversation.title}</h1>
+          {models.length > 0 && (
+            <select
+              value={conversation.model_id}
+              onChange={(e) => handleModelChange(e.target.value)}
+              disabled={switchingModel || sending}
+              className="shrink-0 rounded-md border border-border bg-surface px-2 py-1 text-xs text-text-soft outline-none focus:border-accent disabled:opacity-60"
+            >
+              {models.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.display_name}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
 
         {error && (
           <p className="mt-3 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger">
