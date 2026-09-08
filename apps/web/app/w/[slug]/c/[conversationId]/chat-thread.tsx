@@ -3,7 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import { useRequireAuth } from "@/lib/auth-context";
-import { AttachmentError, uploadAttachment, type Attachment } from "@/lib/attachment-client";
+import { AttachmentError, listAttachments, uploadAttachment, type Attachment } from "@/lib/attachment-client";
 import {
   ChatError,
   deleteConversation,
@@ -24,16 +24,18 @@ import { listModels, type EnabledModel } from "@/lib/provider-client";
 import { useWorkspaceFlags } from "@/lib/use-workspace-flags";
 import { useWorkspaceBySlug } from "@/lib/workspace-context";
 import { ConversationSidebar } from "@/components/conversation-sidebar";
+import { PendingAttachmentChips, SentAttachmentChips, hasBlockedImage } from "@/components/attachment-chips";
 
-// What each attachment's chip shows next to its filename — silence here is exactly how the last
-// three attachment bugs went unnoticed for as long as they did.
-const EXTRACT_STATUS_LABEL: Record<Attachment["extract_status"], string> = {
-  pending: "processing…",
-  done: "text extracted",
-  passthrough: "sent as image",
-  unsupported: "format not supported",
-  failed: "couldn't be read",
-};
+// Groups a conversation's attachments by the message they were sent with — what lets a message
+// already sitting in history show it had a file attached, not just the composer at send time.
+function groupByMessageId(attachments: Attachment[]): Record<string, Attachment[]> {
+  const grouped: Record<string, Attachment[]> = {};
+  for (const attachment of attachments) {
+    if (!attachment.message_id) continue;
+    (grouped[attachment.message_id] ??= []).push(attachment);
+  }
+  return grouped;
+}
 
 // A locally-synthesized user turn shown the instant it's sent, before the server confirms it —
 // swapped for the real persisted list once the reply finishes.
@@ -70,6 +72,11 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
   const [activeGenerationId, setActiveGenerationId] = useState<string | null>(null);
   const [pendingAttachments, setPendingAttachments] = useState<Attachment[]>([]);
   const [uploading, setUploading] = useState(false);
+  // Every attachment in this conversation, keyed by the message it was sent with — so a message
+  // already in history can show it had a file attached, not just the composer at send time.
+  const [attachmentsByMessageId, setAttachmentsByMessageId] = useState<Record<string, Attachment[]>>(
+    {}
+  );
   // The workspace's enabled models — for the model switcher, and to look up whether the current
   // one accepts images (Conversation only carries a model_id, not the model's own fields).
   const [models, setModels] = useState<EnabledModel[]>([]);
@@ -108,13 +115,18 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
       } catch (err) {
         setError(err instanceof ChatError ? err.message : "Something went wrong.");
       } finally {
-        setMessages(await listMessages(workspace.id, conversationId));
+        const [msgs, attachments] = await Promise.all([
+          listMessages(workspace.id, conversationId),
+          attachmentsEnabled ? listAttachments(workspace.id, conversationId) : Promise.resolve([]),
+        ]);
+        setMessages(msgs);
+        setAttachmentsByMessageId(groupByMessageId(attachments));
         setStreamingText("");
         setActiveGenerationId(null);
         setSending(false);
       }
     },
-    [workspace, conversationId]
+    [workspace, conversationId, attachmentsEnabled]
   );
 
   // Initial load, then — the only way a page reload can discover a reply was mid-stream — check
@@ -127,17 +139,19 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     async function load() {
       if (!workspace) return;
       try {
-        const [conv, convs, msgs, activeId, fetchedModels] = await Promise.all([
+        const [conv, convs, msgs, activeId, fetchedModels, attachments] = await Promise.all([
           getConversation(workspace.id, conversationId),
           listConversations(workspace.id),
           listMessages(workspace.id, conversationId),
           getActiveGeneration(workspace.id, conversationId),
           listModels(workspace.id),
+          attachmentsEnabled ? listAttachments(workspace.id, conversationId) : Promise.resolve([]),
         ]);
         if (cancelled) return;
         setConversation(conv);
         setSiblings(convs);
         setMessages(msgs);
+        setAttachmentsByMessageId(groupByMessageId(attachments));
         setModels(fetchedModels);
         setModelSupportsVision(
           fetchedModels.find((m) => m.id === conv.model_id)?.supports_vision ?? false
@@ -175,7 +189,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     return () => {
       cancelled = true;
     };
-  }, [workspace, conversationId, sendChat]);
+  }, [workspace, conversationId, sendChat, attachmentsEnabled]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -183,9 +197,8 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
 
   async function handleSend(e: FormEvent) {
     e.preventDefault();
-    const blockedImage =
-      !modelSupportsVision && pendingAttachments.some((a) => a.extract_status === "passthrough");
-    if (!workspace || !input.trim() || sending || blockedImage) return;
+    if (!workspace || !input.trim() || sending || hasBlockedImage(pendingAttachments, modelSupportsVision))
+      return;
     const content = input;
     const attachmentIds = pendingAttachments.map((a) => a.id);
     setInput("");
@@ -284,8 +297,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     );
   }
 
-  const hasBlockedImage =
-    !modelSupportsVision && pendingAttachments.some((a) => a.extract_status === "passthrough");
+  const blockedImage = hasBlockedImage(pendingAttachments, modelSupportsVision);
 
   const isOwner = conversation.user_id === user?.id;
 
@@ -353,7 +365,10 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
 
         <div className="mt-4 flex-1 space-y-4 overflow-y-auto">
           {messages.map((m) => (
-            <div key={m.id} className={m.role === "user" ? "flex justify-end" : "flex justify-start"}>
+            <div
+              key={m.id}
+              className={`flex flex-col ${m.role === "user" ? "items-end" : "items-start"}`}
+            >
               <div
                 className={`max-w-[75%] whitespace-pre-wrap rounded-lg px-3 py-2 text-sm ${
                   m.role === "user"
@@ -364,6 +379,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
                 {m.content}
                 {m.error && <p className="mt-1 text-xs text-danger">{m.error}</p>}
               </div>
+              <SentAttachmentChips attachments={attachmentsByMessageId[m.id] ?? []} />
             </div>
           ))}
           {streamingText && (
@@ -377,38 +393,15 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
           <div ref={bottomRef} />
         </div>
 
-        {attachmentsEnabled && pendingAttachments.length > 0 && (
-          <ul className="mt-4 flex flex-wrap gap-2">
-            {pendingAttachments.map((a) => {
-              const blocked = a.extract_status === "passthrough" && !modelSupportsVision;
-              return (
-                <li
-                  key={a.id}
-                  className={`flex items-center gap-2 rounded-full border px-3 py-1 text-xs ${
-                    blocked || a.extract_status === "failed" || a.extract_status === "unsupported"
-                      ? "border-danger/40 bg-danger/10 text-danger"
-                      : "border-border bg-surface text-text-soft"
-                  }`}
-                >
-                  <span className="max-w-[12rem] truncate">{a.original_filename}</span>
-                  <span className="text-[0.65rem] uppercase tracking-wide opacity-80">
-                    {blocked ? "model can't read images" : EXTRACT_STATUS_LABEL[a.extract_status]}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => handleRemoveAttachment(a.id)}
-                    className="text-text-muted hover:text-danger"
-                    aria-label={`Remove ${a.original_filename}`}
-                  >
-                    ×
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
+        {attachmentsEnabled && (
+          <PendingAttachmentChips
+            attachments={pendingAttachments}
+            modelSupportsVision={modelSupportsVision}
+            onRemove={handleRemoveAttachment}
+          />
         )}
 
-        {hasBlockedImage && (
+        {blockedImage && (
           <p className="mt-2 text-xs text-danger">
             This model can&apos;t read images. Remove the image or switch to a vision-capable model.
           </p>
@@ -440,7 +433,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
           ) : (
             <button
               type="submit"
-              disabled={sending || !input.trim() || hasBlockedImage}
+              disabled={sending || !input.trim() || blockedImage}
               className="rounded-md bg-accent px-3 py-2 text-sm font-medium text-accent-contrast disabled:opacity-60"
             >
               Send

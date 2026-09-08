@@ -2,20 +2,24 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useEffect, useState, type FormEvent, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import { useRequireAuth } from "@/lib/auth-context";
+import { AttachmentError, uploadAttachment, type Attachment } from "@/lib/attachment-client";
 import {
   ChatError,
   createConversation,
   deleteConversation,
   listConversations,
+  updateConversation,
   type Conversation,
 } from "@/lib/chat-client";
 import { getLastModelId, setLastModelId } from "@/lib/last-model";
 import { setPendingFirstMessage } from "@/lib/pending-first-message";
 import { listModels, type EnabledModel } from "@/lib/provider-client";
+import { useWorkspaceFlags } from "@/lib/use-workspace-flags";
 import { useWorkspaceBySlug } from "@/lib/workspace-context";
 import { ConversationSidebar } from "@/components/conversation-sidebar";
+import { PendingAttachmentChips, hasBlockedImage } from "@/components/attachment-chips";
 
 // Picks which model a brand-new chat should start on: whichever one this workspace used last
 // (remembered across sessions), falling back to the first enabled, undisabled model. Just a
@@ -28,12 +32,17 @@ function pickDefaultModel(workspaceId: string, models: EnabledModel[]): EnabledM
 }
 
 // A brand-new chat's composer. Nothing is saved to the database just by landing here — no
-// conversation row exists until this first message is actually sent, unlike the old flow where
-// clicking "+ New chat" created (and usually immediately abandoned) one right away.
+// conversation row exists until either a file is attached or the first message is sent, unlike
+// the old flow where clicking "+ New chat" created (and usually immediately abandoned) one right
+// away. Attaching a file is the one thing that can't wait for Send: uploads need a real
+// conversation_id to attach to, so it lazily creates the conversation right then instead — see
+// ensureConversation() below.
 export function NewChat({ slug }: { slug: string }) {
   const { user, loading: authLoading } = useRequireAuth();
   const { workspace, loading: wsLoading } = useWorkspaceBySlug(slug);
+  const { flags } = useWorkspaceFlags(workspace?.id);
   const router = useRouter();
+  const attachmentsEnabled = flags.attachments === true;
 
   const [siblings, setSiblings] = useState<Conversation[]>([]);
   const [models, setModels] = useState<EnabledModel[]>([]);
@@ -41,7 +50,18 @@ export function NewChat({ slug }: { slug: string }) {
   const [loadingData, setLoadingData] = useState(true);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [pendingAttachments, setPendingAttachments] = useState<Attachment[]>([]);
+  const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // The conversation this draft lazily becomes, the moment it needs to actually exist (a file
+  // attached, or Send pressed) — refs, not state, because ensureConversation() reads and writes
+  // them synchronously across calls that can overlap (e.g. clicking "+File" twice quickly)
+  // without waiting for a re-render.
+  const conversationIdRef = useRef<string | null>(null);
+  const creatingRef = useRef<Promise<string> | null>(null);
+
+  const modelSupportsVision = models.find((m) => m.id === modelId)?.supports_vision ?? false;
 
   useEffect(() => {
     if (!workspace) return;
@@ -60,19 +80,62 @@ export function NewChat({ slug }: { slug: string }) {
     };
   }, [workspace]);
 
+  // Creates the real conversation on first need, and only once — a second caller while creation
+  // is still in flight gets the same promise rather than triggering a second POST.
+  async function ensureConversation(): Promise<string> {
+    if (conversationIdRef.current) return conversationIdRef.current;
+    if (!workspace || !modelId) throw new Error("Pick a model first.");
+    if (!creatingRef.current) {
+      creatingRef.current = createConversation(workspace.id, modelId)
+        .then((conversation) => {
+          conversationIdRef.current = conversation.id;
+          setLastModelId(workspace.id, modelId);
+          return conversation.id;
+        })
+        .catch((err) => {
+          creatingRef.current = null; // let a retry actually retry, not replay the same rejection
+          throw err;
+        });
+    }
+    return creatingRef.current;
+  }
+
+  async function handleModelChange(newModelId: string) {
+    setModelId(newModelId);
+    // The conversation already exists (a file was attached before the model was changed) — keep
+    // it in sync rather than letting the dropdown silently disagree with what's persisted.
+    if (workspace && conversationIdRef.current) {
+      try {
+        await updateConversation(workspace.id, conversationIdRef.current, { model_id: newModelId });
+      } catch (err) {
+        setError(err instanceof ChatError ? err.message : "Something went wrong.");
+      }
+    }
+  }
+
   async function handleSend(e: FormEvent) {
     e.preventDefault();
-    if (!workspace || !input.trim() || !modelId || sending) return;
+    if (
+      !workspace ||
+      !input.trim() ||
+      !modelId ||
+      sending ||
+      hasBlockedImage(pendingAttachments, modelSupportsVision)
+    ) {
+      return;
+    }
     setSending(true);
     setError(null);
     try {
-      const conversation = await createConversation(workspace.id, modelId);
-      setLastModelId(workspace.id, modelId);
+      const conversationId = await ensureConversation();
       // Handed off, not sent from here: the real chat page does the actual sending once it
       // mounts at the new URL, so an in-flight reply is never at risk of being interrupted by
       // this navigation. See lib/pending-first-message.ts.
-      setPendingFirstMessage(conversation.id, { content: input, attachmentIds: [] });
-      router.replace(`/w/${slug}/c/${conversation.id}`);
+      setPendingFirstMessage(conversationId, {
+        content: input,
+        attachmentIds: pendingAttachments.map((a) => a.id),
+      });
+      router.replace(`/w/${slug}/c/${conversationId}`);
     } catch (err) {
       setError(err instanceof ChatError ? err.message : "Something went wrong.");
       setSending(false);
@@ -84,6 +147,31 @@ export function NewChat({ slug }: { slug: string }) {
       e.preventDefault();
       e.currentTarget.form?.requestSubmit();
     }
+  }
+
+  async function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // let the same file be picked again later
+    if (!workspace || !file || !modelId) return;
+    setUploading(true);
+    setError(null);
+    try {
+      const conversationId = await ensureConversation();
+      const attachment = await uploadAttachment(workspace.id, conversationId, file);
+      setPendingAttachments((prev) => [...prev, attachment]);
+    } catch (err) {
+      setError(
+        err instanceof AttachmentError || err instanceof ChatError
+          ? err.message
+          : "Something went wrong."
+      );
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  function handleRemoveAttachment(id: string) {
+    setPendingAttachments((prev) => prev.filter((a) => a.id !== id));
   }
 
   async function handleDeleteConversation(id: string) {
@@ -106,6 +194,8 @@ export function NewChat({ slug }: { slug: string }) {
       </div>
     );
   }
+
+  const blockedImage = hasBlockedImage(pendingAttachments, modelSupportsVision);
 
   return (
     <div className="mx-auto flex max-w-5xl gap-6 px-6 py-8">
@@ -137,10 +227,25 @@ export function NewChat({ slug }: { slug: string }) {
         ) : (
           <>
             <div className="flex-1" />
+
+            {attachmentsEnabled && (
+              <PendingAttachmentChips
+                attachments={pendingAttachments}
+                modelSupportsVision={modelSupportsVision}
+                onRemove={handleRemoveAttachment}
+              />
+            )}
+
+            {blockedImage && (
+              <p className="mt-2 text-xs text-danger">
+                This model can&apos;t read images. Remove the image or switch to a vision-capable model.
+              </p>
+            )}
+
             <form onSubmit={handleSend} className="mt-4 flex items-end gap-2">
               <select
                 value={modelId}
-                onChange={(e) => setModelId(e.target.value)}
+                onChange={(e) => handleModelChange(e.target.value)}
                 disabled={sending}
                 className="shrink-0 rounded-md border border-border bg-surface px-2 py-2 text-xs text-text-soft outline-none focus:border-accent disabled:opacity-60"
               >
@@ -150,6 +255,17 @@ export function NewChat({ slug }: { slug: string }) {
                   </option>
                 ))}
               </select>
+              {attachmentsEnabled && (
+                <label className="cursor-pointer rounded-md border border-border px-3 py-2 text-sm text-text-soft hover:border-border-strong">
+                  {uploading ? "…" : "+ File"}
+                  <input
+                    type="file"
+                    onChange={handleFileSelect}
+                    disabled={uploading}
+                    className="hidden"
+                  />
+                </label>
+              )}
               <textarea
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
@@ -161,7 +277,7 @@ export function NewChat({ slug }: { slug: string }) {
               />
               <button
                 type="submit"
-                disabled={sending || !input.trim()}
+                disabled={sending || !input.trim() || blockedImage}
                 className="rounded-md bg-accent px-3 py-2 text-sm font-medium text-accent-contrast disabled:opacity-60"
               >
                 {sending ? "Starting…" : "Send"}
