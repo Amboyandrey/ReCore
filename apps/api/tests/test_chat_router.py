@@ -130,6 +130,40 @@ async def test_conversation_title_is_set_from_the_first_message(client: AsyncCli
     assert updated.json()["title"] == "What is the capital of France?"
 
 
+async def test_updating_a_conversation_s_model_switches_which_model_it_uses(
+    client: AsyncClient,
+) -> None:
+    """PATCHing a conversation's model_id changes it, and only to a model the workspace itself
+    has enabled — mirrors the chat page's "change model mid-session" picker."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    credential_id = (
+        await client.get(f"/api/v1/workspaces/{workspace_id}/credentials")
+    ).json()[0]["id"]
+    other_model_id = (
+        await client.post(
+            f"/api/v1/workspaces/{workspace_id}/models",
+            json={
+                "credential_id": credential_id,
+                "provider_model_id": "fake-large",
+                "display_name": "Fake Large",
+            },
+        )
+    ).json()["id"]
+    conversation_id = (
+        await client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id}
+        )
+    ).json()["id"]
+
+    updated = await client.patch(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}",
+        json={"model_id": other_model_id},
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["model_id"] == other_model_id
+
+
 async def test_idempotency_key_prevents_a_duplicate_send(client: AsyncClient) -> None:
     """Two sends with the same Idempotency-Key produce only one user/assistant pair."""
     workspace_id, model_id = await _workspace_with_model(client)

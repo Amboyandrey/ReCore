@@ -15,6 +15,14 @@ class ConversationCreate(BaseModel):
     system_prompt: str | None = None
 
 
+class ConversationModelUpdate(BaseModel):
+    """Switching a conversation to a different one of the workspace's enabled models — mid-session,
+    not just at creation. History already sent to the old model isn't rewritten or resent; only
+    the turn that follows the switch goes to the new one."""
+
+    model_id: uuid.UUID
+
+
 class ConversationOut(BaseModel):
     """A chat thread."""
 

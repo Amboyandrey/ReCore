@@ -37,6 +37,7 @@ from app.services.chat import (
     list_conversations,
     list_messages,
     send_message,
+    update_conversation_model,
 )
 from app.services.generations import read_events, request_stop
 
@@ -162,6 +163,70 @@ async def test_create_conversation_rejects_a_model_from_another_workspace(
             user=user,
             model_id=model.id,
             system_prompt=None,
+        )
+
+
+async def test_update_conversation_model_switches_which_model_is_used(db: AsyncSession) -> None:
+    """Switching a conversation's model updates what it resolves to for its next send — the
+    mechanism the chat page's "change model mid-session" picker relies on."""
+    user, workspace, model = await _workspace_with_model(db)
+    other_model = LLMModel(
+        workspace_id=workspace.id,
+        credential_id=model.credential_id,
+        provider_model_id="fake-large",
+        display_name="Fake Large",
+    )
+    db.add(other_model)
+    await db.flush()
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+
+    updated = await update_conversation_model(
+        db, workspace_id=workspace.id, conversation_id=conversation.id, model_id=other_model.id
+    )
+
+    assert updated.model_id == other_model.id
+
+
+async def test_update_conversation_model_rejects_a_model_from_another_workspace(
+    db: AsyncSession,
+) -> None:
+    """Same guard as create_conversation: a model id belonging to a different workspace 404s,
+    even though the conversation being switched is real."""
+    user, workspace, model = await _workspace_with_model(db)
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+    other_workspace = Workspace(slug="other-ws", name="Other", owner_id=user.id)
+    db.add(other_workspace)
+    await db.flush()
+    other_credential = ProviderCredential(
+        workspace_id=other_workspace.id,
+        provider=Provider.ANTHROPIC,
+        label="Other",
+        ciphertext=b"\x01",
+        nonce=b"\x02" * 12,
+        wrapped_key=b"\x03" * 44,
+        last4="zz99",
+        created_by=user.id,
+    )
+    db.add(other_credential)
+    await db.flush()
+    other_model = LLMModel(
+        workspace_id=other_workspace.id,
+        credential_id=other_credential.id,
+        provider_model_id="fake-other",
+        display_name="Fake Other",
+    )
+    db.add(other_model)
+    await db.flush()
+
+    with pytest.raises(ModelNotFound):
+        await update_conversation_model(
+            db, workspace_id=workspace.id, conversation_id=conversation.id, model_id=other_model.id
         )
 
 

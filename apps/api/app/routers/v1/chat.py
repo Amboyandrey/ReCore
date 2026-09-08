@@ -24,6 +24,7 @@ from app.models import Role
 from app.schemas.chat import (
     ActiveGenerationOut,
     ConversationCreate,
+    ConversationModelUpdate,
     ConversationOut,
     MessageOut,
     SendMessageRequest,
@@ -34,6 +35,7 @@ from app.services.chat import (
     list_conversations,
     list_messages,
     send_message,
+    update_conversation_model,
 )
 from app.services.generations import get_active_generation, read_events, request_stop
 
@@ -84,6 +86,20 @@ async def get_conversation_route(
     """Fetch one conversation."""
     conversation = await get_conversation(
         db, workspace_id=ctx.workspace_id, conversation_id=conversation_id
+    )
+    return ConversationOut.model_validate(conversation, from_attributes=True)
+
+
+@router.patch("/{conversation_id}", response_model=ConversationOut)
+async def update_conversation_model_route(
+    conversation_id: uuid.UUID,
+    body: ConversationModelUpdate,
+    ctx: WorkspaceCtx = Depends(require_role(Role.VIEWER)),
+    db: AsyncSession = Depends(get_db),
+) -> ConversationOut:
+    """Switch a conversation to a different one of the workspace's enabled models."""
+    conversation = await update_conversation_model(
+        db, workspace_id=ctx.workspace_id, conversation_id=conversation_id, model_id=body.model_id
     )
     return ConversationOut.model_validate(conversation, from_attributes=True)
 
