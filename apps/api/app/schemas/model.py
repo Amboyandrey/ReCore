@@ -4,6 +4,8 @@ import uuid
 
 from pydantic import BaseModel, Field
 
+from app.models import Provider
+
 
 class AvailableModelOut(BaseModel):
     """One model a credential's provider reports as available — not yet enabled for chat."""
@@ -25,12 +27,18 @@ class EnableModelRequest(BaseModel):
 
 
 class ModelOut(BaseModel):
-    """An enabled model, with the pricing it was registered with."""
+    """An enabled model, with the pricing it was registered with.
+
+    `provider_enabled` reflects that provider's killswitch flag — the model picker greys the
+    model out rather than removing it, so a disabled provider degrades visibly, not silently.
+    """
 
     id: uuid.UUID
     credential_id: uuid.UUID
+    provider: Provider
     provider_model_id: str
     display_name: str
     context_window: int | None
     cost_per_mtok_in: float | None
     cost_per_mtok_out: float | None
+    provider_enabled: bool

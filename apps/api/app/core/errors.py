@@ -119,3 +119,56 @@ class GenerationNotFound(AppError):
 
     status_code = 404
     detail = "Generation not found."
+
+
+class SuperuserRequired(AppError):
+    """Raised when a non-superuser calls an admin-only route (flag and global user management)."""
+
+    status_code = 403
+    detail = "This action requires superuser access."
+
+
+class FlagNotFound(AppError):
+    """Raised for a flag key that has no definition."""
+
+    status_code = 404
+    detail = "Flag not found."
+
+
+class FlagKeyAlreadyExists(AppError):
+    """Raised when creating a flag whose key is already taken — keys are the stable identifier."""
+
+    status_code = 409
+    detail = "A flag with this key already exists."
+
+
+class FeatureDisabled(AppError):
+    """Raised by a route gated with `flag_gate()` when the flag resolves to off for this caller."""
+
+    status_code = 404
+    detail = "This feature isn't available."
+
+
+class ProviderDisabled(AppError):
+    """Raised when sending a message whose model's provider has been switched off by an admin.
+
+    Existing conversations and their history stay readable — only starting a new generation
+    through that provider is blocked.
+    """
+
+    status_code = 403
+    detail = "This provider has been disabled by an administrator."
+
+
+class AttachmentNotFound(AppError):
+    """Raised for an attachment that doesn't exist in the conversation it was looked up under."""
+
+    status_code = 404
+    detail = "Attachment not found."
+
+
+class AttachmentTooLarge(AppError):
+    """Raised when an uploaded file exceeds the configured size limit."""
+
+    status_code = 413
+    detail = "This file is too large."

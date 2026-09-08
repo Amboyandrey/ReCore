@@ -30,3 +30,6 @@ next-env.d.ts
 
 # Logs
 *.log
+
+# Locally uploaded attachments (apps/api's default STORAGE_DIR when run outside Docker)
+apps/api/uploads/

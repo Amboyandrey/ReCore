@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ModelNotFound
-from app.models import LLMModel
+from app.models import LLMModel, Provider, ProviderCredential
 from app.providers.base import ModelInfo
 from app.providers.registry import build_provider
 from app.services.credentials import decrypt_credential_key, get_credential
@@ -64,14 +64,16 @@ async def enable_model(
     return model
 
 
-async def list_models(db: AsyncSession, *, workspace_id: uuid.UUID) -> list[LLMModel]:
-    """List every enabled model in the workspace, across all of its credentials."""
+async def list_models(db: AsyncSession, *, workspace_id: uuid.UUID) -> list[tuple[LLMModel, Provider]]:
+    """List every enabled model in the workspace, paired with its credential's provider — the
+    model picker needs the provider to know which killswitch flag applies to each model."""
     stmt = (
-        select(LLMModel)
+        select(LLMModel, ProviderCredential.provider)
+        .join(ProviderCredential, ProviderCredential.id == LLMModel.credential_id)
         .where(LLMModel.workspace_id == workspace_id, LLMModel.enabled.is_(True))
         .order_by(LLMModel.created_at)
     )
-    return list((await db.scalars(stmt)).all())
+    return [(model, provider) for model, provider in (await db.execute(stmt)).all()]
 
 
 async def disable_model(db: AsyncSession, *, workspace_id: uuid.UUID, model_id: uuid.UUID) -> None:

@@ -4,13 +4,19 @@ Routes provider calls through FakeProvider via monkeypatch — no real network c
 """
 
 import asyncio
+import uuid
 from collections.abc import AsyncIterator, Sequence
 
 import pytest
 from httpx import AsyncClient
+from redis.asyncio import Redis
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models import FeatureFlag, FlagScope
 from app.providers.base import ChatMessage, Chunk, Done, TextDelta, Usage
 from app.providers.fake import VALID_KEY, FakeProvider
+from app.services.flags import set_override
 
 OWNER = {"email": "owner@example.com", "password": "correct horse battery staple"}
 MEMBER = {"email": "member@example.com", "password": "correct horse battery staple"}
@@ -285,3 +291,37 @@ async def test_non_member_cannot_send_messages(client: AsyncClient) -> None:
     )
 
     assert response.status_code == 404
+
+
+async def test_sending_is_blocked_while_the_model_s_provider_is_disabled(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    """The killswitch demo: flip `provider.anthropic` off for the workspace, new sends 403 —
+    but a conversation already read (see test_non_member_cannot_send_messages) stays readable."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    conversation = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id}
+    )
+    conversation_id = conversation.json()["id"]
+    flag = await db.scalar(select(FeatureFlag).where(FeatureFlag.key == "provider.anthropic"))
+    assert flag is not None
+    await set_override(
+        db,
+        redis_client,
+        flag_id=flag.id,
+        scope=FlagScope.WORKSPACE,
+        scope_id=uuid.UUID(workspace_id),
+        value=False,
+    )
+    await db.commit()  # this test's `db` session must commit for the client's own connection to see it
+
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/messages",
+        json={"content": "Hi"},
+    )
+
+    assert response.status_code == 403
+    still_readable = await client.get(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/messages"
+    )
+    assert still_readable.status_code == 200

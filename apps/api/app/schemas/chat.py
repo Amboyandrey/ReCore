@@ -41,9 +41,10 @@ class MessageOut(BaseModel):
 
 
 class SendMessageRequest(BaseModel):
-    """The user's next message."""
+    """The user's next message, plus any already-uploaded attachments to send alongside it."""
 
     content: str = Field(min_length=1)
+    attachment_ids: list[uuid.UUID] = Field(default_factory=list)
 
 
 class ActiveGenerationOut(BaseModel):

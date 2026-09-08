@@ -17,12 +17,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import async_session_factory
-from app.core.errors import ConversationNotFound, ModelNotFound
+from app.core.errors import ConversationNotFound, ModelNotFound, ProviderDisabled
 from app.core.redis import new_redis_client
-from app.models import Conversation, LLMModel, Message, MessageRole, User
+from app.models import Attachment, Conversation, LLMModel, Message, MessageRole, User
 from app.providers.base import ChatMessage, Done, LLMProvider, StreamError, TextDelta, Usage
 from app.providers.registry import build_provider
+from app.services.attachments import attach_to_message
 from app.services.credentials import decrypt_credential_key, get_credential
+from app.services.flags import evaluate_flag
 from app.services.generations import (
     append_event,
     clear_active_generation,
@@ -112,6 +114,19 @@ async def list_messages(db: AsyncSession, *, conversation_id: uuid.UUID) -> list
     return list((await db.scalars(stmt)).all())
 
 
+def _augment_with_attachments(content: str, attachments: list[Attachment]) -> str:
+    """What the model actually reads: the user's text, followed by any extracted attachment text.
+
+    The stored Message keeps just `content` — this augmented version only ever reaches the
+    provider call, so the conversation view shows what the user typed, not what the model saw.
+    """
+    parts = [content]
+    for attachment in attachments:
+        if attachment.extracted_text:
+            parts.append(f"[Attached file: {attachment.original_filename}]\n{attachment.extracted_text}")
+    return "\n\n".join(parts)
+
+
 def _to_chat_history(conversation: Conversation, messages: list[Message]) -> list[ChatMessage]:
     """Translate stored messages into the plain role/content shape every provider adapter takes."""
     history = []
@@ -132,6 +147,7 @@ async def send_message(
     conversation: Conversation,
     content: str,
     idempotency_key: str | None,
+    attachment_ids: list[uuid.UUID] | None = None,
 ) -> str:
     """Persist the user's message and start (or, for a repeated key, resume) a generation.
 
@@ -146,11 +162,21 @@ async def send_message(
     credential = await get_credential(
         db, workspace_id=workspace_id, credential_id=model.credential_id
     )
+    provider_enabled = await evaluate_flag(
+        db,
+        redis,
+        key=f"provider.{credential.provider.value}",
+        workspace_id=workspace_id,
+        user_id=conversation.user_id,
+    )
+    if not provider_enabled:
+        raise ProviderDisabled()
 
     existing_messages = await list_messages(db, conversation_id=conversation.id)
     is_first_message = not existing_messages
 
-    db.add(Message(conversation_id=conversation.id, role=MessageRole.USER, content=content))
+    user_message = Message(conversation_id=conversation.id, role=MessageRole.USER, content=content)
+    db.add(user_message)
     if is_first_message:
         conversation.title = _heuristic_title(content)
     conversation.updated_at = datetime.now(UTC)
@@ -158,8 +184,15 @@ async def send_message(
     # Committed above (not just flushed): the background task below opens its own session in a
     # separate connection and must be able to see this row the moment it starts.
 
+    attachments: list[Attachment] = []
+    if attachment_ids:
+        attachments = await attach_to_message(
+            db, conversation_id=conversation.id, attachment_ids=attachment_ids, message_id=user_message.id
+        )
+        await db.commit()
+
     history = _to_chat_history(conversation, [*existing_messages])
-    history.append(ChatMessage(role="user", content=content))
+    history.append(ChatMessage(role="user", content=_augment_with_attachments(content, attachments)))
 
     api_key = decrypt_credential_key(credential)
     provider = build_provider(credential.provider, api_key=api_key, base_url=credential.base_url)
