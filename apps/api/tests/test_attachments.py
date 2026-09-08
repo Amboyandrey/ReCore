@@ -4,9 +4,12 @@ Routes provider calls through FakeProvider via monkeypatch, same as test_chat_ro
 """
 
 import uuid
+from io import BytesIO
 
 import pytest
+from docx import Document as DocxDocument
 from httpx import AsyncClient
+from pypdf import PdfWriter
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,6 +17,42 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import FeatureFlag, FlagScope
 from app.providers.fake import VALID_KEY, FakeProvider
 from app.services.flags import set_override
+
+
+def _minimal_pdf(text: bytes) -> bytes:
+    """Hand-build the smallest valid PDF that holds one page of real, extractable text — no
+    library renders PDFs from scratch, so this writes the object/xref structure directly."""
+    objects = [
+        b"<</Type/Catalog/Pages 2 0 R>>",
+        b"<</Type/Pages/Kids[3 0 R]/Count 1>>",
+        b"<</Type/Page/Parent 2 0 R/Resources<</Font<</F1 4 0 R>>>>/MediaBox[0 0 200 200]/Contents 5 0 R>>",
+        b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
+    ]
+    stream = b"BT /F1 24 Tf 10 100 Td (" + text + b") Tj ET"
+    objects.append(b"<</Length " + str(len(stream)).encode() + b">>\nstream\n" + stream + b"\nendstream")
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for i, obj in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj".encode() + obj + b"endobj\n"
+    xref_offset = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n".encode()
+    out += b"0000000000 65535 f \n"
+    for off in offsets[1:]:
+        out += f"{off:010} 00000 n \n".encode()
+    out += f"trailer<</Size {len(objects) + 1}/Root 1 0 R>>\nstartxref\n{xref_offset}\n%%EOF".encode()
+    return bytes(out)
+
+
+def _minimal_docx(paragraphs: list[str]) -> bytes:
+    """A real, valid .docx with the given paragraphs — python-docx both writes and reads them."""
+    document = DocxDocument()
+    for text in paragraphs:
+        document.add_paragraph(text)
+    buffer = BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
 
 OWNER = {"email": "owner@example.com", "password": "correct horse battery staple"}
 
@@ -172,3 +211,82 @@ async def test_sending_a_message_with_an_attachment_feeds_its_text_to_the_model(
         await client.get(f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/attachments")
     ).json()
     assert attachments[0]["message_id"] == messages[0]["id"]  # linked to the user's turn
+
+
+async def test_uploading_a_pdf_extracts_its_text(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    """A real PDF (not just a text file renamed) gets its page text pulled out."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    await _enable_attachments(db, redis_client, workspace_id=workspace_id)
+    conversation_id = (
+        await client.post(f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id})
+    ).json()["id"]
+
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/attachments",
+        files={"file": ("notes.pdf", _minimal_pdf(b"Hello PDF"), "application/pdf")},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["extract_status"] == "done"
+    assert body["extracted_text"] is not None
+    assert "Hello PDF" in body["extracted_text"]
+
+
+async def test_a_pdf_with_no_extractable_text_is_marked_failed(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    """A blank page (the shape a scanned/image-only PDF takes to a text extractor) fails clearly,
+    not silently — there's a real difference between 'no attachment' and 'nothing to read'."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    await _enable_attachments(db, redis_client, workspace_id=workspace_id)
+    conversation_id = (
+        await client.post(f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id})
+    ).json()["id"]
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    buffer = BytesIO()
+    writer.write(buffer)
+
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/attachments",
+        files={"file": ("blank.pdf", buffer.getvalue(), "application/pdf")},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["extract_status"] == "failed"
+    assert body["extracted_text"] is None
+
+
+async def test_uploading_a_docx_extracts_its_paragraphs(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    """A real Word document's paragraph text comes back, in order."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    await _enable_attachments(db, redis_client, workspace_id=workspace_id)
+    conversation_id = (
+        await client.post(f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id})
+    ).json()["id"]
+
+    docx_bytes = _minimal_docx(["First paragraph.", "Second paragraph."])
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/attachments",
+        files={
+            "file": (
+                "letter.docx",
+                docx_bytes,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["extract_status"] == "done"
+    assert body["extracted_text"] is not None
+    assert "First paragraph." in body["extracted_text"]
+    assert "Second paragraph." in body["extracted_text"]

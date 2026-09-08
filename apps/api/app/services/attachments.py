@@ -1,14 +1,17 @@
 """Uploading a file into a conversation, extracting whatever text it holds, and reading it back.
 
-Extraction is synchronous and deliberately simple: text-like files are decoded as UTF-8 and used
-as-is; anything else is stored but marked unsupported. Parsing PDFs or images is a real feature,
-not a corner of this one — "attached" and "extracted" are tracked separately so it can grow into
-that later without a schema change.
+Extraction is synchronous, on the request path, and covers what people actually attach: plain
+text/markdown/JSON decoded directly, plus real PDF and DOCX parsing (pypdf and python-docx).
+Anything else is stored but marked unsupported — "attached" and "extracted" are tracked
+separately, so growing this list later (images via OCR, say) is an addition, not a schema change.
 """
 
 import uuid
+from io import BytesIO
 from pathlib import Path
 
+from docx import Document as DocxDocument
+from pypdf import PdfReader
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,21 +23,67 @@ settings = get_settings()
 
 _TEXT_MIME_PREFIXES = ("text/",)
 _TEXT_MIME_TYPES = {"application/json", "application/xml", "application/x-yaml"}
+_PDF_MIME = "application/pdf"
+_DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+# Caps how much of one file's text reaches the model — a single huge document otherwise crowds
+# out the rest of the conversation's context budget entirely.
+MAX_EXTRACTED_CHARS = 100_000
 
 
 def _is_text_like(mime: str) -> bool:
-    """Whether this phase knows how to pull text out of this mime type."""
+    """Whether this is read as plain UTF-8 text, no parsing library involved."""
     return mime.startswith(_TEXT_MIME_PREFIXES) or mime in _TEXT_MIME_TYPES
 
 
-def _extract_text(data: bytes, mime: str) -> tuple[str | None, ExtractStatus, str | None]:
-    """Best-effort text extraction: decode as UTF-8 for anything text-like, skip everything else."""
-    if not _is_text_like(mime):
-        return None, ExtractStatus.UNSUPPORTED, None
+def _cap(text: str) -> str:
+    """Truncate extracted text at MAX_EXTRACTED_CHARS, with a visible marker that it happened."""
+    if len(text) <= MAX_EXTRACTED_CHARS:
+        return text
+    return text[:MAX_EXTRACTED_CHARS] + "\n\n[...truncated]"
+
+
+def _extract_plain_text(data: bytes) -> tuple[str | None, ExtractStatus, str | None]:
+    """Text-like files are already text — just decode them."""
     try:
-        return data.decode("utf-8"), ExtractStatus.DONE, None
+        return _cap(data.decode("utf-8")), ExtractStatus.DONE, None
     except UnicodeDecodeError as exc:
         return None, ExtractStatus.FAILED, str(exc)
+
+
+def _extract_pdf_text(data: bytes) -> tuple[str | None, ExtractStatus, str | None]:
+    """Concatenate every page's extracted text, page breaks marked with a blank line."""
+    try:
+        reader = PdfReader(BytesIO(data))
+        text = "\n\n".join(page.extract_text() or "" for page in reader.pages)
+    except Exception as exc:  # noqa: BLE001 — pypdf raises several distinct errors for bad PDFs
+        return None, ExtractStatus.FAILED, str(exc)
+    if not text.strip():
+        return None, ExtractStatus.FAILED, "No extractable text found (the PDF may be scanned images)."
+    return _cap(text), ExtractStatus.DONE, None
+
+
+def _extract_docx_text(data: bytes) -> tuple[str | None, ExtractStatus, str | None]:
+    """Join every paragraph's text — tables and headers/footers aren't walked, just the body."""
+    try:
+        document = DocxDocument(BytesIO(data))
+        text = "\n".join(p.text for p in document.paragraphs)
+    except Exception as exc:  # noqa: BLE001 — python-docx raises several distinct errors too
+        return None, ExtractStatus.FAILED, str(exc)
+    if not text.strip():
+        return None, ExtractStatus.FAILED, "No extractable text found."
+    return _cap(text), ExtractStatus.DONE, None
+
+
+def _extract_text(data: bytes, mime: str) -> tuple[str | None, ExtractStatus, str | None]:
+    """Dispatch to the right extractor for this mime type, or mark it unsupported."""
+    if _is_text_like(mime):
+        return _extract_plain_text(data)
+    if mime == _PDF_MIME:
+        return _extract_pdf_text(data)
+    if mime == _DOCX_MIME:
+        return _extract_docx_text(data)
+    return None, ExtractStatus.UNSUPPORTED, None
 
 
 async def save_attachment(
