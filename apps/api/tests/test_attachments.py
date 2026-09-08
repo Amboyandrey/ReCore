@@ -9,6 +9,9 @@ from io import BytesIO
 import pytest
 from docx import Document as DocxDocument
 from httpx import AsyncClient
+from openpyxl import Workbook
+from pptx import Presentation
+from pptx.util import Inches
 from pypdf import PdfWriter
 from redis.asyncio import Redis
 from sqlalchemy import select
@@ -52,6 +55,30 @@ def _minimal_docx(paragraphs: list[str]) -> bytes:
         document.add_paragraph(text)
     buffer = BytesIO()
     document.save(buffer)
+    return buffer.getvalue()
+
+
+def _minimal_pptx(slide_texts: list[str]) -> bytes:
+    """A real .pptx with one text-box slide per string — python-pptx both writes and reads them."""
+    presentation = Presentation()
+    for text in slide_texts:
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6])  # blank layout
+        box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(4), Inches(1))
+        box.text_frame.text = text
+    buffer = BytesIO()
+    presentation.save(buffer)
+    return buffer.getvalue()
+
+
+def _minimal_xlsx(rows: list[list[object]]) -> bytes:
+    """A real .xlsx with the given rows on its one sheet — openpyxl both writes and reads them."""
+    workbook = Workbook()
+    sheet = workbook.active
+    assert sheet is not None
+    for row in rows:
+        sheet.append(row)
+    buffer = BytesIO()
+    workbook.save(buffer)
     return buffer.getvalue()
 
 OWNER = {"email": "owner@example.com", "password": "correct horse battery staple"}
@@ -290,3 +317,63 @@ async def test_uploading_a_docx_extracts_its_paragraphs(
     assert body["extracted_text"] is not None
     assert "First paragraph." in body["extracted_text"]
     assert "Second paragraph." in body["extracted_text"]
+
+
+async def test_uploading_a_pptx_extracts_its_slide_text(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    """A real PowerPoint file's slide text comes back, one slide per block."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    await _enable_attachments(db, redis_client, workspace_id=workspace_id)
+    conversation_id = (
+        await client.post(f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id})
+    ).json()["id"]
+
+    pptx_bytes = _minimal_pptx(["First slide.", "Second slide."])
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/attachments",
+        files={
+            "file": (
+                "deck.pptx",
+                pptx_bytes,
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            )
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["extract_status"] == "done"
+    assert body["extracted_text"] is not None
+    assert "First slide." in body["extracted_text"]
+    assert "Second slide." in body["extracted_text"]
+
+
+async def test_uploading_an_xlsx_extracts_its_cells(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    """A real spreadsheet's rows come back as tab-separated text, one sheet per block."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    await _enable_attachments(db, redis_client, workspace_id=workspace_id)
+    conversation_id = (
+        await client.post(f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id})
+    ).json()["id"]
+
+    xlsx_bytes = _minimal_xlsx([["Name", "Score"], ["Alice", 95]])
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/attachments",
+        files={
+            "file": (
+                "sheet.xlsx",
+                xlsx_bytes,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["extract_status"] == "done"
+    assert body["extracted_text"] is not None
+    assert "Name\tScore" in body["extracted_text"]
+    assert "Alice\t95" in body["extracted_text"]
