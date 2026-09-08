@@ -1,11 +1,13 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import { useRequireAuth } from "@/lib/auth-context";
 import { AttachmentError, uploadAttachment, type Attachment } from "@/lib/attachment-client";
 import {
   ChatError,
+  deleteConversation,
   getActiveGeneration,
   getConversation,
   listConversations,
@@ -52,6 +54,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
   const { loading: authLoading } = useRequireAuth();
   const { workspace, loading: wsLoading } = useWorkspaceBySlug(slug);
   const { flags } = useWorkspaceFlags(workspace?.id);
+  const router = useRouter();
   const attachmentsEnabled = flags.attachments === true;
 
   const [conversation, setConversation] = useState<Conversation | null>(null);
@@ -180,7 +183,9 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
   }
 
   function handleKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
-    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+    // Enter sends (with or without Ctrl/Cmd, for anyone's old muscle memory); only Shift+Enter
+    // falls through to the textarea's own default behavior and inserts a newline.
+    if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       e.currentTarget.form?.requestSubmit();
     }
@@ -189,6 +194,19 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
   async function handleStop() {
     if (!workspace || !activeGenerationId) return;
     await stopGeneration(workspace.id, conversationId, activeGenerationId);
+  }
+
+  async function handleDeleteConversation(id: string) {
+    if (!workspace) return;
+    try {
+      await deleteConversation(workspace.id, id);
+      setSiblings((prev) => prev.filter((c) => c.id !== id));
+      // The conversation on screen just deleted itself out from under this page — nothing left
+      // to show here, so hop to a fresh chat instead of leaving a dead 404'd thread visible.
+      if (id === conversationId) router.replace(`/w/${slug}/c/new`);
+    } catch (err) {
+      setError(err instanceof ChatError ? err.message : "Something went wrong.");
+    }
   }
 
   // Switches which model this conversation talks to, mid-session — already-sent history isn't
@@ -234,10 +252,10 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
         </Link>
         <ul className="mt-4 flex flex-col gap-1">
           {siblings.map((c) => (
-            <li key={c.id}>
+            <li key={c.id} className="group relative">
               <Link
                 href={`/w/${slug}/c/${c.id}`}
-                className={`block truncate rounded-md px-2 py-1.5 text-sm ${
+                className={`block truncate rounded-md py-1.5 pl-2 pr-7 text-sm ${
                   c.id === conversationId
                     ? "bg-surface-sunk text-text"
                     : "text-text-soft hover:bg-surface-sunk"
@@ -245,6 +263,31 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
               >
                 {c.title}
               </Link>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.preventDefault();
+                  handleDeleteConversation(c.id);
+                }}
+                aria-label={`Delete ${c.title}`}
+                title="Delete conversation"
+                className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-1 text-text-muted opacity-0 hover:text-danger group-hover:opacity-100"
+              >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  viewBox="0 0 20 20"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  className="h-3.5 w-3.5"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M4.5 5.5h11m-9 0v-1.25A1.25 1.25 0 0 1 7.75 3h4.5a1.25 1.25 0 0 1 1.25 1.25V5.5m1.75 0-.6 9.6A1.5 1.5 0 0 1 13.15 16.5h-6.3a1.5 1.5 0 0 1-1.5-1.4l-.6-9.6"
+                  />
+                </svg>
+              </button>
             </li>
           ))}
         </ul>
@@ -350,7 +393,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
             rows={2}
-            placeholder="Message… (⌘+Enter to send)"
+            placeholder="Message… (Enter to send, Shift+Enter for a new line)"
             className="flex-1 resize-none rounded-md border border-border bg-surface px-3 py-2 text-sm text-text outline-none focus:border-accent"
           />
           {sending && activeGenerationId ? (

@@ -165,6 +165,14 @@ export async function* resumeGeneration(
   yield* consumeSSE(res);
 }
 
+// Permanently deletes a conversation, its messages, attachments, and usage history.
+export async function deleteConversation(workspaceId: string, conversationId: string): Promise<void> {
+  const res = await api(`/api/v1/workspaces/${workspaceId}/conversations/${conversationId}`, {
+    method: "DELETE",
+  });
+  await throwIfNotOk(res);
+}
+
 // Signals a running generation to stop — takes effect between provider chunks, not instantly.
 export async function stopGeneration(
   workspaceId: string,
