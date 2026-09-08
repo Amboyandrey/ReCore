@@ -1,8 +1,7 @@
 "use client";
 
-import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import { useRequireAuth } from "@/lib/auth-context";
 import { AttachmentError, uploadAttachment, type Attachment } from "@/lib/attachment-client";
 import {
@@ -15,14 +14,16 @@ import {
   resumeGeneration,
   sendMessage,
   stopGeneration,
-  updateConversationModel,
+  updateConversation,
   type Conversation,
   type Message,
 } from "@/lib/chat-client";
 import { setLastModelId } from "@/lib/last-model";
+import { takePendingFirstMessage } from "@/lib/pending-first-message";
 import { listModels, type EnabledModel } from "@/lib/provider-client";
 import { useWorkspaceFlags } from "@/lib/use-workspace-flags";
 import { useWorkspaceBySlug } from "@/lib/workspace-context";
+import { ConversationSidebar } from "@/components/conversation-sidebar";
 
 // What each attachment's chip shows next to its filename — silence here is exactly how the last
 // three attachment bugs went unnoticed for as long as they did.
@@ -51,7 +52,7 @@ function pendingUserMessage(content: string): Message {
 }
 
 export function ChatThread({ slug, conversationId }: { slug: string; conversationId: string }) {
-  const { loading: authLoading } = useRequireAuth();
+  const { user, loading: authLoading } = useRequireAuth();
   const { workspace, loading: wsLoading } = useWorkspaceBySlug(slug);
   const { flags } = useWorkspaceFlags(workspace?.id);
   const router = useRouter();
@@ -74,8 +75,47 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
   const [models, setModels] = useState<EnabledModel[]>([]);
   const [modelSupportsVision, setModelSupportsVision] = useState(false);
   const [switchingModel, setSwitchingModel] = useState(false);
+  const [togglingShared, setTogglingShared] = useState(false);
 
   const bottomRef = useRef<HTMLDivElement>(null);
+
+  // The actual send, independent of the composer form — also how a draft chat's first message
+  // (queued by the c/new page before it navigated here, see lib/pending-first-message.ts) gets
+  // sent the instant this page mounts, without the user having to retype or re-click anything.
+  // Wrapped in useCallback (stable as long as workspace/conversationId don't change) so the load
+  // effect below can call it without either re-running on every render or lying about its deps.
+  const sendChat = useCallback(
+    async (content: string, attachmentIds: string[]) => {
+      if (!workspace) return;
+      setSending(true);
+      setStreamingText("");
+      setError(null);
+      setMessages((prev) => [...prev, pendingUserMessage(content)]);
+
+      // Best-effort: grab the generation id shortly after starting, so Stop has something to call.
+      getActiveGeneration(workspace.id, conversationId).then((id) => id && setActiveGenerationId(id));
+
+      try {
+        for await (const evt of sendMessage(
+          workspace.id,
+          conversationId,
+          content,
+          undefined,
+          attachmentIds
+        )) {
+          if (evt.event === "delta") setStreamingText((prev) => prev + evt.data.text);
+        }
+      } catch (err) {
+        setError(err instanceof ChatError ? err.message : "Something went wrong.");
+      } finally {
+        setMessages(await listMessages(workspace.id, conversationId));
+        setStreamingText("");
+        setActiveGenerationId(null);
+        setSending(false);
+      }
+    },
+    [workspace, conversationId]
+  );
 
   // Initial load, then — the only way a page reload can discover a reply was mid-stream — check
   // for and resume an in-flight generation. Every setState here happens strictly after an
@@ -104,6 +144,16 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
         );
         setLoadingData(false);
 
+        // A draft chat's first message, queued by c/new right before it navigated here (see
+        // lib/pending-first-message.ts) — sent now, the instant this conversation actually
+        // exists, rather than making the user retype or re-click Send.
+        const pending = takePendingFirstMessage(conversationId);
+        if (pending) {
+          if (cancelled) return;
+          await sendChat(pending.content, pending.attachmentIds);
+          return;
+        }
+
         if (activeId) {
           setActiveGenerationId(activeId);
           for await (const evt of resumeGeneration(workspace.id, conversationId, activeId)) {
@@ -125,7 +175,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     return () => {
       cancelled = true;
     };
-  }, [workspace, conversationId]);
+  }, [workspace, conversationId, sendChat]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -140,26 +190,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     const attachmentIds = pendingAttachments.map((a) => a.id);
     setInput("");
     setPendingAttachments([]);
-    setSending(true);
-    setStreamingText("");
-    setError(null);
-    setMessages((prev) => [...prev, pendingUserMessage(content)]);
-
-    // Best-effort: grab the generation id shortly after starting, so Stop has something to call.
-    getActiveGeneration(workspace.id, conversationId).then((id) => id && setActiveGenerationId(id));
-
-    try {
-      for await (const evt of sendMessage(workspace.id, conversationId, content, undefined, attachmentIds)) {
-        if (evt.event === "delta") setStreamingText((prev) => prev + evt.data.text);
-      }
-    } catch (err) {
-      setError(err instanceof ChatError ? err.message : "Something went wrong.");
-    } finally {
-      setMessages(await listMessages(workspace.id, conversationId));
-      setStreamingText("");
-      setActiveGenerationId(null);
-      setSending(false);
-    }
+    await sendChat(content, attachmentIds);
   }
 
   async function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
@@ -216,7 +247,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     setSwitchingModel(true);
     setError(null);
     try {
-      const updated = await updateConversationModel(workspace.id, conversationId, modelId);
+      const updated = await updateConversation(workspace.id, conversationId, { model_id: modelId });
       setConversation(updated);
       setModelSupportsVision(models.find((m) => m.id === modelId)?.supports_vision ?? false);
       setLastModelId(workspace.id, modelId);
@@ -224,6 +255,21 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
       setError(err instanceof ChatError ? err.message : "Something went wrong.");
     } finally {
       setSwitchingModel(false);
+    }
+  }
+
+  // Only the conversation's owner may share or unshare it — enforced server-side too; this just
+  // keeps the UI from offering a control that would 403.
+  async function handleToggleShared(shared: boolean) {
+    if (!workspace) return;
+    setTogglingShared(true);
+    setError(null);
+    try {
+      setConversation(await updateConversation(workspace.id, conversationId, { shared }));
+    } catch (err) {
+      setError(err instanceof ChatError ? err.message : "Something went wrong.");
+    } finally {
+      setTogglingShared(false);
     }
   }
 
@@ -241,75 +287,62 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
   const hasBlockedImage =
     !modelSupportsVision && pendingAttachments.some((a) => a.extract_status === "passthrough");
 
+  const isOwner = conversation.user_id === user?.id;
+
   return (
     <div className="mx-auto flex max-w-5xl gap-6 px-6 py-8">
-      <aside className="hidden w-56 shrink-0 sm:block">
-        <Link
-          href={`/w/${slug}/c/new`}
-          className="block rounded-md border border-border px-3 py-2 text-center text-sm text-accent"
-        >
-          + New chat
-        </Link>
-        <ul className="mt-4 flex flex-col gap-1">
-          {siblings.map((c) => (
-            <li key={c.id} className="group relative">
-              <Link
-                href={`/w/${slug}/c/${c.id}`}
-                className={`block truncate rounded-md py-1.5 pl-2 pr-7 text-sm ${
-                  c.id === conversationId
-                    ? "bg-surface-sunk text-text"
-                    : "text-text-soft hover:bg-surface-sunk"
-                }`}
-              >
-                {c.title}
-              </Link>
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.preventDefault();
-                  handleDeleteConversation(c.id);
-                }}
-                aria-label={`Delete ${c.title}`}
-                title="Delete conversation"
-                className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-1 text-text-muted opacity-0 hover:text-danger group-hover:opacity-100"
-              >
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  viewBox="0 0 20 20"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.5"
-                  className="h-3.5 w-3.5"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    d="M4.5 5.5h11m-9 0v-1.25A1.25 1.25 0 0 1 7.75 3h4.5a1.25 1.25 0 0 1 1.25 1.25V5.5m1.75 0-.6 9.6A1.5 1.5 0 0 1 13.15 16.5h-6.3a1.5 1.5 0 0 1-1.5-1.4l-.6-9.6"
-                  />
-                </svg>
-              </button>
-            </li>
-          ))}
-        </ul>
-      </aside>
+      <ConversationSidebar
+        slug={slug}
+        currentUserId={user?.id}
+        activeConversationId={conversationId}
+        conversations={siblings}
+        onDelete={handleDeleteConversation}
+      />
 
       <div className="flex min-h-[70vh] flex-1 flex-col">
         <div className="flex items-center justify-between gap-3">
           <h1 className="truncate text-lg font-semibold text-text">{conversation.title}</h1>
-          {models.length > 0 && (
-            <select
-              value={conversation.model_id}
-              onChange={(e) => handleModelChange(e.target.value)}
-              disabled={switchingModel || sending}
-              className="shrink-0 rounded-md border border-border bg-surface px-2 py-1 text-xs text-text-soft outline-none focus:border-accent disabled:opacity-60"
-            >
-              {models.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.display_name}
-                </option>
-              ))}
-            </select>
-          )}
+          <div className="flex shrink-0 items-center gap-2">
+            {isOwner ? (
+              <button
+                type="button"
+                onClick={() => handleToggleShared(!conversation.shared)}
+                disabled={togglingShared}
+                title={
+                  conversation.shared
+                    ? "Visible to the whole workspace — click to make private"
+                    : "Private to you — click to share with the workspace"
+                }
+                className={`rounded-md border px-2 py-1 text-xs disabled:opacity-60 ${
+                  conversation.shared
+                    ? "border-accent/40 bg-accent/10 text-accent"
+                    : "border-border text-text-soft hover:border-border-strong"
+                }`}
+              >
+                {conversation.shared ? "Shared" : "Private"}
+              </button>
+            ) : (
+              conversation.shared && (
+                <span className="rounded-md border border-accent/40 bg-accent/10 px-2 py-1 text-xs text-accent">
+                  Shared with you
+                </span>
+              )
+            )}
+            {models.length > 0 && (
+              <select
+                value={conversation.model_id}
+                onChange={(e) => handleModelChange(e.target.value)}
+                disabled={switchingModel || sending}
+                className="rounded-md border border-border bg-surface px-2 py-1 text-xs text-text-soft outline-none focus:border-accent disabled:opacity-60"
+              >
+                {models.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.display_name}
+                  </option>
+                ))}
+              </select>
+            )}
+          </div>
         </div>
 
         {error && (

@@ -2,9 +2,12 @@ import { apiPublicUrl } from "./config";
 
 export type Conversation = {
   id: string;
+  user_id: string;
   title: string;
   model_id: string;
   system_prompt: string | null;
+  // Private to user_id until they opt it into being visible to the rest of the workspace.
+  shared: boolean;
   created_at: string;
   updated_at: string;
 };
@@ -91,16 +94,18 @@ export async function createConversation(workspaceId: string, modelId: string): 
   return (await res.json()) as Conversation;
 }
 
-// Switches a conversation to a different one of the workspace's enabled models — mid-session,
-// not just at the start. History already sent isn't resent to the new model.
-export async function updateConversationModel(
+// Changes a conversation after it's started — only the fields passed are touched. `model_id`
+// switches which enabled model it talks to mid-session (history already sent isn't resent to the
+// new one); `shared` is its owner opting it into being visible to the rest of the workspace, or
+// back out of it — only the owner may change that field.
+export async function updateConversation(
   workspaceId: string,
   conversationId: string,
-  modelId: string
+  changes: { model_id?: string; shared?: boolean }
 ): Promise<Conversation> {
   const res = await api(`/api/v1/workspaces/${workspaceId}/conversations/${conversationId}`, {
     method: "PATCH",
-    body: JSON.stringify({ model_id: modelId }),
+    body: JSON.stringify(changes),
   });
   await throwIfNotOk(res);
   return (await res.json()) as Conversation;
