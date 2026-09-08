@@ -4,6 +4,7 @@ The only endpoints virtually every one of these implements are `GET /models` (re
 validating a credential) and `POST /chat/completions` with `stream: true` (chat itself).
 """
 
+import base64
 import json
 from collections.abc import AsyncIterator, Sequence
 
@@ -23,6 +24,21 @@ from app.providers.base import (
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 _TIMEOUT = 10.0
 _STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
+
+
+def _content(message: ChatMessage) -> str | list[dict[str, object]]:
+    """A bare string when there's nothing but text — some OpenAI-compatible servers (older
+    Ollama, vLLM builds) reject the block-array form even for plain text, so it's only ever
+    built when an image actually needs to ride alongside it."""
+    if not message.images:
+        return message.content
+    blocks: list[dict[str, object]] = [{"type": "text", "text": message.content}]
+    for image in message.images:
+        encoded = base64.b64encode(image.data).decode("ascii")
+        blocks.append(
+            {"type": "image_url", "image_url": {"url": f"data:{image.mime};base64,{encoded}"}}
+        )
+    return blocks
 
 
 class OpenAICompatibleProvider:
@@ -73,7 +89,7 @@ class OpenAICompatibleProvider:
         """Stream a chat completion, translating OpenAI's SSE chunks into normalized Chunks."""
         payload = {
             "model": model,
-            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "messages": [{"role": m.role, "content": _content(m)} for m in messages],
             "max_tokens": max_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},

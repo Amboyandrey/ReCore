@@ -7,7 +7,7 @@ export type Attachment = {
   original_filename: string;
   mime: string;
   size: number;
-  extract_status: "pending" | "done" | "failed" | "unsupported";
+  extract_status: "pending" | "done" | "failed" | "unsupported" | "passthrough";
   extracted_text: string | null;
   created_at: string;
 };

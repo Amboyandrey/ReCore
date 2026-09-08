@@ -5,6 +5,7 @@ shapes follow the published API, and are exercised against a fake transport in t
 way the OpenAI-compatible adapter is.
 """
 
+import base64
 import json
 from collections.abc import AsyncIterator, Sequence
 
@@ -24,6 +25,16 @@ from app.providers.base import (
 DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 _TIMEOUT = 10.0
 _STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
+
+
+def _parts(message: ChatMessage) -> list[dict[str, object]]:
+    """Google's `parts` is always a list — unlike the other two adapters there's no bare-string
+    form to preserve, so this always appends an inline_data part when the turn has an image."""
+    parts: list[dict[str, object]] = [{"text": message.content}]
+    for image in message.images:
+        encoded = base64.b64encode(image.data).decode("ascii")
+        parts.append({"inline_data": {"mime_type": image.mime, "data": encoded}})
+    return parts
 
 
 class GoogleProvider:
@@ -87,7 +98,7 @@ class GoogleProvider:
         system_prompt = next((m.content for m in messages if m.role == "system"), None)
         payload: dict[str, object] = {
             "contents": [
-                {"role": "model" if m.role == "assistant" else "user", "parts": [{"text": m.content}]}
+                {"role": "model" if m.role == "assistant" else "user", "parts": _parts(m)}
                 for m in messages
                 if m.role != "system"
             ],

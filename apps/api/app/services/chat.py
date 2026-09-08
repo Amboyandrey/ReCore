@@ -10,21 +10,35 @@ keeps writing to Redis (and, at the end, the database) whether or not anyone is 
 import asyncio
 import time
 import uuid
+from collections import defaultdict
 from datetime import UTC, datetime
-from typing import Literal, cast
 
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import async_session_factory, set_workspace_scope
-from app.core.errors import ConversationNotFound, ModelNotFound, ProviderDisabled
+from app.core.errors import (
+    ConversationNotFound,
+    ModelDoesNotSupportImages,
+    ModelNotFound,
+    ProviderDisabled,
+)
 from app.core.redis import new_redis_client
 from app.core.tracing import get_tracer
-from app.models import Attachment, Conversation, LLMModel, Message, MessageRole, Provider, User
-from app.providers.base import ChatMessage, Done, LLMProvider, StreamError, TextDelta, Usage
+from app.models import (
+    Attachment,
+    Conversation,
+    ExtractStatus,
+    LLMModel,
+    Message,
+    MessageRole,
+    Provider,
+    User,
+)
+from app.providers.base import ChatMessage, Done, ImagePart, LLMProvider, StreamError, TextDelta, Usage
 from app.providers.registry import build_provider
-from app.services.attachments import attach_to_message
+from app.services.attachments import attach_to_message, read_attachment_bytes
 from app.services.credentials import decrypt_credential_key, get_credential
 from app.services.flags import evaluate_flag
 from app.services.generations import (
@@ -39,6 +53,14 @@ tracer = get_tracer(__name__)
 
 MAX_TOKENS = 4096
 TITLE_MAX_LENGTH = 60
+
+# Bounds the raw image bytes carried across one request's assembled history. Unlike text, images
+# live in `history` as actual bytes for the life of the background generation task (up to the
+# stream's timeout) and get re-sent — at real image-token cost — on every subsequent turn. Without
+# a cap, a handful of phone photos early in a long conversation would silently balloon every later
+# turn's request size and cost.
+MAX_HISTORY_IMAGES = 10
+MAX_HISTORY_IMAGE_BYTES = 20 * 1024 * 1024
 
 # Holds strong references to in-flight generation tasks so they aren't garbage-collected mid-run
 # (asyncio only guarantees a task survives while something still refers to it).
@@ -119,28 +141,93 @@ async def list_messages(db: AsyncSession, *, conversation_id: uuid.UUID) -> list
     return list((await db.scalars(stmt)).all())
 
 
-def _augment_with_attachments(content: str, attachments: list[Attachment]) -> str:
-    """What the model actually reads: the user's text, followed by any extracted attachment text.
+def _augment_with_attachments(
+    content: str, attachments: list[Attachment]
+) -> tuple[str, tuple[ImagePart, ...]]:
+    """What the model actually reads: the user's text, any extracted attachment text folded in,
+    and any image attachments as native image parts (see providers/base.py's ImagePart).
 
     The stored Message keeps just `content` — this augmented version only ever reaches the
     provider call, so the conversation view shows what the user typed, not what the model saw.
     """
     parts = [content]
+    images: list[ImagePart] = []
     for attachment in attachments:
         if attachment.extracted_text:
             parts.append(f"[Attached file: {attachment.original_filename}]\n{attachment.extracted_text}")
-    return "\n\n".join(parts)
+        elif attachment.extract_status == ExtractStatus.PASSTHROUGH:
+            images.append(ImagePart(mime=attachment.mime, data=read_attachment_bytes(attachment)))
+    return "\n\n".join(parts), tuple(images)
 
 
-def _to_chat_history(conversation: Conversation, messages: list[Message]) -> list[ChatMessage]:
-    """Translate stored messages into the plain role/content shape every provider adapter takes."""
+async def _attachments_by_message_id(
+    db: AsyncSession, message_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, list[Attachment]]:
+    """Load every attachment sent with any of these messages, grouped by message id — the join
+    _to_chat_history needs to rebuild each past turn exactly as it was actually sent."""
+    if not message_ids:
+        return {}
+    stmt = (
+        select(Attachment)
+        .where(Attachment.message_id.in_(message_ids))
+        .order_by(Attachment.created_at)
+    )
+    grouped: dict[uuid.UUID, list[Attachment]] = defaultdict(list)
+    for attachment in (await db.scalars(stmt)).all():
+        assert attachment.message_id is not None  # the query above filtered on exactly that
+        grouped[attachment.message_id].append(attachment)
+    return grouped
+
+
+def _apply_image_budget(history: list[ChatMessage]) -> list[ChatMessage]:
+    """Cap the raw image bytes carried in one request's assembled history to MAX_HISTORY_IMAGES /
+    MAX_HISTORY_IMAGE_BYTES, keeping the most recent images and dropping the oldest first — a
+    conversation five turns deep shouldn't still be paying to resend a screenshot from turn one.
+    Text extracted from the same attachments is untouched; only the (much heavier) raw image
+    bytes are bounded.
+    """
+    kept_count = 0
+    kept_bytes = 0
+    result: list[ChatMessage] = []
+    for message in reversed(history):
+        if not message.images:
+            result.append(message)
+            continue
+        kept_images: list[ImagePart] = []
+        for image in reversed(message.images):
+            if kept_count >= MAX_HISTORY_IMAGES or kept_bytes + len(image.data) > MAX_HISTORY_IMAGE_BYTES:
+                continue
+            kept_images.append(image)
+            kept_count += 1
+            kept_bytes += len(image.data)
+        kept_images.reverse()
+        result.append(ChatMessage(role=message.role, content=message.content, images=tuple(kept_images)))
+    result.reverse()
+    return result
+
+
+async def _to_chat_history(
+    db: AsyncSession, conversation: Conversation, messages: list[Message]
+) -> list[ChatMessage]:
+    """Translate stored messages into the plain role/content shape every provider adapter takes —
+    replaying each past turn exactly as it was actually sent, attachments included.
+
+    `Message.content` only ever holds what the user typed (see _augment_with_attachments) — a
+    version of this that replayed straight from `content` would silently forget every attachment
+    the moment the conversation moved past the turn it was attached to, which is exactly the bug
+    a user hit three times over with attachment text before this fix.
+    """
     history = []
     if conversation.system_prompt:
         history.append(ChatMessage(role="system", content=conversation.system_prompt))
+    user_message_ids = [m.id for m in messages if m.role == MessageRole.USER]
+    attachments_by_message = await _attachments_by_message_id(db, user_message_ids)
     for m in messages:
-        if m.role in (MessageRole.USER, MessageRole.ASSISTANT):
-            role = cast(Literal["user", "assistant"], m.role.value)
-            history.append(ChatMessage(role=role, content=m.content))
+        if m.role == MessageRole.USER:
+            text, images = _augment_with_attachments(m.content, attachments_by_message.get(m.id, []))
+            history.append(ChatMessage(role="user", content=text, images=images))
+        elif m.role == MessageRole.ASSISTANT:
+            history.append(ChatMessage(role="assistant", content=m.content))
     return history
 
 
@@ -182,26 +269,37 @@ async def send_message(
 
     user_message = Message(conversation_id=conversation.id, role=MessageRole.USER, content=content)
     db.add(user_message)
-    if is_first_message:
-        conversation.title = _heuristic_title(content)
-    conversation.updated_at = datetime.now(UTC)
-    await db.commit()
-    # Committed above (not just flushed): the background task below opens its own session in a
-    # separate connection and must be able to see this row the moment it starts.
-    # `app.workspace_id` is transaction-local (see set_workspace_scope) and that commit just
-    # ended the transaction it was set for — reset it before the attachment lookup below, or
-    # row-level security blocks it as if this connection had never been through get_workspace_ctx.
-    await set_workspace_scope(db, workspace_id)
+    await db.flush()  # materializes user_message.id for attach_to_message below — not a commit yet
 
     attachments: list[Attachment] = []
     if attachment_ids:
         attachments = await attach_to_message(
             db, conversation_id=conversation.id, attachment_ids=attachment_ids, message_id=user_message.id
         )
-        await db.commit()
+    if not model.supports_vision and any(
+        a.extract_status == ExtractStatus.PASSTHROUGH for a in attachments
+    ):
+        # Raised pre-flight: nothing above this point has been committed, so get_db()'s
+        # rollback-on-exception undoes the message insert and the attachment linkage together,
+        # exactly as if this send had never been attempted.
+        raise ModelDoesNotSupportImages()
 
-    history = _to_chat_history(conversation, [*existing_messages])
-    history.append(ChatMessage(role="user", content=_augment_with_attachments(content, attachments)))
+    if is_first_message:
+        conversation.title = _heuristic_title(content)
+    conversation.updated_at = datetime.now(UTC)
+    await db.commit()
+    # Committed above (not just flushed): the background task below opens its own session in a
+    # separate connection and must be able to see this row (and any attachments just linked to
+    # it) the moment it starts. `app.workspace_id` is transaction-local (see set_workspace_scope)
+    # and that commit just ended the transaction it was set for — reset it before building
+    # history below, which reads attachments back out of the (row-level-security-protected)
+    # database via _to_chat_history's join.
+    await set_workspace_scope(db, workspace_id)
+
+    history = await _to_chat_history(db, conversation, [*existing_messages])
+    text, images = _augment_with_attachments(content, attachments)
+    history.append(ChatMessage(role="user", content=text, images=images))
+    history = _apply_image_budget(history)
 
     api_key = decrypt_credential_key(credential)
     provider = build_provider(credential.provider, api_key=api_key, base_url=credential.base_url)

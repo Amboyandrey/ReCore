@@ -23,11 +23,30 @@ class CredentialCheck:
 
 
 @dataclass(frozen=True)
+class ImagePart:
+    """One image sent alongside a turn's text.
+
+    Raw bytes, not pre-encoded — each adapter base64-encodes into its own wire format, rather
+    than every caller (and every history-replay path) guessing what a specific provider wants.
+    """
+
+    mime: str
+    data: bytes
+
+
+@dataclass(frozen=True)
 class ChatMessage:
-    """One turn to send to a provider — a plain role and its text content."""
+    """One turn to send to a provider — a role, its text, and any images attached to it."""
 
     role: Literal["user", "assistant", "system"]
     content: str
+    images: tuple[ImagePart, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Anthropic and OpenAI both reject images outside a user turn, and a system prompt has
+        nowhere to put one — enforced here once, so no adapter has to defend against it itself."""
+        if self.images and self.role != "user":
+            raise ValueError("Only user turns can carry images.")
 
 
 @dataclass(frozen=True)

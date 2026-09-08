@@ -32,6 +32,7 @@ async def enable_model(
     context_window: int | None,
     cost_per_mtok_in: float | None,
     cost_per_mtok_out: float | None,
+    supports_vision: bool,
 ) -> LLMModel:
     """Make a credential's model available for chat, re-enabling it if it was disabled before."""
     await get_credential(db, workspace_id=workspace_id, credential_id=credential_id)  # 404s if not ours
@@ -47,6 +48,7 @@ async def enable_model(
         existing.context_window = context_window
         existing.cost_per_mtok_in = cost_per_mtok_in
         existing.cost_per_mtok_out = cost_per_mtok_out
+        existing.supports_vision = supports_vision
         await db.flush()
         return existing
 
@@ -58,6 +60,7 @@ async def enable_model(
         context_window=context_window,
         cost_per_mtok_in=cost_per_mtok_in,
         cost_per_mtok_out=cost_per_mtok_out,
+        supports_vision=supports_vision,
     )
     db.add(model)
     await db.flush()

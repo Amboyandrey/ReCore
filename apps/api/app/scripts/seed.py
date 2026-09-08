@@ -77,6 +77,9 @@ async def _seed_provider(db: AsyncSession, *, workspace_id: uuid.UUID, created_b
             context_window=model.context_window,
             cost_per_mtok_in=None,
             cost_per_mtok_out=None,
+            # Model ids can't be reliably classified — same reasoning as the admin checkbox this
+            # mirrors in providers-settings.tsx. An admin can flip it on after seeding.
+            supports_vision=False,
         )
         await db.commit()
         logger.info("seed.provider_ready", provider=provider_name, model=model.id)

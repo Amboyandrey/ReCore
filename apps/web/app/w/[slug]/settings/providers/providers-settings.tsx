@@ -46,6 +46,9 @@ export function ProvidersSettings({ slug }: { slug: string }) {
   const [browseCredentialId, setBrowseCredentialId] = useState("");
   const [available, setAvailable] = useState<AvailableModel[] | null>(null);
   const [browsing, setBrowsing] = useState(false);
+  // Which of the currently-browsed available models the admin has checked "supports images" for
+  // — read at enable time, since AvailableModel (what the provider reports) has no such field.
+  const [visionChoices, setVisionChoices] = useState<Record<string, boolean>>({});
 
   // Deferred entirely into .then()/.finally() — see workspace-context.tsx for why: calling
   // setState directly at an effect's top level (even in an early-return branch) risks cascading
@@ -123,6 +126,7 @@ export function ProvidersSettings({ slug }: { slug: string }) {
         provider_model_id: m.id,
         display_name: m.display_name,
         context_window: m.context_window,
+        supports_vision: visionChoices[m.id] ?? false,
       });
       setModels((prev) => [...prev.filter((x) => x.id !== enabled.id), enabled]);
     } catch (err) {
@@ -145,6 +149,27 @@ export function ProvidersSettings({ slug }: { slug: string }) {
         context_window: m.context_window,
         cost_per_mtok_in: field === "cost_per_mtok_in" ? numeric : m.cost_per_mtok_in,
         cost_per_mtok_out: field === "cost_per_mtok_out" ? numeric : m.cost_per_mtok_out,
+        // enable_model() overwrites every field on a re-enable, this pricing edit included — omit
+        // this and a price edit would silently turn vision back off.
+        supports_vision: m.supports_vision,
+      });
+      setModels((prev) => prev.map((x) => (x.id === updated.id ? updated : x)));
+    } catch (err) {
+      setError(err instanceof ProviderError ? err.message : "Something went wrong.");
+    }
+  }
+
+  async function handleVisionChange(m: EnabledModel, supportsVision: boolean) {
+    if (!workspace) return;
+    try {
+      const updated = await enableModel(workspace.id, {
+        credential_id: m.credential_id,
+        provider_model_id: m.provider_model_id,
+        display_name: m.display_name,
+        context_window: m.context_window,
+        cost_per_mtok_in: m.cost_per_mtok_in,
+        cost_per_mtok_out: m.cost_per_mtok_out,
+        supports_vision: supportsVision,
       });
       setModels((prev) => prev.map((x) => (x.id === updated.id ? updated : x)));
     } catch (err) {
@@ -334,14 +359,27 @@ export function ProvidersSettings({ slug }: { slug: string }) {
                         </span>
                       )}
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => handleEnable(m)}
-                      disabled={alreadyEnabled}
-                      className="text-xs text-accent hover:underline disabled:text-text-muted disabled:no-underline"
-                    >
-                      {alreadyEnabled ? "Enabled" : "Enable"}
-                    </button>
+                    <div className="flex items-center gap-3">
+                      <label className="flex items-center gap-1.5 text-xs text-text-soft">
+                        <input
+                          type="checkbox"
+                          checked={visionChoices[m.id] ?? false}
+                          disabled={alreadyEnabled}
+                          onChange={(e) =>
+                            setVisionChoices((prev) => ({ ...prev, [m.id]: e.target.checked }))
+                          }
+                        />
+                        Supports images
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => handleEnable(m)}
+                        disabled={alreadyEnabled}
+                        className="text-xs text-accent hover:underline disabled:text-text-muted disabled:no-underline"
+                      >
+                        {alreadyEnabled ? "Enabled" : "Enable"}
+                      </button>
+                    </div>
                   </li>
                 );
               })}
@@ -360,6 +398,7 @@ export function ProvidersSettings({ slug }: { slug: string }) {
                   <th className="px-4 py-2 font-medium">Model</th>
                   <th className="px-4 py-2 font-medium">$ / Mtok in</th>
                   <th className="px-4 py-2 font-medium">$ / Mtok out</th>
+                  <th className="px-4 py-2 font-medium">Vision</th>
                   <th className="px-4 py-2 font-medium" />
                 </tr>
               </thead>
@@ -385,6 +424,13 @@ export function ProvidersSettings({ slug }: { slug: string }) {
                         defaultValue={m.cost_per_mtok_out ?? ""}
                         onBlur={(e) => handlePricingChange(m, "cost_per_mtok_out", e.target.value)}
                         className="w-20 rounded-md border border-border bg-surface px-2 py-1 text-sm text-text"
+                      />
+                    </td>
+                    <td className="px-4 py-2">
+                      <input
+                        type="checkbox"
+                        checked={m.supports_vision}
+                        onChange={(e) => handleVisionChange(m, e.target.checked)}
                       />
                     </td>
                     <td className="px-4 py-2 text-right">

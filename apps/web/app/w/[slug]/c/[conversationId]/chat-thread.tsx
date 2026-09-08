@@ -16,8 +16,19 @@ import {
   type Conversation,
   type Message,
 } from "@/lib/chat-client";
+import { listModels } from "@/lib/provider-client";
 import { useWorkspaceFlags } from "@/lib/use-workspace-flags";
 import { useWorkspaceBySlug } from "@/lib/workspace-context";
+
+// What each attachment's chip shows next to its filename — silence here is exactly how the last
+// three attachment bugs went unnoticed for as long as they did.
+const EXTRACT_STATUS_LABEL: Record<Attachment["extract_status"], string> = {
+  pending: "processing…",
+  done: "text extracted",
+  passthrough: "sent as image",
+  unsupported: "format not supported",
+  failed: "couldn't be read",
+};
 
 // A locally-synthesized user turn shown the instant it's sent, before the server confirms it —
 // swapped for the real persisted list once the reply finishes.
@@ -53,6 +64,10 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
   const [activeGenerationId, setActiveGenerationId] = useState<string | null>(null);
   const [pendingAttachments, setPendingAttachments] = useState<Attachment[]>([]);
   const [uploading, setUploading] = useState(false);
+  // Whether this conversation's model accepts images — looked up from the workspace's enabled
+  // models (list_models only requires VIEWER, so any member can call it), not the conversation
+  // itself, since Conversation only carries a model_id.
+  const [modelSupportsVision, setModelSupportsVision] = useState(false);
 
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -66,16 +81,18 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     async function load() {
       if (!workspace) return;
       try {
-        const [conv, convs, msgs, activeId] = await Promise.all([
+        const [conv, convs, msgs, activeId, models] = await Promise.all([
           getConversation(workspace.id, conversationId),
           listConversations(workspace.id),
           listMessages(workspace.id, conversationId),
           getActiveGeneration(workspace.id, conversationId),
+          listModels(workspace.id),
         ]);
         if (cancelled) return;
         setConversation(conv);
         setSiblings(convs);
         setMessages(msgs);
+        setModelSupportsVision(models.find((m) => m.id === conv.model_id)?.supports_vision ?? false);
         setLoadingData(false);
 
         if (activeId) {
@@ -107,7 +124,9 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
 
   async function handleSend(e: FormEvent) {
     e.preventDefault();
-    if (!workspace || !input.trim() || sending) return;
+    const blockedImage =
+      !modelSupportsVision && pendingAttachments.some((a) => a.extract_status === "passthrough");
+    if (!workspace || !input.trim() || sending || blockedImage) return;
     const content = input;
     const attachmentIds = pendingAttachments.map((a) => a.id);
     setInput("");
@@ -177,6 +196,9 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     );
   }
 
+  const hasBlockedImage =
+    !modelSupportsVision && pendingAttachments.some((a) => a.extract_status === "passthrough");
+
   return (
     <div className="mx-auto flex max-w-5xl gap-6 px-6 py-8">
       <aside className="hidden w-56 shrink-0 sm:block">
@@ -241,23 +263,39 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
 
         {attachmentsEnabled && pendingAttachments.length > 0 && (
           <ul className="mt-4 flex flex-wrap gap-2">
-            {pendingAttachments.map((a) => (
-              <li
-                key={a.id}
-                className="flex items-center gap-2 rounded-full border border-border bg-surface px-3 py-1 text-xs text-text-soft"
-              >
-                <span className="max-w-[12rem] truncate">{a.original_filename}</span>
-                <button
-                  type="button"
-                  onClick={() => handleRemoveAttachment(a.id)}
-                  className="text-text-muted hover:text-danger"
-                  aria-label={`Remove ${a.original_filename}`}
+            {pendingAttachments.map((a) => {
+              const blocked = a.extract_status === "passthrough" && !modelSupportsVision;
+              return (
+                <li
+                  key={a.id}
+                  className={`flex items-center gap-2 rounded-full border px-3 py-1 text-xs ${
+                    blocked || a.extract_status === "failed" || a.extract_status === "unsupported"
+                      ? "border-danger/40 bg-danger/10 text-danger"
+                      : "border-border bg-surface text-text-soft"
+                  }`}
                 >
-                  ×
-                </button>
-              </li>
-            ))}
+                  <span className="max-w-[12rem] truncate">{a.original_filename}</span>
+                  <span className="text-[0.65rem] uppercase tracking-wide opacity-80">
+                    {blocked ? "model can't read images" : EXTRACT_STATUS_LABEL[a.extract_status]}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => handleRemoveAttachment(a.id)}
+                    className="text-text-muted hover:text-danger"
+                    aria-label={`Remove ${a.original_filename}`}
+                  >
+                    ×
+                  </button>
+                </li>
+              );
+            })}
           </ul>
+        )}
+
+        {hasBlockedImage && (
+          <p className="mt-2 text-xs text-danger">
+            This model can&apos;t read images. Remove the image or switch to a vision-capable model.
+          </p>
         )}
 
         <form onSubmit={handleSend} className="mt-4 flex items-end gap-2">
@@ -286,7 +324,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
           ) : (
             <button
               type="submit"
-              disabled={sending || !input.trim()}
+              disabled={sending || !input.trim() || hasBlockedImage}
               className="rounded-md bg-accent px-3 py-2 text-sm font-medium text-accent-contrast disabled:opacity-60"
             >
               Send

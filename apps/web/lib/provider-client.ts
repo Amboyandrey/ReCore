@@ -26,6 +26,9 @@ export type EnabledModel = {
   // Reflects that provider's killswitch flag — false greys the model out in pickers rather than
   // removing it from the catalog (see ARCHITECTURE.md #8's provider-killswitch demo).
   provider_enabled: boolean;
+  // Whether this model accepts image attachments — set by an admin at enable time (model ids
+  // can't be reliably classified across arbitrary OpenAI-compatible endpoints).
+  supports_vision: boolean;
 };
 
 export class ProviderError extends Error {}
@@ -94,6 +97,9 @@ export async function enableModel(
     context_window?: number | null;
     cost_per_mtok_in?: number | null;
     cost_per_mtok_out?: number | null;
+    // Defaults false server-side, not inferred — omitting it on a re-enable (e.g. a price edit)
+    // would silently turn vision back off, so every caller must pass the model's current value.
+    supports_vision?: boolean;
   }
 ): Promise<EnabledModel> {
   const res = await api(`/api/v1/workspaces/${workspaceId}/models`, {
