@@ -17,6 +17,9 @@ class FakeProvider:
     def __init__(self, api_key: str, base_url: str | None = None) -> None:
         del base_url  # unused — the fake has nowhere to send requests
         self._valid = api_key == VALID_KEY
+        # Set by stream() on every call — lets a test assert on what it was actually handed
+        # (images included) without needing a real network call to inspect.
+        self.last_messages: Sequence[ChatMessage] = ()
 
     async def validate(self) -> CredentialCheck:
         """Report success only for the one key this fake recognizes."""
@@ -38,6 +41,7 @@ class FakeProvider:
     ) -> AsyncIterator[Chunk]:
         """Yield a fixed reply word by word, then usage and a normal finish."""
         del model, max_tokens
+        self.last_messages = messages
         input_tokens = sum(len(m.content.split()) for m in messages)
         for word in FAKE_REPLY.split(" "):
             yield TextDelta(text=word + " ")

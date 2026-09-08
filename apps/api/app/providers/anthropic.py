@@ -5,6 +5,7 @@ shapes follow Anthropic's published Messages and Models APIs, and are exercised 
 transport in tests the same way the OpenAI-compatible adapter is.
 """
 
+import base64
 import json
 from collections.abc import AsyncIterator, Sequence
 
@@ -25,6 +26,23 @@ DEFAULT_BASE_URL = "https://api.anthropic.com/v1"
 ANTHROPIC_VERSION = "2023-06-01"
 _TIMEOUT = 10.0
 _STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
+
+
+def _content(message: ChatMessage) -> str | list[dict[str, object]]:
+    """A bare string when there's nothing but text; Anthropic's block form is only ever built
+    once an image actually needs to ride alongside it."""
+    if not message.images:
+        return message.content
+    blocks: list[dict[str, object]] = [{"type": "text", "text": message.content}]
+    for image in message.images:
+        encoded = base64.b64encode(image.data).decode("ascii")
+        blocks.append(
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": image.mime, "data": encoded},
+            }
+        )
+    return blocks
 
 
 class AnthropicProvider:
@@ -83,7 +101,7 @@ class AnthropicProvider:
             "model": model,
             "max_tokens": max_tokens,
             "messages": [
-                {"role": m.role, "content": m.content} for m in messages if m.role != "system"
+                {"role": m.role, "content": _content(m)} for m in messages if m.role != "system"
             ],
             "stream": True,
         }

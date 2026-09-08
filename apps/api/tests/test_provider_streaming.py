@@ -1,10 +1,13 @@
 """Streaming for all three adapters, against canned SSE bodies shaped like each provider's real
 wire format. See test_provider_openai_compatible.py's module docstring for why MockTransport."""
 
+import base64
+import json
+
 import httpx
 
 from app.providers.anthropic import AnthropicProvider
-from app.providers.base import ChatMessage, Done, StreamError, TextDelta, Usage
+from app.providers.base import ChatMessage, Done, ImagePart, StreamError, TextDelta, Usage
 from app.providers.google import GoogleProvider
 from app.providers.openai_compatible import OpenAICompatibleProvider
 
@@ -15,6 +18,8 @@ def _sse(*lines: str) -> bytes:
 
 
 MESSAGES = [ChatMessage(role="user", content="Hi there")]
+_IMAGE = ImagePart(mime="image/png", data=b"fake-png-bytes")
+_IMAGE_MESSAGES = [ChatMessage(role="user", content="What's this?", images=(_IMAGE,))]
 
 
 # ---------- OpenAI-compatible ----------
@@ -97,8 +102,6 @@ async def test_anthropic_stream_extracts_the_system_prompt() -> None:
     async for _ in provider.stream(model="claude-opus-5", messages=messages, max_tokens=50):
         pass
 
-    import json
-
     body = json.loads(seen_requests[0].content)
     assert body["system"] == "Be terse."
     assert body["messages"] == [{"role": "user", "content": "Hi"}]
@@ -160,8 +163,6 @@ async def test_google_stream_maps_assistant_role_to_model() -> None:
     async for _ in provider.stream(model="gemini-2.5-pro", messages=messages, max_tokens=50):
         pass
 
-    import json
-
     body = json.loads(seen_requests[0].content)
     assert [c["role"] for c in body["contents"]] == ["user", "model", "user"]
 
@@ -180,3 +181,99 @@ async def test_google_stream_reports_a_rejected_request() -> None:
     assert len(chunks) == 1
     assert isinstance(chunks[0], StreamError)
     assert "400" in chunks[0].message
+
+
+# ---------- Images (all three providers) ----------
+
+
+async def test_openai_sends_a_bare_string_when_there_are_no_images() -> None:
+    """The regression this design exists to prevent: some OpenAI-compatible servers (older
+    Ollama, vLLM) reject the block-array content form even for plain text."""
+    seen_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(200, content=_sse("data: [DONE]"))
+
+    provider = OpenAICompatibleProvider(api_key="k", transport=httpx.MockTransport(handler))
+    async for _ in provider.stream(model="llama3", messages=MESSAGES, max_tokens=50):
+        pass
+
+    body = json.loads(seen_requests[0].content)
+    assert body["messages"] == [{"role": "user", "content": "Hi there"}]
+
+
+async def test_openai_sends_an_image_url_block_when_an_image_is_attached() -> None:
+    """An attached image becomes a base64 data: URL alongside the text block."""
+    seen_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(200, content=_sse("data: [DONE]"))
+
+    provider = OpenAICompatibleProvider(api_key="k", transport=httpx.MockTransport(handler))
+    async for _ in provider.stream(model="gpt-5", messages=_IMAGE_MESSAGES, max_tokens=50):
+        pass
+
+    body = json.loads(seen_requests[0].content)
+    content = body["messages"][0]["content"]
+    assert content[0] == {"type": "text", "text": "What's this?"}
+    encoded = base64.b64encode(_IMAGE.data).decode("ascii")
+    assert content[1] == {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}}
+
+
+async def test_anthropic_sends_a_bare_string_when_there_are_no_images() -> None:
+    """Same regression guard as the OpenAI-compatible adapter, for Anthropic's payload."""
+    seen_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(200, content=_sse('data: {"type":"message_stop"}'))
+
+    provider = AnthropicProvider(api_key="k", transport=httpx.MockTransport(handler))
+    async for _ in provider.stream(model="claude-opus-5", messages=MESSAGES, max_tokens=50):
+        pass
+
+    body = json.loads(seen_requests[0].content)
+    assert body["messages"] == [{"role": "user", "content": "Hi there"}]
+
+
+async def test_anthropic_sends_an_image_block_when_an_image_is_attached() -> None:
+    """An attached image becomes Anthropic's base64 image source block alongside the text block."""
+    seen_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(200, content=_sse('data: {"type":"message_stop"}'))
+
+    provider = AnthropicProvider(api_key="k", transport=httpx.MockTransport(handler))
+    async for _ in provider.stream(model="claude-opus-5", messages=_IMAGE_MESSAGES, max_tokens=50):
+        pass
+
+    body = json.loads(seen_requests[0].content)
+    content = body["messages"][0]["content"]
+    assert content[0] == {"type": "text", "text": "What's this?"}
+    encoded = base64.b64encode(_IMAGE.data).decode("ascii")
+    assert content[1] == {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": encoded},
+    }
+
+
+async def test_google_sends_an_inline_data_part_when_an_image_is_attached() -> None:
+    """An attached image becomes Google's inline_data part alongside the text part."""
+    seen_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(200, content=_sse('data: {"candidates":[]}'))
+
+    provider = GoogleProvider(api_key="k", transport=httpx.MockTransport(handler))
+    async for _ in provider.stream(model="gemini-2.5-pro", messages=_IMAGE_MESSAGES, max_tokens=50):
+        pass
+
+    body = json.loads(seen_requests[0].content)
+    parts = body["contents"][0]["parts"]
+    assert parts[0] == {"text": "What's this?"}
+    encoded = base64.b64encode(_IMAGE.data).decode("ascii")
+    assert parts[1] == {"inline_data": {"mime_type": "image/png", "data": encoded}}
