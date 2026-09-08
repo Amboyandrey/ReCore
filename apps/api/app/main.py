@@ -8,8 +8,10 @@ from app.core.config import get_settings
 from app.core.errors import AppError
 from app.core.logging import configure_logging
 from app.core.middleware import request_context_middleware, security_headers_middleware
+from app.core.tracing import configure_tracing
 from app.routers.v1 import (
     attachments,
+    audit,
     auth,
     chat,
     credentials,
@@ -18,11 +20,13 @@ from app.routers.v1 import (
     invitations,
     members,
     models,
+    usage,
     workspaces,
 )
 
 settings = get_settings()
 configure_logging(settings.debug)
+configure_tracing(settings.app_name)
 
 app = FastAPI(title=settings.app_name, debug=settings.debug)
 
@@ -50,6 +54,8 @@ app.include_router(chat.router, prefix="/api/v1")
 app.include_router(flags.evaluate_router, prefix="/api/v1")
 app.include_router(flags.admin_router, prefix="/api/v1")
 app.include_router(attachments.router, prefix="/api/v1")
+app.include_router(usage.router, prefix="/api/v1")
+app.include_router(audit.router, prefix="/api/v1")
 
 
 @app.exception_handler(AppError)
