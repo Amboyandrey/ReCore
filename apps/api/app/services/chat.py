@@ -188,6 +188,10 @@ async def send_message(
     await db.commit()
     # Committed above (not just flushed): the background task below opens its own session in a
     # separate connection and must be able to see this row the moment it starts.
+    # `app.workspace_id` is transaction-local (see set_workspace_scope) and that commit just
+    # ended the transaction it was set for — reset it before the attachment lookup below, or
+    # row-level security blocks it as if this connection had never been through get_workspace_ctx.
+    await set_workspace_scope(db, workspace_id)
 
     attachments: list[Attachment] = []
     if attachment_ids:

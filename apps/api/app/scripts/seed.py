@@ -17,7 +17,7 @@ import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.db import async_session_factory
+from app.core.db import async_session_factory, set_workspace_scope
 from app.core.errors import EmailAlreadyRegistered
 from app.core.logging import configure_logging, get_logger
 from app.models import Provider, User
@@ -44,6 +44,11 @@ async def _seed_provider(db: AsyncSession, *, workspace_id: uuid.UUID, created_b
     if not api_key:
         logger.info("seed.provider_skipped", reason="SEED_PROVIDER_API_KEY not set")
         return
+    # This script never goes through get_workspace_ctx (there's no request), so row-level
+    # security has no reason to let this connection see the credential row it's about to read
+    # right back — see the same fix in services/chat.py's send_message for the request-side twin
+    # of this gotcha.
+    await set_workspace_scope(db, workspace_id)
     provider_name = os.environ.get("SEED_PROVIDER", "anthropic")
     try:
         provider = Provider(provider_name)

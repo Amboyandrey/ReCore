@@ -24,6 +24,12 @@ COPY --from=builder --chown=recore:recore /app/alembic.ini /app/alembic.ini
 COPY --from=builder --chown=recore:recore /app/migrations /app/migrations
 ENV PATH="/app/.venv/bin:$PATH"
 
+# Pre-create and own the attachments mount point before it's bound: a named volume that's empty
+# on its first mount inherits ownership from whatever already exists in the image at that path,
+# so this is what keeps `recore` (not root, the volume's default) able to write to it. Doing this
+# after USER recore below would fail — only root can chown.
+RUN mkdir -p /app/uploads && chown recore:recore /app/uploads
+
 USER recore
 EXPOSE 8000
 

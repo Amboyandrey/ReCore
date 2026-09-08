@@ -185,3 +185,52 @@ async def test_messages_are_scoped_through_their_conversation_s_workspace(db: As
 
     assert wrong == 0
     assert right == 1
+
+
+async def test_a_mid_transaction_commit_resets_the_scope_until_reapplied(
+    db: AsyncSession,
+) -> None:
+    """The exact bug a real user hit: `set_config(..., true)` is transaction-local (the
+    parameterized equivalent of `SET LOCAL`), so a commit ends its effect along with the
+    transaction — a later query on the same connection sees nothing again unless the scope is
+    set a second time. This is why send_message() (services/chat.py) re-applies it right after
+    its own mid-function commit, and why the seed script's provider step needs the same call
+    before reading back the credential it just wrote. This test would have failed before either
+    fix existed — a `client`-fixture test wouldn't have, since every other test in this suite
+    connects as the table owner, which bypasses row-level security entirely regardless."""
+    user = User(email="rls-txn@example.com", password_hash="hashed")
+    db.add(user)
+    await db.flush()
+    workspace = Workspace(slug="rls-txn", name="RLS Txn", owner_id=user.id)
+    db.add(workspace)
+    await db.flush()
+    db.add(
+        Invitation(
+            workspace_id=workspace.id,
+            email="invitee@example.com",
+            role=Role.MEMBER,
+            token_hash="z" * 64,
+            invited_by=user.id,
+            expires_at=datetime.now(UTC) + timedelta(days=3),
+        )
+    )
+    await db.commit()
+
+    conn = await asyncpg.connect(_app_role_dsn())
+    try:
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.workspace_id', $1, true)", str(workspace.id))
+            visible_before_commit = await conn.fetchval("SELECT count(*) FROM invitations")
+        # The `async with` block above committed on exit — same shape as send_message's own
+        # mid-function commit ending the transaction the scope was set for.
+        visible_after_commit = await conn.fetchval("SELECT count(*) FROM invitations")
+
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.workspace_id', $1, true)", str(workspace.id))
+            visible_after_reapplying = await conn.fetchval("SELECT count(*) FROM invitations")
+    finally:
+        await conn.close()
+
+    assert visible_before_commit == 1
+    assert visible_after_commit == 0
+    assert visible_after_reapplying == 1
