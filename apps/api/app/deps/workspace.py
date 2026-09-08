@@ -8,7 +8,7 @@ from fastapi import Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.db import get_db
+from app.core.db import get_db, set_workspace_scope
 from app.core.errors import InsufficientRole, WorkspaceNotFound
 from app.deps.auth import get_current_user
 from app.models import Role, User, Workspace, WorkspaceMember
@@ -52,6 +52,10 @@ async def get_workspace_ctx(
     if row is None:
         raise WorkspaceNotFound()
     workspace, role = row
+    # Everything this request queries from here on is scoped to this workspace — row-level
+    # security policies on every tenant table check exactly this, as a backstop under this
+    # membership check, not instead of it (see docs/ARCHITECTURE.md #4's tenancy design).
+    await set_workspace_scope(db, workspace_id)
     return WorkspaceCtx(workspace=workspace, user=user, role=role)
 
 

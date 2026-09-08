@@ -30,6 +30,7 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')" || exit 1
 
-# Migrations run every boot — a no-op once the schema's current, and how a fresh `compose up`
-# ends up with an actual schema instead of an empty database.
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+# Migrations and the demo seed both run every boot — no-ops once the schema and demo account
+# already exist, and how a fresh `compose up` ends up as an actual populated platform instead of
+# an empty database (see app/scripts/seed.py).
+CMD ["sh", "-c", "alembic upgrade head && python -m app.scripts.seed && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
