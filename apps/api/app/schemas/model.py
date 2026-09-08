@@ -16,7 +16,12 @@ class AvailableModelOut(BaseModel):
 
 
 class EnableModelRequest(BaseModel):
-    """What enabling a model for chat needs — pricing is optional but drives usage cost later."""
+    """What enabling a model for chat needs — pricing is optional but drives usage cost later.
+
+    `supports_vision` defaults false, not inferred: re-sent on every re-enable (a price edit is
+    also a re-enable — see enable_model()), so a caller that wants to keep it must pass the
+    model's current value rather than relying on a default that would silently clear it.
+    """
 
     credential_id: uuid.UUID
     provider_model_id: str = Field(min_length=1)
@@ -24,6 +29,7 @@ class EnableModelRequest(BaseModel):
     context_window: int | None = None
     cost_per_mtok_in: float | None = Field(default=None, ge=0)
     cost_per_mtok_out: float | None = Field(default=None, ge=0)
+    supports_vision: bool = False
 
 
 class ModelOut(BaseModel):
@@ -42,3 +48,4 @@ class ModelOut(BaseModel):
     cost_per_mtok_in: float | None
     cost_per_mtok_out: float | None
     provider_enabled: bool
+    supports_vision: bool

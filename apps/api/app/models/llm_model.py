@@ -25,3 +25,7 @@ class LLMModel(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     cost_per_mtok_in: Mapped[float | None] = mapped_column(Numeric(10, 4, asdecimal=False), default=None)
     cost_per_mtok_out: Mapped[float | None] = mapped_column(Numeric(10, 4, asdecimal=False), default=None)
     enabled: Mapped[bool] = mapped_column(default=True, server_default="true")
+    # Explicit, not inferred from provider_model_id: model ids can't be reliably classified
+    # across arbitrary OpenAI-compatible endpoints (Ollama, OpenRouter, ...). Set by an admin
+    # checkbox when the model is enabled (see services/models.py).
+    supports_vision: Mapped[bool] = mapped_column(default=False, server_default="false")

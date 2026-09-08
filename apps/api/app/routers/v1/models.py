@@ -40,6 +40,7 @@ async def _to_model_out(
         cost_per_mtok_in=model.cost_per_mtok_in,
         cost_per_mtok_out=model.cost_per_mtok_out,
         provider_enabled=bool(provider_enabled),
+        supports_vision=model.supports_vision,
     )
 
 
@@ -75,6 +76,7 @@ async def enable_model_route(
         context_window=body.context_window,
         cost_per_mtok_in=body.cost_per_mtok_in,
         cost_per_mtok_out=body.cost_per_mtok_out,
+        supports_vision=body.supports_vision,
     )
     credential = await get_credential(db, workspace_id=ctx.workspace_id, credential_id=body.credential_id)
     await record_audit(
