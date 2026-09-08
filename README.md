@@ -113,6 +113,23 @@ never the ones a running `docker compose up` dev stack is using interactively: `
 forces a separate `_test`-suffixed database and Redis db index before any app code loads, so
 running the suite locally can never truncate or flush data you're actually looking at in the app.
 
+There's also one end-to-end happy path (signup → login → create a workspace) via Playwright,
+against a real running stack rather than a mocked one:
+
+```bash
+cd apps/web && pnpm exec playwright install chromium && pnpm e2e
+```
+
+It defaults to `http://localhost:3000` (override with `E2E_BASE_URL`) — have `docker compose up`
+running first. It stops short of sending a chat message, since that needs a real provider key.
+
+And a load test against concurrent streaming generations, no real provider key needed (see the
+script's own docstring for what it found the first time it was run):
+
+```bash
+cd apps/api && uv run python -m app.scripts.load_test
+```
+
 ## Security
 
 - Argon2id password hashing; opaque Redis-backed sessions, not JWTs; double-submit CSRF cookie

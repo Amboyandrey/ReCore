@@ -18,6 +18,11 @@ out/
 next-env.d.ts
 *.tsbuildinfo
 
+# Playwright
+apps/web/test-results/
+apps/web/playwright-report/
+apps/web/blob-report/
+
 # Env files (never commit real secrets)
 .env
 .env.*
