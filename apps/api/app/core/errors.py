@@ -79,6 +79,13 @@ class InvitationInvalid(AppError):
     detail = "This invitation is invalid or has expired."
 
 
+class InvitationNotFound(AppError):
+    """Raised when revoking an invitation id that doesn't exist in the given workspace."""
+
+    status_code = 404
+    detail = "Invitation not found."
+
+
 class LastOwnerError(AppError):
     """Raised when an action would leave a workspace with no owner at all."""
 
