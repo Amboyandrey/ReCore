@@ -1,9 +1,16 @@
 """Discovering, enabling, listing, and disabling models — validated against a fake provider."""
 
+import uuid
+
 import pytest
 from httpx import AsyncClient
+from redis.asyncio import Redis
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models import FeatureFlag, FlagScope
 from app.providers.fake import VALID_KEY, FakeProvider
+from app.services.flags import set_override
 
 OWNER = {"email": "owner@example.com", "password": "correct horse battery staple"}
 
@@ -118,3 +125,37 @@ async def test_re_enabling_a_disabled_model_updates_its_pricing(client: AsyncCli
 
     listed = await client.get(f"/api/v1/workspaces/{workspace_id}/models")
     assert len(listed.json()) == 1
+
+
+async def test_provider_enabled_reflects_the_killswitch_flag(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    """Flipping a provider's killswitch flag greys a model out — it stays listed, not removed."""
+    workspace_id, credential_id = await _workspace_with_credential(client)
+    await client.post(
+        f"/api/v1/workspaces/{workspace_id}/models",
+        json={
+            "credential_id": credential_id,
+            "provider_model_id": "fake-small",
+            "display_name": "Fake Small",
+        },
+    )
+    flag = await db.scalar(select(FeatureFlag).where(FeatureFlag.key == "provider.anthropic"))
+    assert flag is not None
+
+    before = (await client.get(f"/api/v1/workspaces/{workspace_id}/models")).json()
+    assert before[0]["provider_enabled"] is True
+
+    await set_override(
+        db,
+        redis_client,
+        flag_id=flag.id,
+        scope=FlagScope.WORKSPACE,
+        scope_id=uuid.UUID(workspace_id),
+        value=False,
+    )
+    await db.commit()  # this test's `db` session must commit for the client's own connection to see it
+
+    after = (await client.get(f"/api/v1/workspaces/{workspace_id}/models")).json()
+    assert after[0]["provider_enabled"] is False
+    assert after[0]["provider_model_id"] == "fake-small"  # still listed, just greyed out

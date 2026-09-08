@@ -41,6 +41,13 @@ class Settings(BaseSettings):
     auth_rate_limit_max: int = 5
     auth_rate_limit_window_seconds: int = 300
 
+    # How long a resolved flag snapshot stays cached in Redis before it's recomputed from Postgres
+    flag_cache_ttl_seconds: int = 30
+
+    # Where uploaded attachments are written — a bind-mounted volume in compose, a tmp dir in tests
+    storage_dir: str = "/app/uploads"
+    max_attachment_size_bytes: int = 10 * 1024 * 1024
+
 
 @lru_cache
 def get_settings() -> Settings:

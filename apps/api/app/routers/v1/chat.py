@@ -136,6 +136,7 @@ async def send_message_route(
         conversation=conversation,
         content=body.content,
         idempotency_key=idempotency_key,
+        attachment_ids=body.attachment_ids,
     )
     return StreamingResponse(
         _sse_body(redis, generation_id), media_type="text/event-stream", headers=_SSE_HEADERS

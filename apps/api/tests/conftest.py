@@ -40,9 +40,13 @@ async def _reset_state_after_test() -> AsyncGenerator[None]:
         await conn.execute(
             text(
                 "TRUNCATE TABLE users, workspaces, workspace_members, invitations, "
-                "provider_credentials, models, conversations, messages CASCADE"
+                "provider_credentials, models, conversations, messages, attachments, "
+                "flag_overrides CASCADE"
             )
         )
+        # feature_flags is deliberately NOT truncated: the migration seeds the provider
+        # killswitches and the attachments flag once per test session, and chat/model tests
+        # rely on those rows existing (a missing flag resolves to disabled — see services/flags.py).
     await engine.dispose()
     await redis_module._pool.disconnect()
 

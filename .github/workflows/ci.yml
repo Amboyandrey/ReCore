@@ -37,6 +37,7 @@ jobs:
       REDIS_URL: redis://localhost:6379/0
       # CI-only key, fine to commit — wraps provider-credential data keys (see .env.example).
       MASTER_KEY: BpiLXgRyl3uYpRm32mG0+1lcq+BvToj7jg0XIuaENWA=
+      STORAGE_DIR: /tmp/recore-attachments
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5

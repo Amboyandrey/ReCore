@@ -41,6 +41,9 @@ services:
       # Dev-only key, fine to commit — wraps provider-credential data keys (see .env.example).
       # Rotate and inject a real one via secrets/environment for any non-throwaway deployment.
       MASTER_KEY: "BpiLXgRyl3uYpRm32mG0+1lcq+BvToj7jg0XIuaENWA="
+      STORAGE_DIR: /app/uploads
+    volumes:
+      - attachments_data:/app/uploads
     ports:
       - "8000:8000"
     depends_on:
@@ -65,3 +68,4 @@ services:
 
 volumes:
   postgres_data:
+  attachments_data:
