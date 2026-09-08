@@ -4,6 +4,7 @@ import type { Role } from "./workspace-client";
 export type Member = { user_id: string; email: string; role: Role; joined_at: string };
 export type Invitation = { id: string; email: string; role: Role; expires_at: string; token?: string | null };
 export type InvitePreview = { workspace_name: string; email: string; role: Role; expires_at: string };
+export type PendingInvitation = { id: string; workspace_name: string; role: Role; expires_at: string };
 export type AcceptedWorkspace = { id: string; slug: string; name: string; role: Role };
 
 export class MemberError extends Error {}
@@ -60,6 +61,29 @@ export async function createInvitation(workspaceId: string, email: string, role:
   });
   await throwIfNotOk(res);
   return (await res.json()) as Invitation;
+}
+
+// Permanently withdraws a pending invitation — its link stops working immediately.
+export async function revokeInvitation(workspaceId: string, invitationId: string): Promise<void> {
+  const res = await api(`/api/v1/workspaces/${workspaceId}/invitations/${invitationId}`, {
+    method: "DELETE",
+  });
+  await throwIfNotOk(res);
+}
+
+// Lists every outstanding invite waiting for the signed-in account's email, across every
+// workspace — independent of whether it ever followed the original invite link.
+export async function listPendingInvitationsForMe(): Promise<PendingInvitation[]> {
+  const res = await api("/api/v1/invitations/pending");
+  await throwIfNotOk(res);
+  return (await res.json()) as PendingInvitation[];
+}
+
+// Accepts a pending invite by id — no token needed, just being signed in as the invited email.
+export async function acceptPendingInvitation(invitationId: string): Promise<AcceptedWorkspace> {
+  const res = await api(`/api/v1/invitations/pending/${invitationId}/accept`, { method: "POST" });
+  await throwIfNotOk(res);
+  return (await res.json()) as AcceptedWorkspace;
 }
 
 // Previews an invitation by its token — reachable without being signed in.

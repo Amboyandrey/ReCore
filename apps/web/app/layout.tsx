@@ -3,6 +3,7 @@ import { Manrope, IBM_Plex_Mono } from "next/font/google";
 import { AuthProvider } from "@/lib/auth-context";
 import { WorkspaceProvider } from "@/lib/workspace-context";
 import { AuthStatus } from "@/components/auth-status";
+import { PendingInvitationsBanner } from "@/components/pending-invitations-banner";
 import { WorkspaceSwitcher } from "@/components/workspace-switcher";
 import "./globals.css";
 
@@ -38,6 +39,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                 <AuthStatus />
               </div>
             </header>
+            <PendingInvitationsBanner />
             <main className="flex-1">{children}</main>
             <footer className="border-t border-border">
               <div className="mx-auto max-w-5xl px-6 py-4 font-mono text-xs text-text-muted">

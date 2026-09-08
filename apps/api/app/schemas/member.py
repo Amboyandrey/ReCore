@@ -47,3 +47,13 @@ class InvitePreview(BaseModel):
     email: str
     role: Role
     expires_at: datetime
+
+
+class PendingInvitationOut(BaseModel):
+    """One pending invite waiting for the signed-in account's email — shown as a welcome prompt
+    right after login, whether or not that account ever followed the original invite link."""
+
+    id: uuid.UUID
+    workspace_name: str
+    role: Role
+    expires_at: datetime
