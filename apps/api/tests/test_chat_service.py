@@ -7,15 +7,18 @@ test_credentials.py and test_models.py — no real network call happens.
 import asyncio
 import uuid
 from collections.abc import AsyncIterator, Sequence
+from io import BytesIO
 
 import pytest
+from PIL import Image
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import encrypt_secret
-from app.core.errors import ConversationNotFound, ModelNotFound
+from app.core.errors import ConversationNotFound, ModelDoesNotSupportImages, ModelNotFound
 from app.models import (
+    Attachment,
     LLMModel,
     Provider,
     ProviderCredential,
@@ -25,8 +28,9 @@ from app.models import (
     Workspace,
     WorkspaceMember,
 )
-from app.providers.base import ChatMessage, Chunk, Done, StreamError, TextDelta, Usage
+from app.providers.base import ChatMessage, Chunk, Done, ImagePart, StreamError, TextDelta, Usage
 from app.providers.fake import VALID_KEY, FakeProvider
+from app.services.attachments import save_attachment
 from app.services.chat import (
     create_conversation,
     get_conversation,
@@ -122,6 +126,24 @@ async def _workspace_with_model(db: AsyncSession) -> tuple[User, Workspace, LLMM
     db.add(model)
     await db.flush()
     return user, workspace, model
+
+
+async def _upload_image(
+    db: AsyncSession, *, workspace_id: uuid.UUID, conversation_id: uuid.UUID, uploaded_by: uuid.UUID
+) -> Attachment:
+    """Upload a real, tiny PNG through the actual attachment service — not a hand-built row — so
+    it goes through _normalize_image and comes out genuinely marked `passthrough`."""
+    buffer = BytesIO()
+    Image.new("RGB", (10, 10), color=(255, 0, 0)).save(buffer, format="PNG")
+    return await save_attachment(
+        db,
+        workspace_id=workspace_id,
+        conversation_id=conversation_id,
+        uploaded_by=uploaded_by,
+        filename="photo.png",
+        mime="image/png",
+        data=buffer.getvalue(),
+    )
 
 
 async def test_create_conversation_rejects_a_model_from_another_workspace(
@@ -376,3 +398,155 @@ async def test_a_failed_generation_records_no_usage_event(
         await db.scalars(select(UsageEvent).where(UsageEvent.workspace_id == workspace.id))
     ).all()
     assert usage_events == []
+
+
+async def test_an_attached_image_reaches_the_provider_as_an_image_part(
+    db: AsyncSession, redis_client: Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point of native vision support: an image attachment shows up in the payload the
+    adapter actually sends, as an ImagePart — not silently dropped, not OCR'd into text."""
+    user, workspace, model = await _workspace_with_model(db)
+    model.supports_vision = True
+    await db.flush()
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+    attachment = await _upload_image(
+        db, workspace_id=workspace.id, conversation_id=conversation.id, uploaded_by=user.id
+    )
+    await db.commit()
+
+    captured: list[FakeProvider] = []
+
+    def _capturing_build_provider(
+        provider: Provider, *, api_key: str, base_url: str | None
+    ) -> FakeProvider:
+        instance = FakeProvider(api_key=api_key, base_url=base_url)
+        captured.append(instance)
+        return instance
+
+    monkeypatch.setattr("app.services.chat.build_provider", _capturing_build_provider)
+
+    generation_id = await send_message(
+        db,
+        redis_client,
+        workspace_id=workspace.id,
+        conversation=conversation,
+        content="What's in this image?",
+        idempotency_key=None,
+        attachment_ids=[attachment.id],
+    )
+    async for _ in read_events(redis_client, generation_id, block_ms=50):
+        pass
+
+    assert len(captured) == 1
+    sent_turn = captured[0].last_messages[-1]
+    assert len(sent_turn.images) == 1
+    assert sent_turn.images[0].mime == "image/png"
+    assert isinstance(sent_turn.images[0], ImagePart)
+
+
+async def test_an_image_on_a_non_vision_model_is_rejected_pre_flight(
+    db: AsyncSession, redis_client: Redis
+) -> None:
+    """The gate raises before anything about the send is persisted — the message insert and the
+    attachment linkage both roll back, exactly as if the send had never been attempted, rather
+    than the image silently never reaching the model."""
+    user, workspace, model = await _workspace_with_model(db)  # supports_vision defaults to False
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+    attachment = await _upload_image(
+        db, workspace_id=workspace.id, conversation_id=conversation.id, uploaded_by=user.id
+    )
+    await db.commit()
+    conversation_id, attachment_id = conversation.id, attachment.id  # read before rollback expires them
+
+    with pytest.raises(ModelDoesNotSupportImages):
+        await send_message(
+            db,
+            redis_client,
+            workspace_id=workspace.id,
+            conversation=conversation,
+            content="What's in this image?",
+            idempotency_key=None,
+            attachment_ids=[attachment_id],
+        )
+    await db.rollback()
+
+    assert await list_messages(db, conversation_id=conversation_id) == []
+    refreshed = await db.get(Attachment, attachment_id)
+    assert refreshed is not None
+    assert refreshed.message_id is None
+
+
+async def test_an_attachment_from_an_earlier_turn_is_still_in_history_for_a_later_turn(
+    db: AsyncSession, redis_client: Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The regression this phase fixes: attachment content used to reach the model only on the
+    turn it was attached to, because history replay read straight from Message.content, which
+    never held it in the first place. A follow-up question would find the model had already
+    "forgotten" the file — the same disappointment a real user hit three times over with
+    attachment text before this fix. This proves it by inspecting turn 2's actual payload, not
+    just turn 1's."""
+    user, workspace, model = await _workspace_with_model(db)
+    model.supports_vision = True
+    await db.flush()
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+    text_attachment = await save_attachment(
+        db,
+        workspace_id=workspace.id,
+        conversation_id=conversation.id,
+        uploaded_by=user.id,
+        filename="notes.txt",
+        mime="text/plain",
+        data=b"the secret ingredient is basil",
+    )
+    image_attachment = await _upload_image(
+        db, workspace_id=workspace.id, conversation_id=conversation.id, uploaded_by=user.id
+    )
+    await db.commit()
+
+    captured: list[FakeProvider] = []
+
+    def _capturing_build_provider(
+        provider: Provider, *, api_key: str, base_url: str | None
+    ) -> FakeProvider:
+        instance = FakeProvider(api_key=api_key, base_url=base_url)
+        captured.append(instance)
+        return instance
+
+    monkeypatch.setattr("app.services.chat.build_provider", _capturing_build_provider)
+
+    first_id = await send_message(
+        db,
+        redis_client,
+        workspace_id=workspace.id,
+        conversation=conversation,
+        content="Here's my recipe notes and a photo",
+        idempotency_key=None,
+        attachment_ids=[text_attachment.id, image_attachment.id],
+    )
+    async for _ in read_events(redis_client, first_id, block_ms=50):
+        pass
+
+    second_id = await send_message(
+        db,
+        redis_client,
+        workspace_id=workspace.id,
+        conversation=conversation,
+        content="What did I attach earlier?",
+        idempotency_key=None,
+    )
+    async for _ in read_events(redis_client, second_id, block_ms=50):
+        pass
+
+    assert len(captured) == 2
+    replayed_first_turn = captured[1].last_messages[0]
+    assert "the secret ingredient is basil" in replayed_first_turn.content
+    assert len(replayed_first_turn.images) == 1

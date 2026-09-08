@@ -174,6 +174,16 @@ class AttachmentTooLarge(AppError):
     detail = "This file is too large."
 
 
+class ModelDoesNotSupportImages(AppError):
+    """Raised pre-flight when an image is attached to a message but the conversation's model
+    isn't marked `supports_vision` — caught before anything is persisted or a generation starts,
+    rather than letting the image silently vanish or the provider reject the request mid-stream.
+    """
+
+    status_code = 422
+    detail = "This model can't read images. Pick a vision-capable model or remove the image."
+
+
 class InvalidCursor(AppError):
     """Raised when a cursor-paginated list gets a `before`/`cursor` value it can't parse."""
 
