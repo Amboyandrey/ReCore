@@ -20,6 +20,7 @@ from app.core.errors import ConversationNotFound, ModelDoesNotSupportImages, Mod
 from app.models import (
     Attachment,
     LLMModel,
+    Message,
     Provider,
     ProviderCredential,
     Role,
@@ -33,10 +34,12 @@ from app.providers.fake import VALID_KEY, FakeProvider
 from app.services.attachments import save_attachment
 from app.services.chat import (
     create_conversation,
+    delete_conversation,
     get_conversation,
     list_conversations,
     list_messages,
     send_message,
+    update_conversation_model,
 )
 from app.services.generations import read_events, request_stop
 
@@ -162,6 +165,120 @@ async def test_create_conversation_rejects_a_model_from_another_workspace(
             user=user,
             model_id=model.id,
             system_prompt=None,
+        )
+
+
+async def test_update_conversation_model_switches_which_model_is_used(db: AsyncSession) -> None:
+    """Switching a conversation's model updates what it resolves to for its next send — the
+    mechanism the chat page's "change model mid-session" picker relies on."""
+    user, workspace, model = await _workspace_with_model(db)
+    other_model = LLMModel(
+        workspace_id=workspace.id,
+        credential_id=model.credential_id,
+        provider_model_id="fake-large",
+        display_name="Fake Large",
+    )
+    db.add(other_model)
+    await db.flush()
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+
+    updated = await update_conversation_model(
+        db, workspace_id=workspace.id, conversation_id=conversation.id, model_id=other_model.id
+    )
+
+    assert updated.model_id == other_model.id
+
+
+async def test_update_conversation_model_rejects_a_model_from_another_workspace(
+    db: AsyncSession,
+) -> None:
+    """Same guard as create_conversation: a model id belonging to a different workspace 404s,
+    even though the conversation being switched is real."""
+    user, workspace, model = await _workspace_with_model(db)
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+    other_workspace = Workspace(slug="other-ws", name="Other", owner_id=user.id)
+    db.add(other_workspace)
+    await db.flush()
+    other_credential = ProviderCredential(
+        workspace_id=other_workspace.id,
+        provider=Provider.ANTHROPIC,
+        label="Other",
+        ciphertext=b"\x01",
+        nonce=b"\x02" * 12,
+        wrapped_key=b"\x03" * 44,
+        last4="zz99",
+        created_by=user.id,
+    )
+    db.add(other_credential)
+    await db.flush()
+    other_model = LLMModel(
+        workspace_id=other_workspace.id,
+        credential_id=other_credential.id,
+        provider_model_id="fake-other",
+        display_name="Fake Other",
+    )
+    db.add(other_model)
+    await db.flush()
+
+    with pytest.raises(ModelNotFound):
+        await update_conversation_model(
+            db, workspace_id=workspace.id, conversation_id=conversation.id, model_id=other_model.id
+        )
+
+
+async def test_delete_conversation_removes_it_and_its_messages(
+    db: AsyncSession, redis_client: Redis
+) -> None:
+    """Deleting a conversation is permanent — it and its messages are both gone afterward, via
+    the messages table's own ondelete="CASCADE" foreign key rather than an explicit second delete."""
+    user, workspace, model = await _workspace_with_model(db)
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+    generation_id = await send_message(
+        db,
+        redis_client,
+        workspace_id=workspace.id,
+        conversation=conversation,
+        content="Hi",
+        idempotency_key=None,
+    )
+    async for _ in read_events(redis_client, generation_id, block_ms=50):
+        pass  # let the background task's own session commit the assistant reply before deleting
+    conversation_id = conversation.id
+
+    await delete_conversation(db, workspace_id=workspace.id, conversation_id=conversation_id)
+    await db.commit()
+
+    with pytest.raises(ConversationNotFound):
+        await get_conversation(db, workspace_id=workspace.id, conversation_id=conversation_id)
+    remaining = (
+        await db.scalars(select(Message).where(Message.conversation_id == conversation_id))
+    ).all()
+    assert remaining == []
+
+
+async def test_delete_conversation_rejects_one_from_another_workspace(db: AsyncSession) -> None:
+    """The same workspace-scoping guard every other conversation lookup here has."""
+    user, workspace, model = await _workspace_with_model(db)
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+    other_workspace = Workspace(slug="other-delete", name="Other", owner_id=user.id)
+    db.add(other_workspace)
+    await db.flush()
+
+    with pytest.raises(ConversationNotFound):
+        await delete_conversation(
+            db, workspace_id=other_workspace.id, conversation_id=conversation.id
         )
 
 

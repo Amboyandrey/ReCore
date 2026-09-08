@@ -107,6 +107,43 @@ async def create_conversation(
     return conversation
 
 
+async def update_conversation_model(
+    db: AsyncSession, *, workspace_id: uuid.UUID, conversation_id: uuid.UUID, model_id: uuid.UUID
+) -> Conversation:
+    """Switch a conversation to a different one of the workspace's enabled models — mid-session,
+    not just at the start. Already-sent history isn't rewritten or resent to the new model; only
+    the turn that follows the switch goes to it, same as a human switching who they're talking to
+    mid-conversation doesn't hand the new person a transcript unless asked.
+    """
+    conversation = await get_conversation(db, workspace_id=workspace_id, conversation_id=conversation_id)
+    model = await db.scalar(
+        select(LLMModel).where(LLMModel.id == model_id, LLMModel.workspace_id == workspace_id)
+    )
+    if model is None:
+        raise ModelNotFound()
+    conversation.model_id = model_id
+    await db.flush()
+    # `updated_at`'s onupdate=func.now() runs server-side, so the flush above leaves that
+    # attribute expired rather than populated — the route below serializes this object
+    # immediately (before the request's own commit), and an expired attribute's implicit lazy
+    # load can't run outside an awaited context. Refreshing here resolves it while we can still
+    # await it, instead of the caller hitting a MissingGreenlet error trying to read it back.
+    await db.refresh(conversation)
+    return conversation
+
+
+async def delete_conversation(
+    db: AsyncSession, *, workspace_id: uuid.UUID, conversation_id: uuid.UUID
+) -> None:
+    """Permanently remove a conversation — its messages, attachments, and usage-event history all
+    cascade-delete with it (see each model's ondelete="CASCADE" foreign key). There's no undo and
+    no soft-delete here, unlike Workspace: a chat thread has no membership or billing of its own
+    to keep around after it's gone, just the history a deleted conversation asks to forget too."""
+    conversation = await get_conversation(db, workspace_id=workspace_id, conversation_id=conversation_id)
+    await db.delete(conversation)
+    await db.flush()
+
+
 async def list_conversations(db: AsyncSession, *, workspace_id: uuid.UUID) -> list[Conversation]:
     """List a workspace's conversations, most recently active first."""
     stmt = (
