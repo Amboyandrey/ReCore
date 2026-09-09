@@ -1,5 +1,7 @@
 """Import every model here so it registers on Base.metadata before Alembic autogenerate runs."""
 
+from app.models.assistant import Assistant
+from app.models.assistant_tool import AssistantTool
 from app.models.attachment import Attachment
 from app.models.audit_log import AuditLog
 from app.models.conversation import Conversation
@@ -24,6 +26,8 @@ from app.models.user import User
 from app.models.workspace import Workspace, WorkspaceMember
 
 __all__ = [
+    "Assistant",
+    "AssistantTool",
     "Attachment",
     "AuditLog",
     "Conversation",

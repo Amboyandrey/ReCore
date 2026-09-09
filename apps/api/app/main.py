@@ -10,6 +10,7 @@ from app.core.logging import configure_logging
 from app.core.middleware import request_context_middleware, security_headers_middleware
 from app.core.tracing import configure_tracing
 from app.routers.v1 import (
+    assistants,
     attachments,
     audit,
     auth,
@@ -58,6 +59,7 @@ app.include_router(flags.admin_router, prefix="/api/v1")
 app.include_router(attachments.router, prefix="/api/v1")
 app.include_router(tools.router, prefix="/api/v1")
 app.include_router(tool_invocations.router, prefix="/api/v1")
+app.include_router(assistants.router, prefix="/api/v1")
 app.include_router(usage.router, prefix="/api/v1")
 app.include_router(audit.router, prefix="/api/v1")
 
