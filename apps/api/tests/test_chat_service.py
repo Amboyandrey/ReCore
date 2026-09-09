@@ -24,20 +24,38 @@ from app.core.errors import (
 )
 from app.models import (
     Attachment,
+    FeatureFlag,
+    FlagScope,
     LLMModel,
     Message,
     Provider,
     ProviderCredential,
     Role,
+    Tool,
+    ToolInvocation,
+    ToolInvocationStatus,
+    ToolKind,
     UsageEvent,
     User,
     Workspace,
     WorkspaceMember,
 )
-from app.providers.base import ChatMessage, Chunk, Done, ImagePart, StreamError, TextDelta, Usage
+from app.providers.base import (
+    ChatMessage,
+    Chunk,
+    Done,
+    ImagePart,
+    StreamError,
+    TextDelta,
+    ToolCall,
+    ToolCallRequest,
+    ToolDefinition,
+    Usage,
+)
 from app.providers.fake import VALID_KEY, FakeProvider
 from app.services.attachments import save_attachment
 from app.services.chat import (
+    MAX_TOOL_ITERATIONS,
     create_conversation,
     delete_conversation,
     get_conversation,
@@ -46,15 +64,24 @@ from app.services.chat import (
     send_message,
     update_conversation,
 )
+from app.services.flags import set_override
 from app.services.generations import read_events, request_stop
+from app.services.tools import to_tool_definition
+from app.tools.base import ToolExecutionResult
 
 
 class SlowFakeProvider(FakeProvider):
     """Like FakeProvider, but paced — gives a test time to call request_stop mid-stream."""
 
     async def stream(
-        self, *, model: str, messages: Sequence[ChatMessage], max_tokens: int
+        self,
+        *,
+        model: str,
+        messages: Sequence[ChatMessage],
+        max_tokens: int,
+        tools: Sequence[ToolDefinition] = (),
     ) -> AsyncIterator[Chunk]:
+        del tools
         for word in ["one ", "two ", "three ", "four "]:
             await asyncio.sleep(0.05)
             yield TextDelta(text=word)
@@ -66,14 +93,107 @@ class ErrorFakeProvider(FakeProvider):
     """Fails partway through a stream — for proving a failed generation bills nothing."""
 
     async def stream(
-        self, *, model: str, messages: Sequence[ChatMessage], max_tokens: int
+        self,
+        *,
+        model: str,
+        messages: Sequence[ChatMessage],
+        max_tokens: int,
+        tools: Sequence[ToolDefinition] = (),
     ) -> AsyncIterator[Chunk]:
+        del tools
         yield TextDelta(text="partial ")
         yield StreamError(message="the provider disconnected")
 
 
 def _fake_build_provider(provider: Provider, *, api_key: str, base_url: str | None) -> FakeProvider:
     return FakeProvider(api_key=api_key, base_url=base_url)
+
+
+class ToolCallingFakeProvider(FakeProvider):
+    """Asks for one tool on its first stream() call, then replies normally once the loop feeds
+    the result back — see FakeProvider.SCRIPTED_TOOL_CALL."""
+
+    SCRIPTED_TOOL_CALL = ToolCall(id="call_1", name="get_weather", arguments={"city": "Paris"})
+
+
+class NeverFinishesFakeProvider(FakeProvider):
+    """Asks for the same tool again on every single call — never gives a final answer. Exercises
+    the agent loop's MAX_TOOL_ITERATIONS cap."""
+
+    async def stream(
+        self,
+        *,
+        model: str,
+        messages: Sequence[ChatMessage],
+        max_tokens: int,
+        tools: Sequence[ToolDefinition] = (),
+    ) -> AsyncIterator[Chunk]:
+        del model, max_tokens, tools
+        self.last_messages = messages
+        self._stream_calls += 1
+        yield Usage(input_tokens=1, output_tokens=1)
+        yield ToolCallRequest(
+            calls=(ToolCall(id=f"call_{self._stream_calls}", name="get_weather", arguments={}),)
+        )
+
+
+async def _fake_execute_tool(tool: Tool, arguments: dict[str, object]) -> tuple[ToolExecutionResult, int]:
+    """Stands in for app.tools.execute.execute_tool in the agent-loop tests — what actually runs
+    a tool is exercised separately, in test_tools.py; these tests are about the loop around it."""
+    del tool
+    return ToolExecutionResult(ok=True, content=f"It is sunny in {arguments.get('city')}"), 5
+
+
+async def _failing_execute_tool(tool: Tool, arguments: dict[str, object]) -> tuple[ToolExecutionResult, int]:
+    del tool, arguments
+    return ToolExecutionResult(ok=False, content="The tool blew up."), 3
+
+
+async def _enable_tools(db: AsyncSession, redis: Redis, *, workspace_id: uuid.UUID) -> None:
+    """Flip the `tools` flag on for one workspace — the lever the tools settings page pulls."""
+    flag = await db.scalar(select(FeatureFlag).where(FeatureFlag.key == "tools"))
+    assert flag is not None
+    await set_override(
+        db, redis, flag_id=flag.id, scope=FlagScope.WORKSPACE, scope_id=workspace_id, value=True
+    )
+    await db.commit()  # this test's `db` session must commit for the client's own connection to see it
+
+
+async def _add_tool(
+    db: AsyncSession, *, workspace_id: uuid.UUID, created_by: uuid.UUID, name: str = "get_weather"
+) -> Tool:
+    """A minimal enabled tool — its actual execution is stubbed via monkeypatching execute_tool
+    in the tests that need it, so this never needs a real Tavily key or HTTP endpoint."""
+    tool = Tool(
+        workspace_id=workspace_id,
+        name=name,
+        description="Get the current weather for a city.",
+        parameters={"type": "object", "properties": {"city": {"type": "string"}}},
+        kind=ToolKind.BUILTIN,
+        enabled=True,
+        created_by=created_by,
+    )
+    db.add(tool)
+    await db.flush()
+    return tool
+
+
+@pytest.fixture
+def tool_calling_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Swap in ToolCallingFakeProvider for this test only."""
+    monkeypatch.setattr(
+        "app.services.chat.build_provider",
+        lambda provider, *, api_key, base_url: ToolCallingFakeProvider(api_key=api_key, base_url=base_url),
+    )
+
+
+@pytest.fixture
+def never_finishes_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Swap in NeverFinishesFakeProvider for this test only."""
+    monkeypatch.setattr(
+        "app.services.chat.build_provider",
+        lambda provider, *, api_key, base_url: NeverFinishesFakeProvider(api_key=api_key, base_url=base_url),
+    )
 
 
 @pytest.fixture
@@ -786,3 +906,228 @@ async def test_an_attachment_from_an_earlier_turn_is_still_in_history_for_a_late
     replayed_first_turn = captured[1].last_messages[0]
     assert "the secret ingredient is basil" in replayed_first_turn.content
     assert len(replayed_first_turn.images) == 1
+
+
+async def test_tools_are_not_offered_when_the_flag_is_off(
+    db: AsyncSession, redis_client: Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tool can be fully registered and enabled and still never reach the provider — the
+    `tools` flag is the switch, same as `attachments`."""
+    user, workspace, model = await _workspace_with_model(db)
+    await _add_tool(db, workspace_id=workspace.id, created_by=user.id)
+    captured: list[FakeProvider] = []
+
+    def _capturing_build_provider(
+        provider: Provider, *, api_key: str, base_url: str | None
+    ) -> FakeProvider:
+        instance = FakeProvider(api_key=api_key, base_url=base_url)
+        captured.append(instance)
+        return instance
+
+    monkeypatch.setattr("app.services.chat.build_provider", _capturing_build_provider)
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db,
+        redis_client,
+        workspace_id=workspace.id,
+        conversation=conversation,
+        content="Hi",
+        idempotency_key=None,
+    )
+    async for _ in read_events(redis_client, generation_id, block_ms=50):
+        pass
+
+    assert list(captured[0].last_tools) == []
+
+
+async def test_enabled_tools_are_offered_when_the_flag_is_on(
+    db: AsyncSession, redis_client: Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user, workspace, model = await _workspace_with_model(db)
+    await _enable_tools(db, redis_client, workspace_id=workspace.id)
+    tool = await _add_tool(db, workspace_id=workspace.id, created_by=user.id)
+    captured: list[FakeProvider] = []
+
+    def _capturing_build_provider(
+        provider: Provider, *, api_key: str, base_url: str | None
+    ) -> FakeProvider:
+        instance = FakeProvider(api_key=api_key, base_url=base_url)
+        captured.append(instance)
+        return instance
+
+    monkeypatch.setattr("app.services.chat.build_provider", _capturing_build_provider)
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db,
+        redis_client,
+        workspace_id=workspace.id,
+        conversation=conversation,
+        content="Hi",
+        idempotency_key=None,
+    )
+    async for _ in read_events(redis_client, generation_id, block_ms=50):
+        pass
+
+    assert list(captured[0].last_tools) == [to_tool_definition(tool)]
+
+
+async def test_a_tool_call_is_executed_and_fed_back_for_a_final_answer(
+    db: AsyncSession, redis_client: Redis, tool_calling_provider: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The model asks for a tool, the loop runs it and feeds the result back, and the provider is
+    called again for the actual answer — one generation, one persisted reply, usage from both
+    round trips summed into it."""
+    user, workspace, model = await _workspace_with_model(db)
+    await _enable_tools(db, redis_client, workspace_id=workspace.id)
+    tool = await _add_tool(db, workspace_id=workspace.id, created_by=user.id)
+    monkeypatch.setattr("app.services.chat.execute_tool", _fake_execute_tool)
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db,
+        redis_client,
+        workspace_id=workspace.id,
+        conversation=conversation,
+        content="What's the weather in Paris?",
+        idempotency_key=None,
+    )
+    events = [e async for e in read_events(redis_client, generation_id, block_ms=50)]
+
+    event_types = [e.type for e in events]
+    assert "tool_call" in event_types
+    assert "tool_result" in event_types
+    assert event_types[-1] == "done"
+
+    messages = await list_messages(db, conversation_id=conversation.id)
+    assert [m.role.value for m in messages] == ["user", "assistant"]
+    assistant = messages[1]
+    assert assistant.content == "Hello from the fake provider. "  # the second stream() call's reply
+    # First call: "What's the weather in Paris?" (5 words) -> input 5, output 0 (a tool request).
+    # Second call adds the assistant's (empty) tool-call turn and the tool result "It is sunny in
+    # Paris" (5 words) -> input 5+0+5=10, output len(FAKE_REPLY.split(" "))=5. Summed: in=15, out=5.
+    assert assistant.tokens_in == 15
+    assert assistant.tokens_out == 5
+
+    invocations = (
+        await db.scalars(select(ToolInvocation).where(ToolInvocation.message_id == assistant.id))
+    ).all()
+    assert len(invocations) == 1
+    assert invocations[0].tool_id == tool.id
+    assert invocations[0].name == "get_weather"
+    assert invocations[0].arguments == {"city": "Paris"}
+    assert invocations[0].status == ToolInvocationStatus.SUCCESS
+    assert invocations[0].result == "It is sunny in Paris"
+
+
+async def test_a_failing_tool_returns_an_error_to_the_model_not_the_generation(
+    db: AsyncSession, redis_client: Redis, tool_calling_provider: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tool that fails still lets the generation finish normally — the model gets to react to
+    the failure (and here, FakeProvider's scripted reply is exactly that reaction) rather than
+    the whole reply blowing up."""
+    user, workspace, model = await _workspace_with_model(db)
+    await _enable_tools(db, redis_client, workspace_id=workspace.id)
+    await _add_tool(db, workspace_id=workspace.id, created_by=user.id)
+    monkeypatch.setattr("app.services.chat.execute_tool", _failing_execute_tool)
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db,
+        redis_client,
+        workspace_id=workspace.id,
+        conversation=conversation,
+        content="What's the weather in Paris?",
+        idempotency_key=None,
+    )
+    events = [e async for e in read_events(redis_client, generation_id, block_ms=50)]
+
+    assert events[-1].type == "done"
+    tool_result_events = [e for e in events if e.type == "tool_result"]
+    assert tool_result_events[0].data["ok"] is False
+
+    messages = await list_messages(db, conversation_id=conversation.id)
+    invocation = (
+        await db.scalars(select(ToolInvocation).where(ToolInvocation.message_id == messages[1].id))
+    ).one()
+    assert invocation.status == ToolInvocationStatus.ERROR
+    assert invocation.error == "The tool blew up."
+
+
+async def test_calling_an_unknown_tool_is_an_error_not_a_crash(
+    db: AsyncSession, redis_client: Redis, tool_calling_provider: None
+) -> None:
+    """The model asks for a tool that was never registered (or was since disabled) — a stale
+    definition from earlier in a long conversation, not a reason to fail the generation."""
+    user, workspace, model = await _workspace_with_model(db)
+    await _enable_tools(db, redis_client, workspace_id=workspace.id)
+    # Deliberately no tool registered — ToolCallingFakeProvider still asks for "get_weather".
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db,
+        redis_client,
+        workspace_id=workspace.id,
+        conversation=conversation,
+        content="What's the weather in Paris?",
+        idempotency_key=None,
+    )
+    events = [e async for e in read_events(redis_client, generation_id, block_ms=50)]
+
+    assert events[-1].type == "done"
+    messages = await list_messages(db, conversation_id=conversation.id)
+    invocation = (
+        await db.scalars(select(ToolInvocation).where(ToolInvocation.message_id == messages[1].id))
+    ).one()
+    assert invocation.tool_id is None
+    assert invocation.status == ToolInvocationStatus.ERROR
+
+
+async def test_the_iteration_cap_stops_a_provider_that_never_finishes(
+    db: AsyncSession, redis_client: Redis, never_finishes_provider: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A model that keeps calling tools forever doesn't run forever — it's cut off after
+    MAX_TOOL_ITERATIONS round trips, and every call made up to that point is still recorded."""
+    user, workspace, model = await _workspace_with_model(db)
+    await _enable_tools(db, redis_client, workspace_id=workspace.id)
+    await _add_tool(db, workspace_id=workspace.id, created_by=user.id)
+    monkeypatch.setattr("app.services.chat.execute_tool", _fake_execute_tool)
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db,
+        redis_client,
+        workspace_id=workspace.id,
+        conversation=conversation,
+        content="What's the weather?",
+        idempotency_key=None,
+    )
+    events = [e async for e in read_events(redis_client, generation_id, block_ms=50)]
+
+    assert events[-1].type == "error"
+    assert len([e for e in events if e.type == "tool_call"]) == MAX_TOOL_ITERATIONS
+
+    messages = await list_messages(db, conversation_id=conversation.id)
+    invocations = (
+        await db.scalars(select(ToolInvocation).where(ToolInvocation.message_id == messages[1].id))
+    ).all()
+    assert len(invocations) == MAX_TOOL_ITERATIONS

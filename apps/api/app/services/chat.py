@@ -11,6 +11,7 @@ import asyncio
 import time
 import uuid
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from redis.asyncio import Redis
@@ -35,9 +36,22 @@ from app.models import (
     Message,
     MessageRole,
     Provider,
+    Tool,
+    ToolInvocation,
+    ToolInvocationStatus,
     User,
 )
-from app.providers.base import ChatMessage, Done, ImagePart, LLMProvider, StreamError, TextDelta, Usage
+from app.providers.base import (
+    ChatMessage,
+    Done,
+    ImagePart,
+    LLMProvider,
+    StreamError,
+    TextDelta,
+    ToolCall,
+    ToolCallRequest,
+    Usage,
+)
 from app.providers.registry import build_provider
 from app.services.attachments import attach_to_message, read_attachment_bytes
 from app.services.credentials import decrypt_credential_key, get_credential
@@ -48,12 +62,18 @@ from app.services.generations import (
     get_or_create_generation_id,
     set_active_generation,
 )
+from app.services.tools import list_enabled_tools, to_tool_definition
 from app.services.usage import record_usage_event
+from app.tools.execute import execute_tool
 
 tracer = get_tracer(__name__)
 
 MAX_TOKENS = 4096
 TITLE_MAX_LENGTH = 60
+
+# A model that keeps calling tools forever is a billing runaway, not a feature — this bounds one
+# generation to at most this many round trips through the provider before it's forced to a stop.
+MAX_TOOL_ITERATIONS = 5
 
 # Bounds the raw image bytes carried across one request's assembled history. Unlike text, images
 # live in `history` as actual bytes for the life of the background generation task (up to the
@@ -378,6 +398,11 @@ async def send_message(
     history.append(ChatMessage(role="user", content=text, images=images))
     history = _apply_image_budget(history)
 
+    tools_enabled = await evaluate_flag(
+        db, redis, key="tools", workspace_id=workspace_id, user_id=conversation.user_id
+    )
+    tools = await list_enabled_tools(db, workspace_id=workspace_id) if tools_enabled else []
+
     api_key = decrypt_credential_key(credential)
     provider = build_provider(credential.provider, api_key=api_key, base_url=credential.base_url)
 
@@ -394,12 +419,65 @@ async def send_message(
             provider=credential.provider,
             provider_model_id=model.provider_model_id,
             history=history,
+            tools=tools,
         )
     )
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
 
     return generation_id
+
+
+@dataclass
+class _ToolInvocationRecord:
+    """One tool call from this generation, held in memory until the final assistant message
+    exists to attach it to — see the persistence step at the end of _run_generation."""
+
+    tool_id: uuid.UUID | None
+    name: str
+    arguments: dict[str, object]
+    result: str
+    status: ToolInvocationStatus
+    error: str | None
+    latency_ms: int
+
+
+async def _execute_tool_call(
+    redis: Redis, generation_id: str, call: ToolCall, tools_by_name: dict[str, Tool]
+) -> _ToolInvocationRecord:
+    """Run one requested call, emitting the SSE events either side of it, and return a record
+    ready to persist once the generation finishes."""
+    await append_event(redis, generation_id, "tool_call", {"name": call.name, "arguments": call.arguments})
+    tool = tools_by_name.get(call.name)
+    if tool is None:
+        # The model asked for a tool that isn't (or is no longer) enabled — a stale definition
+        # from earlier in a long conversation, not a reason to fail the whole generation.
+        content = f"Tool '{call.name}' is not available."
+        await append_event(
+            redis, generation_id, "tool_result", {"name": call.name, "ok": False, "content": content}
+        )
+        return _ToolInvocationRecord(
+            tool_id=None,
+            name=call.name,
+            arguments=call.arguments,
+            result=content,
+            status=ToolInvocationStatus.ERROR,
+            error=content,
+            latency_ms=0,
+        )
+    result, latency_ms = await execute_tool(tool, call.arguments)
+    await append_event(
+        redis, generation_id, "tool_result", {"name": call.name, "ok": result.ok, "content": result.content}
+    )
+    return _ToolInvocationRecord(
+        tool_id=tool.id,
+        name=call.name,
+        arguments=call.arguments,
+        result=result.content,
+        status=ToolInvocationStatus.SUCCESS if result.ok else ToolInvocationStatus.ERROR,
+        error=None if result.ok else result.content,
+        latency_ms=latency_ms,
+    )
 
 
 async def _run_generation(
@@ -413,8 +491,14 @@ async def _run_generation(
     provider: Provider,
     provider_model_id: str,
     history: list[ChatMessage],
+    tools: list[Tool],
 ) -> None:
     """Stream a reply from the provider, appending each chunk to Redis, then persist the result.
+
+    When the model calls a tool, this doesn't return — it executes the call, appends the
+    assistant's request and the tool's result to the working history, and calls the provider
+    again, up to MAX_TOOL_ITERATIONS times. Every iteration's usage adds to the same running
+    total, and everything is still one generation, one Redis stream, one persisted reply.
 
     Owns its own database session and Redis client — it must keep running, and keep those
     connections, independent of whatever HTTP request (if any) is currently watching.
@@ -423,11 +507,16 @@ async def _run_generation(
     pubsub = redis.pubsub()
     await pubsub.subscribe(f"gen:{generation_id}:stop")
 
+    tool_definitions = [to_tool_definition(t) for t in tools]
+    tools_by_name = {t.name: t for t in tools}
+
     text_parts: list[str] = []
     input_tokens: int | None = None
     output_tokens: int | None = None
     finish_reason = "stop"
     error_message: str | None = None
+    stopped = False
+    invocations: list[_ToolInvocationRecord] = []
     started_at = time.monotonic()
 
     with tracer.start_as_current_span(
@@ -441,28 +530,71 @@ async def _run_generation(
         },
     ) as span:
         try:
-            stream = adapter.stream(model=provider_model_id, messages=history, max_tokens=MAX_TOKENS)
-            async for chunk in stream:
+            for _ in range(MAX_TOOL_ITERATIONS):
+                # Checked at the top of every iteration too, not just between provider chunks —
+                # tool execution itself can take several seconds, and a stop request shouldn't
+                # have to wait for the *next* round trip to the provider to take effect.
                 stop_signal = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.01)
                 if stop_signal is not None:
                     finish_reason = "stopped"
+                    stopped = True
                     break
-                if isinstance(chunk, TextDelta):
-                    text_parts.append(chunk.text)
-                    await append_event(redis, generation_id, "delta", {"text": chunk.text})
-                elif isinstance(chunk, Usage):
-                    input_tokens, output_tokens = chunk.input_tokens, chunk.output_tokens
-                elif isinstance(chunk, Done):
-                    finish_reason = chunk.finish_reason
-                elif isinstance(chunk, StreamError):
-                    error_message = chunk.message
+
+                requested_calls: tuple[ToolCall, ...] = ()
+                iteration_text: list[str] = []
+                stream = adapter.stream(
+                    model=provider_model_id, messages=history, max_tokens=MAX_TOKENS, tools=tool_definitions
+                )
+                async for chunk in stream:
+                    stop_signal = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.01)
+                    if stop_signal is not None:
+                        finish_reason = "stopped"
+                        stopped = True
+                        break
+                    if isinstance(chunk, TextDelta):
+                        iteration_text.append(chunk.text)
+                        text_parts.append(chunk.text)
+                        await append_event(redis, generation_id, "delta", {"text": chunk.text})
+                    elif isinstance(chunk, ToolCallRequest):
+                        requested_calls = chunk.calls
+                    elif isinstance(chunk, Usage):
+                        input_tokens = (input_tokens or 0) + chunk.input_tokens
+                        output_tokens = (output_tokens or 0) + chunk.output_tokens
+                    elif isinstance(chunk, Done):
+                        finish_reason = chunk.finish_reason
+                    elif isinstance(chunk, StreamError):
+                        error_message = chunk.message
+                        break
+
+                if error_message or stopped:
                     break
+                if not requested_calls:
+                    break  # a normal final answer — nothing more to do
+
+                history.append(
+                    ChatMessage(role="assistant", content="".join(iteration_text), tool_calls=requested_calls)
+                )
+                for call in requested_calls:
+                    record = await _execute_tool_call(redis, generation_id, call, tools_by_name)
+                    invocations.append(record)
+                    history.append(
+                        ChatMessage(
+                            role="tool", content=record.result, tool_call_id=call.id, tool_name=call.name
+                        )
+                    )
+                # Loop again: the provider hasn't given a final answer yet, only asked for tools.
+            else:
+                # Exhausted every iteration without a break — the model never stopped calling
+                # tools for a final answer. Doesn't override a real error or an explicit stop.
+                if not error_message and not stopped:
+                    error_message = "The model kept calling tools without finishing an answer."
         except Exception as exc:  # noqa: BLE001 — any transport failure still needs a terminal event
             error_message = f"Streaming failed: {exc}"
 
         span.set_attribute("finish_reason", finish_reason)
         span.set_attribute("tokens_in", input_tokens or 0)
         span.set_attribute("tokens_out", output_tokens or 0)
+        span.set_attribute("tool_calls", len(invocations))
         if error_message:
             span.set_attribute("error", error_message)
 
@@ -493,10 +625,27 @@ async def _run_generation(
         conversation = await db.get(Conversation, conversation_id)
         if conversation is not None:
             conversation.updated_at = datetime.now(UTC)
+        # Materializes assistant_message.id — needed below whether or not there's an error, since
+        # a generation that failed on, say, its third round trip may still have two real tool
+        # calls worth recording.
+        await db.flush()
+        for record in invocations:
+            db.add(
+                ToolInvocation(
+                    workspace_id=workspace_id,
+                    message_id=assistant_message.id,
+                    tool_id=record.tool_id,
+                    name=record.name,
+                    arguments=record.arguments,
+                    result=record.result,
+                    status=record.status,
+                    error=record.error,
+                    latency_ms=record.latency_ms,
+                )
+            )
         if not error_message:
             # A stopped-but-partial reply still used real tokens and is still billable; only an
             # outright failure (never reaching a "done") produces nothing worth metering.
-            await db.flush()  # materializes assistant_message.id for the usage event's FK
             await record_usage_event(
                 db,
                 workspace_id=workspace_id,

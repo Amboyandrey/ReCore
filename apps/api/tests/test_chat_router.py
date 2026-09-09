@@ -13,8 +13,8 @@ from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import FeatureFlag, FlagScope
-from app.providers.base import ChatMessage, Chunk, Done, TextDelta, Usage
+from app.models import FeatureFlag, FlagScope, Tool, ToolKind, User
+from app.providers.base import ChatMessage, Chunk, Done, TextDelta, ToolCall, ToolDefinition, Usage
 from app.providers.fake import VALID_KEY, FakeProvider
 from app.services.flags import set_override
 
@@ -26,13 +26,26 @@ class SlowFakeProvider(FakeProvider):
     """Paced like test_chat_service.py's version — gives a test a reliable window mid-stream."""
 
     async def stream(
-        self, *, model: str, messages: Sequence[ChatMessage], max_tokens: int
+        self,
+        *,
+        model: str,
+        messages: Sequence[ChatMessage],
+        max_tokens: int,
+        tools: Sequence[ToolDefinition] = (),
     ) -> AsyncIterator[Chunk]:
+        del tools
         for word in ["one ", "two ", "three ", "four "]:
             await asyncio.sleep(0.05)
             yield TextDelta(text=word)
         yield Usage(input_tokens=1, output_tokens=4)
         yield Done(finish_reason="stop")
+
+
+class ToolCallingFakeProvider(FakeProvider):
+    """Asks for one tool on its first stream() call, then replies normally once the loop feeds
+    the result back — see FakeProvider.SCRIPTED_TOOL_CALL."""
+
+    SCRIPTED_TOOL_CALL = ToolCall(id="call_1", name="get_weather", arguments={"city": "Paris"})
 
 
 def _fake_build_provider(provider, *, api_key, base_url) -> FakeProvider:
@@ -41,6 +54,10 @@ def _fake_build_provider(provider, *, api_key, base_url) -> FakeProvider:
 
 def _slow_build_provider(provider, *, api_key, base_url) -> SlowFakeProvider:
     return SlowFakeProvider(api_key=api_key, base_url=base_url)
+
+
+def _tool_calling_build_provider(provider, *, api_key, base_url) -> ToolCallingFakeProvider:
+    return ToolCallingFakeProvider(api_key=api_key, base_url=base_url)
 
 
 @pytest.fixture(autouse=True)
@@ -478,3 +495,60 @@ async def test_sending_is_blocked_while_the_model_s_provider_is_disabled(
         f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/messages"
     )
     assert still_readable.status_code == 200
+
+
+async def test_a_tool_call_streams_live_and_is_listed_after_the_fact(
+    db: AsyncSession, redis_client: Redis, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The full round trip: a tool call shows up as SSE events while it's happening, and as a row
+    the tool-invocations endpoint returns once the reply is done — a reload shouldn't lose it."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    flag = await db.scalar(select(FeatureFlag).where(FeatureFlag.key == "tools"))
+    assert flag is not None
+    await set_override(
+        db,
+        redis_client,
+        flag_id=flag.id,
+        scope=FlagScope.WORKSPACE,
+        scope_id=uuid.UUID(workspace_id),
+        value=True,
+    )
+    owner = await db.scalar(select(User).where(User.email == OWNER["email"]))
+    assert owner is not None
+    tool = Tool(
+        workspace_id=uuid.UUID(workspace_id),
+        name="get_weather",
+        description="Get the current weather for a city.",
+        parameters={"type": "object", "properties": {"city": {"type": "string"}}},
+        kind=ToolKind.BUILTIN,
+        enabled=True,
+        created_by=owner.id,
+    )
+    db.add(tool)
+    await db.commit()
+    monkeypatch.setattr("app.services.chat.build_provider", _tool_calling_build_provider)
+    conversation = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id}
+    )
+    conversation_id = conversation.json()["id"]
+
+    events = await _consume_sse(
+        client,
+        "POST",
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/messages",
+        json={"content": "What's the weather in Paris?"},
+    )
+
+    event_types = [e for e, _ in events]
+    assert "tool_call" in event_types
+    assert "tool_result" in event_types
+    assert event_types[-1] == "done"
+
+    invocations = await client.get(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/tool-invocations"
+    )
+    assert invocations.status_code == 200
+    body = invocations.json()
+    assert len(body) == 1
+    assert body[0]["name"] == "get_weather"
+    assert body[0]["tool_id"] == str(tool.id)
