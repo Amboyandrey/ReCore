@@ -20,6 +20,8 @@ from app.routers.v1 import (
     invitations,
     members,
     models,
+    tool_invocations,
+    tools,
     usage,
     workspaces,
 )
@@ -54,6 +56,8 @@ app.include_router(chat.router, prefix="/api/v1")
 app.include_router(flags.evaluate_router, prefix="/api/v1")
 app.include_router(flags.admin_router, prefix="/api/v1")
 app.include_router(attachments.router, prefix="/api/v1")
+app.include_router(tools.router, prefix="/api/v1")
+app.include_router(tool_invocations.router, prefix="/api/v1")
 app.include_router(usage.router, prefix="/api/v1")
 app.include_router(audit.router, prefix="/api/v1")
 
