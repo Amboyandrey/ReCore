@@ -211,3 +211,10 @@ class ToolNameAlreadyExists(AppError):
 
     status_code = 409
     detail = "A tool with this name already exists."
+
+
+class AssistantNotFound(AppError):
+    """Raised for an assistant id that doesn't exist in the workspace it was looked up under."""
+
+    status_code = 404
+    detail = "Assistant not found."

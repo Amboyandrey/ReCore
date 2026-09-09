@@ -53,6 +53,7 @@ from app.providers.base import (
     Usage,
 )
 from app.providers.fake import VALID_KEY, FakeProvider
+from app.services.assistants import create_assistant, update_assistant
 from app.services.attachments import save_attachment
 from app.services.chat import (
     MAX_TOOL_ITERATIONS,
@@ -326,7 +327,7 @@ async def test_update_conversation_model_switches_which_model_is_used(db: AsyncS
         workspace_id=workspace.id,
         conversation_id=conversation.id,
         viewer_id=user.id,
-        model_id=other_model.id,
+        changes={"model_id": other_model.id},
     )
 
     assert updated.model_id == other_model.id
@@ -372,7 +373,7 @@ async def test_update_conversation_model_rejects_a_model_from_another_workspace(
             workspace_id=workspace.id,
             conversation_id=conversation.id,
             viewer_id=user.id,
-            model_id=other_model.id,
+            changes={"model_id": other_model.id},
         )
 
 
@@ -583,7 +584,11 @@ async def test_sharing_a_conversation_makes_it_visible_to_the_rest_of_the_worksp
     await db.commit()
 
     await update_conversation(
-        db, workspace_id=workspace.id, conversation_id=conversation.id, viewer_id=owner.id, shared=True
+        db,
+        workspace_id=workspace.id,
+        conversation_id=conversation.id,
+        viewer_id=owner.id,
+        changes={"shared": True},
     )
 
     visible_to_teammate = await list_conversations(db, workspace_id=workspace.id, viewer_id=teammate.id)
@@ -604,7 +609,11 @@ async def test_only_the_owner_can_share_or_unshare_a_conversation(db: AsyncSessi
     )
     await db.commit()
     await update_conversation(
-        db, workspace_id=workspace.id, conversation_id=conversation.id, viewer_id=owner.id, shared=True
+        db,
+        workspace_id=workspace.id,
+        conversation_id=conversation.id,
+        viewer_id=owner.id,
+        changes={"shared": True},
     )
 
     with pytest.raises(InsufficientRole):
@@ -613,7 +622,7 @@ async def test_only_the_owner_can_share_or_unshare_a_conversation(db: AsyncSessi
             workspace_id=workspace.id,
             conversation_id=conversation.id,
             viewer_id=teammate.id,
-            shared=False,
+            changes={"shared": False},
         )
 
 
@@ -627,7 +636,11 @@ async def test_only_the_owner_can_delete_a_shared_conversation(db: AsyncSession)
     )
     await db.commit()
     await update_conversation(
-        db, workspace_id=workspace.id, conversation_id=conversation.id, viewer_id=owner.id, shared=True
+        db,
+        workspace_id=workspace.id,
+        conversation_id=conversation.id,
+        viewer_id=owner.id,
+        changes={"shared": True},
     )
 
     with pytest.raises(InsufficientRole):
@@ -977,6 +990,158 @@ async def test_enabled_tools_are_offered_when_the_flag_is_on(
         pass
 
     assert list(captured[0].last_tools) == [to_tool_definition(tool)]
+
+
+async def test_an_assistants_instructions_become_the_system_turn(
+    db: AsyncSession, redis_client: Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A conversation with an assistant uses its instructions instead of its own system_prompt —
+    even when one was also set, the assistant takes over."""
+    user, workspace, model = await _workspace_with_model(db)
+    assistant = await create_assistant(
+        db,
+        workspace_id=workspace.id,
+        created_by=user,
+        name="Weather bot",
+        instructions="You only ever talk about the weather.",
+        model_id=None,
+        tool_ids=[],
+    )
+    captured: list[FakeProvider] = []
+
+    def _capturing_build_provider(
+        provider: Provider, *, api_key: str, base_url: str | None
+    ) -> FakeProvider:
+        instance = FakeProvider(api_key=api_key, base_url=base_url)
+        captured.append(instance)
+        return instance
+
+    monkeypatch.setattr("app.services.chat.build_provider", _capturing_build_provider)
+    conversation = await create_conversation(
+        db,
+        workspace_id=workspace.id,
+        user=user,
+        model_id=model.id,
+        system_prompt="This should be ignored.",
+        assistant_id=assistant.id,
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db,
+        redis_client,
+        workspace_id=workspace.id,
+        conversation=conversation,
+        content="Hi",
+        idempotency_key=None,
+    )
+    async for _ in read_events(redis_client, generation_id, block_ms=50):
+        pass
+
+    system_turn = captured[0].last_messages[0]
+    assert system_turn.role == "system"
+    assert system_turn.content == "You only ever talk about the weather."
+
+
+async def test_an_assistants_tools_narrow_the_offered_set(
+    db: AsyncSession, redis_client: Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A conversation with an assistant is offered only that assistant's assigned tools — not
+    every enabled tool in the workspace, the way an assistant-less conversation is."""
+    user, workspace, model = await _workspace_with_model(db)
+    await _enable_tools(db, redis_client, workspace_id=workspace.id)
+    assigned_tool = await _add_tool(db, workspace_id=workspace.id, created_by=user.id, name="get_weather")
+    other_tool = await _add_tool(db, workspace_id=workspace.id, created_by=user.id, name="get_stock_price")
+    assistant = await create_assistant(
+        db,
+        workspace_id=workspace.id,
+        created_by=user,
+        name="Weather bot",
+        instructions="Only use get_weather.",
+        model_id=None,
+        tool_ids=[assigned_tool.id],
+    )
+    del other_tool
+    captured: list[FakeProvider] = []
+
+    def _capturing_build_provider(
+        provider: Provider, *, api_key: str, base_url: str | None
+    ) -> FakeProvider:
+        instance = FakeProvider(api_key=api_key, base_url=base_url)
+        captured.append(instance)
+        return instance
+
+    monkeypatch.setattr("app.services.chat.build_provider", _capturing_build_provider)
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None,
+        assistant_id=assistant.id,
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db,
+        redis_client,
+        workspace_id=workspace.id,
+        conversation=conversation,
+        content="Hi",
+        idempotency_key=None,
+    )
+    async for _ in read_events(redis_client, generation_id, block_ms=50):
+        pass
+
+    assert list(captured[0].last_tools) == [to_tool_definition(assigned_tool)]
+
+
+async def test_editing_an_assistant_is_reflected_on_the_very_next_send(
+    db: AsyncSession, redis_client: Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An assistant's instructions are resolved live on every send, not snapshotted onto the
+    conversation at creation — editing one reaches a conversation already using it."""
+    user, workspace, model = await _workspace_with_model(db)
+    assistant = await create_assistant(
+        db,
+        workspace_id=workspace.id,
+        created_by=user,
+        name="Bot",
+        instructions="Version one.",
+        model_id=None,
+        tool_ids=[],
+    )
+    captured: list[FakeProvider] = []
+
+    def _capturing_build_provider(
+        provider: Provider, *, api_key: str, base_url: str | None
+    ) -> FakeProvider:
+        instance = FakeProvider(api_key=api_key, base_url=base_url)
+        captured.append(instance)
+        return instance
+
+    monkeypatch.setattr("app.services.chat.build_provider", _capturing_build_provider)
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None,
+        assistant_id=assistant.id,
+    )
+    await db.commit()
+    generation_id = await send_message(
+        db, redis_client, workspace_id=workspace.id, conversation=conversation,
+        content="First", idempotency_key=None,
+    )
+    async for _ in read_events(redis_client, generation_id, block_ms=50):
+        pass
+
+    await update_assistant(
+        db, workspace_id=workspace.id, assistant_id=assistant.id, changes={"instructions": "Version two."}
+    )
+    await db.commit()
+    generation_id = await send_message(
+        db, redis_client, workspace_id=workspace.id, conversation=conversation,
+        content="Second", idempotency_key=None,
+    )
+    async for _ in read_events(redis_client, generation_id, block_ms=50):
+        pass
+
+    assert captured[0].last_messages[0].content == "Version one."
+    assert captured[1].last_messages[0].content == "Version two."
 
 
 async def test_a_tool_call_is_executed_and_fed_back_for_a_final_answer(

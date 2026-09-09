@@ -66,6 +66,7 @@ async def create_conversation_route(
         user=ctx.user,
         model_id=body.model_id,
         system_prompt=body.system_prompt,
+        assistant_id=body.assistant_id,
     )
     return ConversationOut.model_validate(conversation, from_attributes=True)
 
@@ -102,15 +103,15 @@ async def update_conversation_route(
     ctx: WorkspaceCtx = Depends(require_role(Role.VIEWER)),
     db: AsyncSession = Depends(get_db),
 ) -> ConversationOut:
-    """Switch a conversation's model and/or toggle its sharing — only the owner may share/unshare."""
+    """Switch a conversation's model, assistant, and/or toggle its sharing — only the owner may
+    share/unshare."""
     changes = body.model_dump(exclude_unset=True)
     conversation = await update_conversation(
         db,
         workspace_id=ctx.workspace_id,
         conversation_id=conversation_id,
         viewer_id=ctx.user.id,
-        model_id=changes.get("model_id"),
-        shared=changes.get("shared"),
+        changes=changes,
     )
     return ConversationOut.model_validate(conversation, from_attributes=True)
 

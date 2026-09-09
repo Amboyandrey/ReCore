@@ -5,6 +5,9 @@ export type Conversation = {
   user_id: string;
   title: string;
   model_id: string;
+  // Set when an assistant governs this chat — its instructions and tools take over from this
+  // conversation's own system_prompt and the workspace's full tool set (see the API's own docs).
+  assistant_id: string | null;
   system_prompt: string | null;
   // Private to user_id until they opt it into being visible to the rest of the workspace.
   shared: boolean;
@@ -86,11 +89,16 @@ export async function listConversations(workspaceId: string): Promise<Conversati
   return (await res.json()) as Conversation[];
 }
 
-// Starts a new conversation pinned to a model.
-export async function createConversation(workspaceId: string, modelId: string): Promise<Conversation> {
+// Starts a new conversation pinned to a model, optionally governed by one of the workspace's
+// saved assistants.
+export async function createConversation(
+  workspaceId: string,
+  modelId: string,
+  assistantId?: string
+): Promise<Conversation> {
   const res = await api(`/api/v1/workspaces/${workspaceId}/conversations`, {
     method: "POST",
-    body: JSON.stringify({ model_id: modelId }),
+    body: JSON.stringify({ model_id: modelId, assistant_id: assistantId }),
   });
   await throwIfNotOk(res);
   return (await res.json()) as Conversation;
@@ -99,11 +107,12 @@ export async function createConversation(workspaceId: string, modelId: string): 
 // Changes a conversation after it's started — only the fields passed are touched. `model_id`
 // switches which enabled model it talks to mid-session (history already sent isn't resent to the
 // new one); `shared` is its owner opting it into being visible to the rest of the workspace, or
-// back out of it — only the owner may change that field.
+// back out of it — only the owner may change that field. `assistant_id` switches (or, sent as
+// `null`, clears) which assistant governs the chat.
 export async function updateConversation(
   workspaceId: string,
   conversationId: string,
-  changes: { model_id?: string; shared?: boolean }
+  changes: { model_id?: string; shared?: boolean; assistant_id?: string | null }
 ): Promise<Conversation> {
   const res = await api(`/api/v1/workspaces/${workspaceId}/conversations/${conversationId}`, {
     method: "PATCH",

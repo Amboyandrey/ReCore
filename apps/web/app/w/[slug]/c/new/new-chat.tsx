@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import { useRequireAuth } from "@/lib/auth-context";
+import { listAssistants, type Assistant } from "@/lib/assistant-client";
 import { AttachmentError, uploadAttachment, type Attachment } from "@/lib/attachment-client";
 import {
   ChatError,
@@ -47,6 +48,8 @@ export function NewChat({ slug }: { slug: string }) {
   const [siblings, setSiblings] = useState<Conversation[]>([]);
   const [models, setModels] = useState<EnabledModel[]>([]);
   const [modelId, setModelId] = useState("");
+  const [assistants, setAssistants] = useState<Assistant[]>([]);
+  const [assistantId, setAssistantId] = useState(""); // "" means no assistant
   const [loadingData, setLoadingData] = useState(true);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -66,11 +69,12 @@ export function NewChat({ slug }: { slug: string }) {
   useEffect(() => {
     if (!workspace) return;
     let cancelled = false;
-    Promise.all([listConversations(workspace.id), listModels(workspace.id)])
-      .then(([convs, fetchedModels]) => {
+    Promise.all([listConversations(workspace.id), listModels(workspace.id), listAssistants(workspace.id)])
+      .then(([convs, fetchedModels, fetchedAssistants]) => {
         if (cancelled) return;
         setSiblings(convs);
         setModels(fetchedModels);
+        setAssistants(fetchedAssistants);
         const initial = pickDefaultModel(workspace.id, fetchedModels);
         if (initial) setModelId(initial.id);
       })
@@ -86,7 +90,7 @@ export function NewChat({ slug }: { slug: string }) {
     if (conversationIdRef.current) return conversationIdRef.current;
     if (!workspace || !modelId) throw new Error("Pick a model first.");
     if (!creatingRef.current) {
-      creatingRef.current = createConversation(workspace.id, modelId)
+      creatingRef.current = createConversation(workspace.id, modelId, assistantId || undefined)
         .then((conversation) => {
           conversationIdRef.current = conversation.id;
           setLastModelId(workspace.id, modelId);
@@ -107,6 +111,25 @@ export function NewChat({ slug }: { slug: string }) {
     if (workspace && conversationIdRef.current) {
       try {
         await updateConversation(workspace.id, conversationIdRef.current, { model_id: newModelId });
+      } catch (err) {
+        setError(err instanceof ChatError ? err.message : "Something went wrong.");
+      }
+    }
+  }
+
+  // Picking an assistant pre-fills the model picker from its preferred model, same starting-guess
+  // role pickDefaultModel already plays — still just a suggestion the model dropdown can override.
+  async function handleAssistantChange(newAssistantId: string) {
+    setAssistantId(newAssistantId);
+    const assistant = assistants.find((a) => a.id === newAssistantId);
+    if (assistant?.model_id && models.some((m) => m.id === assistant.model_id)) {
+      setModelId(assistant.model_id);
+    }
+    if (workspace && conversationIdRef.current) {
+      try {
+        await updateConversation(workspace.id, conversationIdRef.current, {
+          assistant_id: newAssistantId || null,
+        });
       } catch (err) {
         setError(err instanceof ChatError ? err.message : "Something went wrong.");
       }
@@ -243,6 +266,22 @@ export function NewChat({ slug }: { slug: string }) {
             )}
 
             <form onSubmit={handleSend} className="mt-4 flex items-end gap-2">
+              {assistants.length > 0 && (
+                <select
+                  value={assistantId}
+                  onChange={(e) => handleAssistantChange(e.target.value)}
+                  disabled={sending}
+                  title="Assistant"
+                  className="shrink-0 rounded-md border border-border bg-surface px-2 py-2 text-xs text-text-soft outline-none focus:border-accent disabled:opacity-60"
+                >
+                  <option value="">No assistant</option>
+                  {assistants.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.name}
+                    </option>
+                  ))}
+                </select>
+              )}
               <select
                 value={modelId}
                 onChange={(e) => handleModelChange(e.target.value)}

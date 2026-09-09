@@ -13,6 +13,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 from redis.asyncio import Redis
 from sqlalchemy import select
@@ -29,6 +30,7 @@ from app.core.errors import (
 from app.core.redis import new_redis_client
 from app.core.tracing import get_tracer
 from app.models import (
+    Assistant,
     Attachment,
     Conversation,
     ExtractStatus,
@@ -53,6 +55,7 @@ from app.providers.base import (
     Usage,
 )
 from app.providers.registry import build_provider
+from app.services.assistants import get_assistant, list_assistant_tools
 from app.services.attachments import attach_to_message, read_attachment_bytes
 from app.services.credentials import decrypt_credential_key, get_credential
 from app.services.flags import evaluate_flag
@@ -109,17 +112,22 @@ async def create_conversation(
     user: User,
     model_id: uuid.UUID,
     system_prompt: str | None,
+    assistant_id: uuid.UUID | None = None,
 ) -> Conversation:
-    """Start a new, empty conversation pinned to one of the workspace's enabled models."""
+    """Start a new, empty conversation pinned to one of the workspace's enabled models, and
+    optionally governed by one of its saved assistants (see Conversation's own docstring)."""
     model = await db.scalar(
         select(LLMModel).where(LLMModel.id == model_id, LLMModel.workspace_id == workspace_id)
     )
     if model is None:
         raise ModelNotFound()
+    if assistant_id is not None:
+        await get_assistant(db, workspace_id=workspace_id, assistant_id=assistant_id)  # 404s if not ours
     conversation = Conversation(
         workspace_id=workspace_id,
         user_id=user.id,
         model_id=model_id,
+        assistant_id=assistant_id,
         title="New conversation",
         system_prompt=system_prompt,
     )
@@ -134,16 +142,17 @@ async def update_conversation(
     workspace_id: uuid.UUID,
     conversation_id: uuid.UUID,
     viewer_id: uuid.UUID,
-    model_id: uuid.UUID | None = None,
-    shared: bool | None = None,
+    changes: dict[str, Any],
 ) -> Conversation:
-    """Change a conversation's model and/or its sharing state — only the fields actually passed.
+    """Apply only the fields present in `changes` (built with the request schema's
+    `exclude_unset`) — so omitting a field leaves it untouched, but explicitly passing
+    `assistant_id: null` clears which assistant governs the chat.
 
-    Switching models is mid-session, not just at the start: already-sent history isn't rewritten
-    or resent to the new model, only the turn that follows the switch goes to it, same as a human
-    switching who they're talking to mid-conversation doesn't hand the new person a transcript
-    unless asked. Available to anyone who can already see this conversation (its owner, or anyone
-    it's been shared with) — same as sending a message into it always has been.
+    Switching models (or assistants) is mid-session, not just at the start: already-sent history
+    isn't rewritten or resent to the new one, only the turn that follows the switch goes to it,
+    same as a human switching who they're talking to mid-conversation doesn't hand the new person
+    a transcript unless asked. Available to anyone who can already see this conversation (its
+    owner, or anyone it's been shared with) — same as sending a message into it always has been.
 
     Sharing is different: only the owner may flip it, in either direction. Letting anyone who can
     already see a shared conversation also un-share (or re-share) it would make "shared" a
@@ -152,17 +161,23 @@ async def update_conversation(
     conversation = await get_conversation(
         db, workspace_id=workspace_id, conversation_id=conversation_id, viewer_id=viewer_id
     )
-    if shared is not None and conversation.user_id != viewer_id:
+    if "shared" in changes and conversation.user_id != viewer_id:
         raise InsufficientRole()
-    if model_id is not None:
+    if "model_id" in changes:
         model = await db.scalar(
-            select(LLMModel).where(LLMModel.id == model_id, LLMModel.workspace_id == workspace_id)
+            select(LLMModel).where(
+                LLMModel.id == changes["model_id"], LLMModel.workspace_id == workspace_id
+            )
         )
         if model is None:
             raise ModelNotFound()
-        conversation.model_id = model_id
-    if shared is not None:
-        conversation.shared = shared
+        conversation.model_id = changes["model_id"]
+    if "assistant_id" in changes:
+        if changes["assistant_id"] is not None:
+            await get_assistant(db, workspace_id=workspace_id, assistant_id=changes["assistant_id"])
+        conversation.assistant_id = changes["assistant_id"]
+    if "shared" in changes:
+        conversation.shared = changes["shared"]
     await db.flush()
     # `updated_at`'s onupdate=func.now() runs server-side, so the flush above leaves that
     # attribute expired rather than populated — the route below serializes this object
@@ -304,10 +319,13 @@ def _apply_image_budget(history: list[ChatMessage]) -> list[ChatMessage]:
 
 
 async def _to_chat_history(
-    db: AsyncSession, conversation: Conversation, messages: list[Message]
+    db: AsyncSession, messages: list[Message], *, system_prompt: str | None
 ) -> list[ChatMessage]:
     """Translate stored messages into the plain role/content shape every provider adapter takes —
     replaying each past turn exactly as it was actually sent, attachments included.
+
+    `system_prompt` is resolved by the caller: an assistant's instructions when the conversation
+    has one, its own `system_prompt` field otherwise — see send_message.
 
     `Message.content` only ever holds what the user typed (see _augment_with_attachments) — a
     version of this that replayed straight from `content` would silently forget every attachment
@@ -315,8 +333,8 @@ async def _to_chat_history(
     a user hit three times over with attachment text before this fix.
     """
     history = []
-    if conversation.system_prompt:
-        history.append(ChatMessage(role="system", content=conversation.system_prompt))
+    if system_prompt:
+        history.append(ChatMessage(role="system", content=system_prompt))
     user_message_ids = [m.id for m in messages if m.role == MessageRole.USER]
     attachments_by_message = await _attachments_by_message_id(db, user_message_ids)
     for m in messages:
@@ -393,7 +411,15 @@ async def send_message(
     # database via _to_chat_history's join.
     await set_workspace_scope(db, workspace_id)
 
-    history = await _to_chat_history(db, conversation, [*existing_messages])
+    # An assistant, if this conversation has one, governs both the system turn and the offered
+    # tools — resolved fresh on every send rather than snapshotted, so editing it (or its tools)
+    # reaches conversations already using it. `assistant_id` can only ever point at one of this
+    # workspace's own assistants (enforced at create/update time), and ON DELETE SET NULL means
+    # a since-deleted assistant already shows up here as None, not a dangling reference.
+    assistant = await db.get(Assistant, conversation.assistant_id) if conversation.assistant_id else None
+    system_prompt = assistant.instructions if assistant is not None else conversation.system_prompt
+
+    history = await _to_chat_history(db, [*existing_messages], system_prompt=system_prompt)
     text, images = _augment_with_attachments(content, attachments)
     history.append(ChatMessage(role="user", content=text, images=images))
     history = _apply_image_budget(history)
@@ -401,7 +427,12 @@ async def send_message(
     tools_enabled = await evaluate_flag(
         db, redis, key="tools", workspace_id=workspace_id, user_id=conversation.user_id
     )
-    tools = await list_enabled_tools(db, workspace_id=workspace_id) if tools_enabled else []
+    if not tools_enabled:
+        tools: list[Tool] = []
+    elif assistant is not None:
+        tools = await list_assistant_tools(db, assistant_id=assistant.id)
+    else:
+        tools = await list_enabled_tools(db, workspace_id=workspace_id)
 
     api_key = decrypt_credential_key(credential)
     provider = build_provider(credential.provider, api_key=api_key, base_url=credential.base_url)
