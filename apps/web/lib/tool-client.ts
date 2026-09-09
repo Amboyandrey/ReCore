@@ -1,14 +1,43 @@
 import { apiPublicUrl } from "./config";
 
 export type ToolKind = "builtin" | "http";
+export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
 export type Tool = {
   id: string;
   name: string;
   description: string;
+  parameters: Record<string, unknown>;
   kind: ToolKind;
   enabled: boolean;
+  method: HttpMethod | null;
+  url: string | null;
+  secret_header: string | null;
+  has_secret: boolean;
   created_at: string;
+};
+
+export type HttpToolInput = {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  method: HttpMethod;
+  url: string;
+  secret_header?: string;
+  secret_value?: string;
+};
+
+// Every field is optional — only the ones present change (see ToolUpdate's `exclude_unset` on
+// the API side). `enabled` applies to any tool; the rest are HTTP-tool-only.
+export type ToolUpdateInput = {
+  enabled?: boolean;
+  name?: string;
+  description?: string;
+  parameters?: Record<string, unknown>;
+  method?: HttpMethod;
+  url?: string;
+  secret_header?: string;
+  secret_value?: string;
 };
 
 export type ToolInvocation = {
@@ -49,6 +78,16 @@ export async function enableWebSearch(workspaceId: string, apiKey: string): Prom
   return (await res.json()) as Tool;
 }
 
+// Registers a third-party HTTP tool — the URL is checked against the SSRF guard immediately.
+export async function createHttpTool(workspaceId: string, input: HttpToolInput): Promise<Tool> {
+  const res = await api(`/api/v1/workspaces/${workspaceId}/tools`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  await throwIfNotOk(res);
+  return (await res.json()) as Tool;
+}
+
 // Lists every tool registered in the workspace.
 export async function listTools(workspaceId: string): Promise<Tool[]> {
   const res = await api(`/api/v1/workspaces/${workspaceId}/tools`);
@@ -56,8 +95,24 @@ export async function listTools(workspaceId: string): Promise<Tool[]> {
   return (await res.json()) as Tool[];
 }
 
-// Turns a tool off — its configuration (and any secret) is kept for a later re-enable.
-export async function disableTool(workspaceId: string, toolId: string): Promise<void> {
+// Toggles a tool on/off, or edits an HTTP tool's configuration — only the fields in `changes`
+// are touched, and a tool's own secret (if any) is kept unless `secret_value` is sent too.
+export async function updateTool(
+  workspaceId: string,
+  toolId: string,
+  changes: ToolUpdateInput
+): Promise<Tool> {
+  const res = await api(`/api/v1/workspaces/${workspaceId}/tools/${toolId}`, {
+    method: "PATCH",
+    body: JSON.stringify(changes),
+  });
+  await throwIfNotOk(res);
+  return (await res.json()) as Tool;
+}
+
+// Permanently removes a tool — unlike updateTool({ enabled: false }), there's no way back short
+// of registering it again from scratch.
+export async function deleteTool(workspaceId: string, toolId: string): Promise<void> {
   const res = await api(`/api/v1/workspaces/${workspaceId}/tools/${toolId}`, { method: "DELETE" });
   await throwIfNotOk(res);
 }
