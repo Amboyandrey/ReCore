@@ -18,6 +18,9 @@ from app.providers.base import (
     ModelInfo,
     StreamError,
     TextDelta,
+    ToolCall,
+    ToolCallRequest,
+    ToolDefinition,
     Usage,
 )
 
@@ -39,6 +42,49 @@ def _content(message: ChatMessage) -> str | list[dict[str, object]]:
             {"type": "image_url", "image_url": {"url": f"data:{image.mime};base64,{encoded}"}}
         )
     return blocks
+
+
+def _message_payload(message: ChatMessage) -> dict[str, object]:
+    """The full per-message dict OpenAI's `messages` array wants — `_content()` above only ever
+    covers the `content` field, but a tool-calling turn needs `tool_calls` or `tool_call_id` too."""
+    if message.role == "tool":
+        return {"role": "tool", "tool_call_id": message.tool_call_id, "content": message.content}
+    payload: dict[str, object] = {"role": message.role, "content": _content(message)}
+    if message.tool_calls:
+        payload["tool_calls"] = [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {"name": call.name, "arguments": json.dumps(call.arguments)},
+            }
+            for call in message.tool_calls
+        ]
+    return payload
+
+
+def _tools_payload(tools: Sequence[ToolDefinition]) -> list[dict[str, object]]:
+    """OpenAI's function-calling shape — one wrapper object per tool."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters,
+            },
+        }
+        for tool in tools
+    ]
+
+
+def _parse_tool_arguments(raw: str) -> dict[str, object]:
+    """Arguments arrive as a JSON-encoded string, assembled from streamed fragments — a model
+    that emits malformed JSON shouldn't take the whole generation down with it."""
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 class OpenAICompatibleProvider:
@@ -84,16 +130,28 @@ class OpenAICompatibleProvider:
         return [ModelInfo(id=m["id"], display_name=m["id"]) for m in data.get("data", [])]
 
     async def stream(
-        self, *, model: str, messages: Sequence[ChatMessage], max_tokens: int
+        self,
+        *,
+        model: str,
+        messages: Sequence[ChatMessage],
+        max_tokens: int,
+        tools: Sequence[ToolDefinition] = (),
     ) -> AsyncIterator[Chunk]:
         """Stream a chat completion, translating OpenAI's SSE chunks into normalized Chunks."""
-        payload = {
+        payload: dict[str, object] = {
             "model": model,
-            "messages": [{"role": m.role, "content": _content(m)} for m in messages],
+            "messages": [_message_payload(m) for m in messages],
             "max_tokens": max_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        if tools:
+            payload["tools"] = _tools_payload(tools)
+
+        # Keyed by the streamed delta's own `index` — OpenAI can ask for several calls in one
+        # turn, each one's id/name/arguments arriving across many chunks that share that index.
+        call_fragments: dict[int, dict[str, str]] = {}
+
         async with self._client(_STREAM_TIMEOUT) as client, client.stream(
             "POST",
             f"{self._base_url}/chat/completions",
@@ -119,9 +177,20 @@ class OpenAICompatibleProvider:
                     continue
                 choices = event.get("choices") or [{}]
                 choice = choices[0]
-                delta_text = choice.get("delta", {}).get("content")
+                delta = choice.get("delta", {})
+                delta_text = delta.get("content")
                 if delta_text:
                     yield TextDelta(text=delta_text)
+                for tc_delta in delta.get("tool_calls") or []:
+                    index = tc_delta.get("index", 0)
+                    fragment = call_fragments.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                    if tc_delta.get("id"):
+                        fragment["id"] = tc_delta["id"]
+                    function = tc_delta.get("function") or {}
+                    if function.get("name"):
+                        fragment["name"] += function["name"]
+                    if function.get("arguments"):
+                        fragment["arguments"] += function["arguments"]
                 usage = event.get("usage")
                 if usage:
                     yield Usage(
@@ -129,6 +198,19 @@ class OpenAICompatibleProvider:
                         output_tokens=usage.get("completion_tokens", 0),
                     )
                 finish_reason = choice.get("finish_reason")
+                if finish_reason == "tool_calls":
+                    if call_fragments:
+                        yield ToolCallRequest(
+                            calls=tuple(
+                                ToolCall(
+                                    id=fragment["id"],
+                                    name=fragment["name"],
+                                    arguments=_parse_tool_arguments(fragment["arguments"]),
+                                )
+                                for fragment in call_fragments.values()
+                            )
+                        )
+                    return
                 if finish_reason:
                     yield Done(finish_reason=finish_reason)
                     return

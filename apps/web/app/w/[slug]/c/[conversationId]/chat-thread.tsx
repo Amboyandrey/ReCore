@@ -21,6 +21,7 @@ import {
 import { setLastModelId } from "@/lib/last-model";
 import { takePendingFirstMessage } from "@/lib/pending-first-message";
 import { listModels, type EnabledModel } from "@/lib/provider-client";
+import { listToolInvocations, type ToolInvocation } from "@/lib/tool-client";
 import { useWorkspaceFlags } from "@/lib/use-workspace-flags";
 import { useWorkspaceBySlug } from "@/lib/workspace-context";
 import { ConversationSidebar } from "@/components/conversation-sidebar";
@@ -35,6 +36,33 @@ function groupByMessageId(attachments: Attachment[]): Record<string, Attachment[
     (grouped[attachment.message_id] ??= []).push(attachment);
   }
   return grouped;
+}
+
+// Same grouping, for tool calls — a ToolInvocation always has a message_id (it's only ever
+// recorded once the final assistant message exists), unlike an attachment's, which starts null.
+function groupToolInvocationsByMessageId(invocations: ToolInvocation[]): Record<string, ToolInvocation[]> {
+  const grouped: Record<string, ToolInvocation[]> = {};
+  for (const invocation of invocations) {
+    (grouped[invocation.message_id] ??= []).push(invocation);
+  }
+  return grouped;
+}
+
+// One tool call's activity, live (ok still null, mid-run) or from history (ok already settled).
+type ToolActivity = { name: string; ok: boolean | null };
+
+function ToolActivityChip({ name, ok }: ToolActivity) {
+  return (
+    <div
+      className={`max-w-[75%] rounded-md border px-2 py-1 text-xs ${
+        ok === false
+          ? "border-danger/40 bg-danger/10 text-danger"
+          : "border-border bg-surface-sunk text-text-muted"
+      }`}
+    >
+      🔧 <span className="font-medium">{name}</span> — {ok === null ? "running…" : ok ? "done" : "failed"}
+    </div>
+  );
 }
 
 // A locally-synthesized user turn shown the instant it's sent, before the server confirms it —
@@ -59,6 +87,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
   const { flags } = useWorkspaceFlags(workspace?.id);
   const router = useRouter();
   const attachmentsEnabled = flags.attachments === true;
+  const toolsEnabled = flags.tools === true;
 
   const [conversation, setConversation] = useState<Conversation | null>(null);
   const [siblings, setSiblings] = useState<Conversation[]>([]);
@@ -77,6 +106,15 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
   const [attachmentsByMessageId, setAttachmentsByMessageId] = useState<Record<string, Attachment[]>>(
     {}
   );
+  // Every tool call made in this conversation, keyed by the (assistant) message it belongs to —
+  // same shape as attachmentsByMessageId, for the same reason: a message already in history
+  // should still show a tool was called, not just the composer while it's streaming live.
+  const [toolInvocationsByMessageId, setToolInvocationsByMessageId] = useState<
+    Record<string, ToolInvocation[]>
+  >({});
+  // Live tool activity for the reply currently streaming in — cleared once that reply finishes
+  // and the real, persisted invocations (fetched into toolInvocationsByMessageId above) take over.
+  const [liveToolActivity, setLiveToolActivity] = useState<ToolActivity[]>([]);
   // The workspace's enabled models — for the model switcher, and to look up whether the current
   // one accepts images (Conversation only carries a model_id, not the model's own fields).
   const [models, setModels] = useState<EnabledModel[]>([]);
@@ -96,6 +134,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
       if (!workspace) return;
       setSending(true);
       setStreamingText("");
+      setLiveToolActivity([]);
       setError(null);
       setMessages((prev) => [...prev, pendingUserMessage(content)]);
 
@@ -111,22 +150,36 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
           attachmentIds
         )) {
           if (evt.event === "delta") setStreamingText((prev) => prev + evt.data.text);
+          else if (evt.event === "tool_call") {
+            setLiveToolActivity((prev) => [...prev, { name: evt.data.name, ok: null }]);
+          } else if (evt.event === "tool_result") {
+            setLiveToolActivity((prev) => {
+              const index = prev.findLastIndex((a) => a.name === evt.data.name && a.ok === null);
+              if (index === -1) return prev;
+              const next = [...prev];
+              next[index] = { name: evt.data.name, ok: evt.data.ok };
+              return next;
+            });
+          }
         }
       } catch (err) {
         setError(err instanceof ChatError ? err.message : "Something went wrong.");
       } finally {
-        const [msgs, attachments] = await Promise.all([
+        const [msgs, attachments, invocations] = await Promise.all([
           listMessages(workspace.id, conversationId),
           attachmentsEnabled ? listAttachments(workspace.id, conversationId) : Promise.resolve([]),
+          toolsEnabled ? listToolInvocations(workspace.id, conversationId) : Promise.resolve([]),
         ]);
         setMessages(msgs);
         setAttachmentsByMessageId(groupByMessageId(attachments));
+        setToolInvocationsByMessageId(groupToolInvocationsByMessageId(invocations));
         setStreamingText("");
+        setLiveToolActivity([]);
         setActiveGenerationId(null);
         setSending(false);
       }
     },
-    [workspace, conversationId, attachmentsEnabled]
+    [workspace, conversationId, attachmentsEnabled, toolsEnabled]
   );
 
   // Initial load, then — the only way a page reload can discover a reply was mid-stream — check
@@ -139,19 +192,21 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     async function load() {
       if (!workspace) return;
       try {
-        const [conv, convs, msgs, activeId, fetchedModels, attachments] = await Promise.all([
+        const [conv, convs, msgs, activeId, fetchedModels, attachments, invocations] = await Promise.all([
           getConversation(workspace.id, conversationId),
           listConversations(workspace.id),
           listMessages(workspace.id, conversationId),
           getActiveGeneration(workspace.id, conversationId),
           listModels(workspace.id),
           attachmentsEnabled ? listAttachments(workspace.id, conversationId) : Promise.resolve([]),
+          toolsEnabled ? listToolInvocations(workspace.id, conversationId) : Promise.resolve([]),
         ]);
         if (cancelled) return;
         setConversation(conv);
         setSiblings(convs);
         setMessages(msgs);
         setAttachmentsByMessageId(groupByMessageId(attachments));
+        setToolInvocationsByMessageId(groupToolInvocationsByMessageId(invocations));
         setModels(fetchedModels);
         setModelSupportsVision(
           fetchedModels.find((m) => m.id === conv.model_id)?.supports_vision ?? false
@@ -173,10 +228,27 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
           for await (const evt of resumeGeneration(workspace.id, conversationId, activeId)) {
             if (cancelled) return;
             if (evt.event === "delta") setStreamingText((prev) => prev + evt.data.text);
+            else if (evt.event === "tool_call") {
+              setLiveToolActivity((prev) => [...prev, { name: evt.data.name, ok: null }]);
+            } else if (evt.event === "tool_result") {
+              setLiveToolActivity((prev) => {
+                const index = prev.findLastIndex((a) => a.name === evt.data.name && a.ok === null);
+                if (index === -1) return prev;
+                const next = [...prev];
+                next[index] = { name: evt.data.name, ok: evt.data.ok };
+                return next;
+              });
+            }
           }
           if (cancelled) return;
-          setMessages(await listMessages(workspace.id, conversationId));
+          const [resumedMessages, resumedInvocations] = await Promise.all([
+            listMessages(workspace.id, conversationId),
+            toolsEnabled ? listToolInvocations(workspace.id, conversationId) : Promise.resolve([]),
+          ]);
+          setMessages(resumedMessages);
+          setToolInvocationsByMessageId(groupToolInvocationsByMessageId(resumedInvocations));
           setStreamingText("");
+          setLiveToolActivity([]);
           setActiveGenerationId(null);
         }
       } catch (err) {
@@ -189,7 +261,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     return () => {
       cancelled = true;
     };
-  }, [workspace, conversationId, sendChat, attachmentsEnabled]);
+  }, [workspace, conversationId, sendChat, attachmentsEnabled, toolsEnabled]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -367,8 +439,15 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
           {messages.map((m) => (
             <div
               key={m.id}
-              className={`flex flex-col ${m.role === "user" ? "items-end" : "items-start"}`}
+              className={`flex flex-col gap-1 ${m.role === "user" ? "items-end" : "items-start"}`}
             >
+              {(toolInvocationsByMessageId[m.id] ?? []).map((invocation) => (
+                <ToolActivityChip
+                  key={invocation.id}
+                  name={invocation.name}
+                  ok={invocation.status === "success"}
+                />
+              ))}
               <div
                 className={`max-w-[75%] whitespace-pre-wrap rounded-lg px-3 py-2 text-sm ${
                   m.role === "user"
@@ -382,12 +461,17 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
               <SentAttachmentChips attachments={attachmentsByMessageId[m.id] ?? []} />
             </div>
           ))}
-          {streamingText && (
-            <div className="flex justify-start">
-              <div className="max-w-[75%] whitespace-pre-wrap rounded-lg border border-border bg-surface px-3 py-2 text-sm text-text">
-                {streamingText}
-                <span className="ml-0.5 inline-block h-3 w-1.5 animate-pulse bg-text-muted align-middle" />
-              </div>
+          {(liveToolActivity.length > 0 || streamingText) && (
+            <div className="flex flex-col items-start gap-1">
+              {liveToolActivity.map((activity, index) => (
+                <ToolActivityChip key={index} name={activity.name} ok={activity.ok} />
+              ))}
+              {streamingText && (
+                <div className="max-w-[75%] whitespace-pre-wrap rounded-lg border border-border bg-surface px-3 py-2 text-sm text-text">
+                  {streamingText}
+                  <span className="ml-0.5 inline-block h-3 w-1.5 animate-pulse bg-text-muted align-middle" />
+                </div>
+              )}
             </div>
           )}
           <div ref={bottomRef} />

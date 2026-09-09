@@ -40,17 +40,21 @@ def _active_key(conversation_id: uuid.UUID) -> str:
     return f"conv:{conversation_id}:active_generation"
 
 
+_EventType = Literal["delta", "tool_call", "tool_result", "done", "error"]
+_TERMINAL_EVENT_TYPES = ("done", "error")
+
+
 @dataclass(frozen=True)
 class StreamEvent:
     """One entry read back from a generation's Redis stream."""
 
     id: str
-    type: Literal["delta", "done", "error"]
+    type: _EventType
     data: dict[str, object]
 
 
 async def append_event(
-    redis: Redis, generation_id: str, event_type: Literal["delta", "done", "error"], data: dict[str, object]
+    redis: Redis, generation_id: str, event_type: _EventType, data: dict[str, object]
 ) -> None:
     """Append one event to a generation's stream — the source of truth for what's happened so far."""
     await redis.xadd(_stream_key(generation_id), {"type": event_type, "data": json.dumps(data)})
@@ -74,12 +78,12 @@ async def read_events(
         for entry_id, fields in entries:
             last_id = entry_id
             raw_type = fields["type"]
-            if raw_type not in ("delta", "done", "error"):
+            if raw_type not in ("delta", "tool_call", "tool_result", "done", "error"):
                 continue  # ignore anything unexpected rather than crash a long-lived stream reader
-            event_type = cast(Literal["delta", "done", "error"], raw_type)
+            event_type = cast(_EventType, raw_type)
             event = StreamEvent(id=entry_id, type=event_type, data=json.loads(fields["data"]))
             yield event
-            if event.type in ("done", "error"):
+            if event.type in _TERMINAL_EVENT_TYPES:
                 return
 
 

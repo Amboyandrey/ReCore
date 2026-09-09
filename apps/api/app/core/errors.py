@@ -196,3 +196,10 @@ class InvalidCursor(AppError):
 
     status_code = 400
     detail = "Invalid pagination cursor."
+
+
+class ToolNotFound(AppError):
+    """Raised for a tool id that doesn't exist in the workspace it was looked up under."""
+
+    status_code = 404
+    detail = "Tool not found."

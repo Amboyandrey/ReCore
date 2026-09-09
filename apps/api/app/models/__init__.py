@@ -15,6 +15,10 @@ from app.models.message import Message
 from app.models.message_role import MessageRole
 from app.models.provider import Provider
 from app.models.role import Role
+from app.models.tool import Tool
+from app.models.tool_invocation import ToolInvocation
+from app.models.tool_invocation_status import ToolInvocationStatus
+from app.models.tool_kind import ToolKind
 from app.models.usage_event import UsageEvent
 from app.models.user import User
 from app.models.workspace import Workspace, WorkspaceMember
@@ -35,6 +39,10 @@ __all__ = [
     "Provider",
     "ProviderCredential",
     "Role",
+    "Tool",
+    "ToolInvocation",
+    "ToolInvocationStatus",
+    "ToolKind",
     "UsageEvent",
     "User",
     "Workspace",

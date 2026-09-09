@@ -7,7 +7,17 @@ import json
 import httpx
 
 from app.providers.anthropic import AnthropicProvider
-from app.providers.base import ChatMessage, Done, ImagePart, StreamError, TextDelta, Usage
+from app.providers.base import (
+    ChatMessage,
+    Done,
+    ImagePart,
+    StreamError,
+    TextDelta,
+    ToolCall,
+    ToolCallRequest,
+    ToolDefinition,
+    Usage,
+)
 from app.providers.google import GoogleProvider
 from app.providers.openai_compatible import OpenAICompatibleProvider
 
@@ -20,6 +30,24 @@ def _sse(*lines: str) -> bytes:
 MESSAGES = [ChatMessage(role="user", content="Hi there")]
 _IMAGE = ImagePart(mime="image/png", data=b"fake-png-bytes")
 _IMAGE_MESSAGES = [ChatMessage(role="user", content="What's this?", images=(_IMAGE,))]
+_TOOL = ToolDefinition(
+    name="get_weather",
+    description="Get the current weather for a city.",
+    parameters={
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+    },
+)
+_TOOL_CALL_MESSAGES = [
+    ChatMessage(role="user", content="What's the weather in Paris?"),
+    ChatMessage(
+        role="assistant",
+        content="",
+        tool_calls=(ToolCall(id="call_1", name="get_weather", arguments={"city": "Paris"}),),
+    ),
+    ChatMessage(role="tool", content="Sunny, 22C", tool_call_id="call_1", tool_name="get_weather"),
+]
 
 
 # ---------- OpenAI-compatible ----------
@@ -277,3 +305,276 @@ async def test_google_sends_an_inline_data_part_when_an_image_is_attached() -> N
     assert parts[0] == {"text": "What's this?"}
     encoded = base64.b64encode(_IMAGE.data).decode("ascii")
     assert parts[1] == {"inline_data": {"mime_type": "image/png", "data": encoded}}
+
+
+# ---------- Tool calling (all three providers) ----------
+
+
+async def test_openai_sends_no_tools_key_when_none_are_offered() -> None:
+    """The regression this design exists to prevent, same as the bare-string image case: an
+    unexpected `tools` field could break an endpoint that doesn't expect it."""
+    seen_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(200, content=_sse("data: [DONE]"))
+
+    provider = OpenAICompatibleProvider(api_key="k", transport=httpx.MockTransport(handler))
+    async for _ in provider.stream(model="gpt-5", messages=MESSAGES, max_tokens=50):
+        pass
+
+    assert "tools" not in json.loads(seen_requests[0].content)
+
+
+async def test_openai_sends_the_tool_definition_when_offered() -> None:
+    seen_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(200, content=_sse("data: [DONE]"))
+
+    provider = OpenAICompatibleProvider(api_key="k", transport=httpx.MockTransport(handler))
+    async for _ in provider.stream(model="gpt-5", messages=MESSAGES, max_tokens=50, tools=[_TOOL]):
+        pass
+
+    body = json.loads(seen_requests[0].content)
+    assert body["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": _TOOL.name,
+                "description": _TOOL.description,
+                "parameters": _TOOL.parameters,
+            },
+        }
+    ]
+
+
+async def test_openai_assembles_a_streamed_tool_call() -> None:
+    """Arguments arrive in fragments across several chunks, keyed by index — reassembled into
+    one complete ToolCallRequest once the finish_reason arrives."""
+    body = _sse(
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function",'
+        '"function":{"name":"get_weather","arguments":""}}]}}]}',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"city\\""}}]}}]}',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\\"Paris\\"}"}}]}}]}',
+        'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+        "data: [DONE]",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    provider = OpenAICompatibleProvider(api_key="k", transport=httpx.MockTransport(handler))
+    chunks = [
+        c async for c in provider.stream(model="gpt-5", messages=MESSAGES, max_tokens=50, tools=[_TOOL])
+    ]
+
+    assert chunks == [
+        ToolCallRequest(calls=(ToolCall(id="call_1", name="get_weather", arguments={"city": "Paris"}),))
+    ]
+
+
+async def test_openai_replays_a_tool_call_and_its_result() -> None:
+    """A past assistant tool_calls turn and the tool turn answering it round-trip into OpenAI's
+    own `tool_calls`/`tool_call_id` message shape."""
+    seen_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(200, content=_sse("data: [DONE]"))
+
+    provider = OpenAICompatibleProvider(api_key="k", transport=httpx.MockTransport(handler))
+    async for _ in provider.stream(model="gpt-5", messages=_TOOL_CALL_MESSAGES, max_tokens=50):
+        pass
+
+    messages = json.loads(seen_requests[0].content)["messages"]
+    assert messages[1]["tool_calls"] == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'},
+        }
+    ]
+    assert messages[2] == {"role": "tool", "tool_call_id": "call_1", "content": "Sunny, 22C"}
+
+
+async def test_anthropic_sends_no_tools_key_when_none_are_offered() -> None:
+    seen_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(200, content=_sse('data: {"type":"message_stop"}'))
+
+    provider = AnthropicProvider(api_key="k", transport=httpx.MockTransport(handler))
+    async for _ in provider.stream(model="claude-opus-5", messages=MESSAGES, max_tokens=50):
+        pass
+
+    assert "tools" not in json.loads(seen_requests[0].content)
+
+
+async def test_anthropic_sends_the_tool_definition_when_offered() -> None:
+    seen_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(200, content=_sse('data: {"type":"message_stop"}'))
+
+    provider = AnthropicProvider(api_key="k", transport=httpx.MockTransport(handler))
+    async for _ in provider.stream(
+        model="claude-opus-5", messages=MESSAGES, max_tokens=50, tools=[_TOOL]
+    ):
+        pass
+
+    body = json.loads(seen_requests[0].content)
+    assert body["tools"] == [
+        {"name": _TOOL.name, "description": _TOOL.description, "input_schema": _TOOL.parameters}
+    ]
+
+
+async def test_anthropic_assembles_a_streamed_tool_call() -> None:
+    """Input JSON arrives as incremental fragments (`input_json_delta`), keyed by content block
+    index — reassembled into one ToolCallRequest at message_stop, with no Done alongside it."""
+    body = _sse(
+        'data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}',
+        'data: {"type":"content_block_start","index":0,'
+        '"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather"}}',
+        'data: {"type":"content_block_delta","index":0,'
+        '"delta":{"type":"input_json_delta","partial_json":"{\\"city\\""}}',
+        'data: {"type":"content_block_delta","index":0,'
+        '"delta":{"type":"input_json_delta","partial_json":":\\"Paris\\"}"}}',
+        'data: {"type":"content_block_stop","index":0}',
+        'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}',
+        'data: {"type":"message_stop"}',
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    provider = AnthropicProvider(api_key="k", transport=httpx.MockTransport(handler))
+    chunks = [
+        c
+        async for c in provider.stream(
+            model="claude-opus-5", messages=MESSAGES, max_tokens=50, tools=[_TOOL]
+        )
+    ]
+
+    assert chunks == [
+        Usage(input_tokens=10, output_tokens=5),
+        ToolCallRequest(calls=(ToolCall(id="toolu_1", name="get_weather", arguments={"city": "Paris"}),)),
+    ]
+
+
+async def test_anthropic_replays_a_tool_call_and_its_result() -> None:
+    """A past assistant tool_calls turn becomes a tool_use content block; the tool turn answering
+    it becomes a user turn carrying a tool_result block — Anthropic has no "tool" role of its own."""
+    seen_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(200, content=_sse('data: {"type":"message_stop"}'))
+
+    provider = AnthropicProvider(api_key="k", transport=httpx.MockTransport(handler))
+    async for _ in provider.stream(
+        model="claude-opus-5", messages=_TOOL_CALL_MESSAGES, max_tokens=50
+    ):
+        pass
+
+    messages = json.loads(seen_requests[0].content)["messages"]
+    assert messages[1] == {
+        "role": "assistant",
+        "content": [{"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "Paris"}}],
+    }
+    assert messages[2] == {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "Sunny, 22C"}],
+    }
+
+
+async def test_google_sends_no_tools_key_when_none_are_offered() -> None:
+    seen_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(200, content=_sse('data: {"candidates":[]}'))
+
+    provider = GoogleProvider(api_key="k", transport=httpx.MockTransport(handler))
+    async for _ in provider.stream(model="gemini-2.5-pro", messages=MESSAGES, max_tokens=50):
+        pass
+
+    assert "tools" not in json.loads(seen_requests[0].content)
+
+
+async def test_google_sends_the_tool_definition_when_offered() -> None:
+    seen_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(200, content=_sse('data: {"candidates":[]}'))
+
+    provider = GoogleProvider(api_key="k", transport=httpx.MockTransport(handler))
+    async for _ in provider.stream(
+        model="gemini-2.5-pro", messages=MESSAGES, max_tokens=50, tools=[_TOOL]
+    ):
+        pass
+
+    body = json.loads(seen_requests[0].content)
+    assert body["tools"] == [
+        {
+            "functionDeclarations": [
+                {"name": _TOOL.name, "description": _TOOL.description, "parameters": _TOOL.parameters}
+            ]
+        }
+    ]
+
+
+async def test_google_assembles_a_streamed_tool_call() -> None:
+    """Google returns a whole functionCall in one part, no id of its own — this adapter
+    synthesizes one so its output still fits the shared ToolCall shape."""
+    body = _sse(
+        'data: {"candidates":[{"content":{"parts":['
+        '{"functionCall":{"name":"get_weather","args":{"city":"Paris"}}}]}}]}',
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    provider = GoogleProvider(api_key="k", transport=httpx.MockTransport(handler))
+    chunks = [
+        c
+        async for c in provider.stream(
+            model="gemini-2.5-pro", messages=MESSAGES, max_tokens=50, tools=[_TOOL]
+        )
+    ]
+
+    assert len(chunks) == 1
+    assert isinstance(chunks[0], ToolCallRequest)
+    assert len(chunks[0].calls) == 1
+    assert chunks[0].calls[0].name == "get_weather"
+    assert chunks[0].calls[0].arguments == {"city": "Paris"}
+
+
+async def test_google_replays_a_tool_call_and_its_result() -> None:
+    """A past assistant tool_calls turn becomes a functionCall part; the tool turn answering it
+    becomes a user turn carrying a functionResponse part matched by name, not id."""
+    seen_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(200, content=_sse('data: {"candidates":[]}'))
+
+    provider = GoogleProvider(api_key="k", transport=httpx.MockTransport(handler))
+    async for _ in provider.stream(
+        model="gemini-2.5-pro", messages=_TOOL_CALL_MESSAGES, max_tokens=50
+    ):
+        pass
+
+    contents = json.loads(seen_requests[0].content)["contents"]
+    assert contents[1] == {
+        "role": "model",
+        "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "Paris"}}}],
+    }
+    assert contents[2] == {
+        "role": "user",
+        "parts": [{"functionResponse": {"name": "get_weather", "response": {"result": "Sunny, 22C"}}}],
+    }

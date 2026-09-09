@@ -26,6 +26,8 @@ export type Message = {
 
 export type SSEEvent =
   | { event: "delta"; data: { text: string } }
+  | { event: "tool_call"; data: { name: string; arguments: Record<string, unknown> } }
+  | { event: "tool_result"; data: { name: string; ok: boolean; content: string } }
   | { event: "done"; data: { finish_reason: string } }
   | { event: "error"; data: { message: string } };
 

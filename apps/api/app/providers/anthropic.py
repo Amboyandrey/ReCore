@@ -19,6 +19,9 @@ from app.providers.base import (
     ModelInfo,
     StreamError,
     TextDelta,
+    ToolCall,
+    ToolCallRequest,
+    ToolDefinition,
     Usage,
 )
 
@@ -30,10 +33,18 @@ _STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
 
 def _content(message: ChatMessage) -> str | list[dict[str, object]]:
     """A bare string when there's nothing but text; Anthropic's block form is only ever built
-    once an image actually needs to ride alongside it."""
-    if not message.images:
+    once an image, a tool call, or a tool result actually needs to ride alongside it."""
+    if not message.images and not message.tool_calls and message.role != "tool":
         return message.content
-    blocks: list[dict[str, object]] = [{"type": "text", "text": message.content}]
+    if message.role == "tool":
+        # Anthropic has no "tool" role of its own — a tool result rides back as a `user` turn
+        # carrying a tool_result block, matched to its call by id.
+        return [
+            {"type": "tool_result", "tool_use_id": message.tool_call_id, "content": message.content}
+        ]
+    blocks: list[dict[str, object]] = []
+    if message.content:
+        blocks.append({"type": "text", "text": message.content})
     for image in message.images:
         encoded = base64.b64encode(image.data).decode("ascii")
         blocks.append(
@@ -42,7 +53,32 @@ def _content(message: ChatMessage) -> str | list[dict[str, object]]:
                 "source": {"type": "base64", "media_type": image.mime, "data": encoded},
             }
         )
+    for call in message.tool_calls:
+        blocks.append({"type": "tool_use", "id": call.id, "name": call.name, "input": call.arguments})
     return blocks
+
+
+def _api_role(message: ChatMessage) -> str:
+    """Anthropic's two-role wire format: a tool result is a `user` turn (see _content above)."""
+    return "user" if message.role == "tool" else message.role
+
+
+def _tools_payload(tools: Sequence[ToolDefinition]) -> list[dict[str, object]]:
+    """Anthropic's tool shape: `input_schema`, not the `parameters` key OpenAI and Google use."""
+    return [
+        {"name": tool.name, "description": tool.description, "input_schema": tool.parameters}
+        for tool in tools
+    ]
+
+
+def _parse_tool_arguments(raw: str) -> dict[str, object]:
+    """Assembled from streamed `input_json_delta` fragments — malformed JSON shouldn't take the
+    whole generation down with it."""
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 class AnthropicProvider:
@@ -89,7 +125,12 @@ class AnthropicProvider:
         ]
 
     async def stream(
-        self, *, model: str, messages: Sequence[ChatMessage], max_tokens: int
+        self,
+        *,
+        model: str,
+        messages: Sequence[ChatMessage],
+        max_tokens: int,
+        tools: Sequence[ToolDefinition] = (),
     ) -> AsyncIterator[Chunk]:
         """Stream a chat completion, translating Anthropic's SSE events into normalized Chunks.
 
@@ -101,16 +142,21 @@ class AnthropicProvider:
             "model": model,
             "max_tokens": max_tokens,
             "messages": [
-                {"role": m.role, "content": _content(m)} for m in messages if m.role != "system"
+                {"role": _api_role(m), "content": _content(m)} for m in messages if m.role != "system"
             ],
             "stream": True,
         }
         if system_prompt is not None:
             payload["system"] = system_prompt
+        if tools:
+            payload["tools"] = _tools_payload(tools)
 
         input_tokens = 0
         output_tokens = 0
         stop_reason = "end_turn"
+        # Keyed by the content block's own index — a tool_use block's id/name arrive on
+        # content_block_start, its input arrives incrementally across content_block_delta events.
+        blocks: dict[int, dict[str, str]] = {}
 
         async with self._client(_STREAM_TIMEOUT) as client, client.stream(
             "POST", f"{self._base_url}/messages", headers=self._headers(), json=payload
@@ -134,10 +180,22 @@ class AnthropicProvider:
                     continue
 
                 event_type = event.get("type")
-                if event_type == "content_block_delta":
+                if event_type == "content_block_start":
+                    block = event.get("content_block", {})
+                    if block.get("type") == "tool_use":
+                        blocks[event.get("index", 0)] = {
+                            "id": block.get("id", ""),
+                            "name": block.get("name", ""),
+                            "json": "",
+                        }
+                elif event_type == "content_block_delta":
                     delta = event.get("delta", {})
                     if delta.get("type") == "text_delta":
                         yield TextDelta(text=delta.get("text", ""))
+                    elif delta.get("type") == "input_json_delta":
+                        index = event.get("index", 0)
+                        if index in blocks:
+                            blocks[index]["json"] += delta.get("partial_json", "")
                 elif event_type == "message_start":
                     input_tokens = event.get("message", {}).get("usage", {}).get(
                         "input_tokens", 0
@@ -147,7 +205,17 @@ class AnthropicProvider:
                     stop_reason = event.get("delta", {}).get("stop_reason") or stop_reason
                 elif event_type == "message_stop":
                     yield Usage(input_tokens=input_tokens, output_tokens=output_tokens)
-                    yield Done(finish_reason=stop_reason)
+                    if stop_reason == "tool_use" and blocks:
+                        yield ToolCallRequest(
+                            calls=tuple(
+                                ToolCall(
+                                    id=b["id"], name=b["name"], arguments=_parse_tool_arguments(b["json"])
+                                )
+                                for b in blocks.values()
+                            )
+                        )
+                    else:
+                        yield Done(finish_reason=stop_reason)
                     return
                 elif event_type == "error":
                     yield StreamError(event.get("error", {}).get("message", "Unknown error"))

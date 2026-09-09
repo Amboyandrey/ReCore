@@ -62,7 +62,14 @@ import app.services.credentials as credentials_service  # noqa: E402
 from app.core.db import engine  # noqa: E402
 from app.core.redis import _pool as redis_pool  # noqa: E402
 from app.main import app  # noqa: E402
-from app.providers.base import ChatMessage, Chunk, Done, TextDelta, Usage  # noqa: E402
+from app.providers.base import (  # noqa: E402
+    ChatMessage,
+    Chunk,
+    Done,
+    TextDelta,
+    ToolDefinition,
+    Usage,
+)
 from app.providers.fake import VALID_KEY, FakeProvider  # noqa: E402
 
 OWNER = {"email": "load-test@example.com", "password": "correct horse battery staple"}
@@ -77,9 +84,14 @@ class PacedFakeProvider(FakeProvider):
         self._words = words
 
     async def stream(
-        self, *, model: str, messages: Sequence[ChatMessage], max_tokens: int
+        self,
+        *,
+        model: str,
+        messages: Sequence[ChatMessage],
+        max_tokens: int,
+        tools: Sequence[ToolDefinition] = (),
     ) -> AsyncIterator[Chunk]:
-        del model, max_tokens
+        del model, max_tokens, tools
         for i in range(self._words):
             await asyncio.sleep(0.02)
             yield TextDelta(text=f"word{i} ")
