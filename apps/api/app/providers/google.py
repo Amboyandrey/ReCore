@@ -19,6 +19,9 @@ from app.providers.base import (
     ModelInfo,
     StreamError,
     TextDelta,
+    ToolCall,
+    ToolCallRequest,
+    ToolDefinition,
     Usage,
 )
 
@@ -29,12 +32,44 @@ _STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
 
 def _parts(message: ChatMessage) -> list[dict[str, object]]:
     """Google's `parts` is always a list — unlike the other two adapters there's no bare-string
-    form to preserve, so this always appends an inline_data part when the turn has an image."""
-    parts: list[dict[str, object]] = [{"text": message.content}]
+    form to preserve. A tool result becomes a `functionResponse` part; an assistant turn being
+    replayed with tool calls becomes one `functionCall` part per call, ahead of any text."""
+    if message.role == "tool":
+        return [
+            {
+                "functionResponse": {
+                    "name": message.tool_name,
+                    "response": {"result": message.content},
+                }
+            }
+        ]
+    parts: list[dict[str, object]] = []
+    for call in message.tool_calls:
+        parts.append({"functionCall": {"name": call.name, "args": call.arguments}})
+    if message.content:
+        parts.append({"text": message.content})
     for image in message.images:
         encoded = base64.b64encode(image.data).decode("ascii")
         parts.append({"inline_data": {"mime_type": image.mime, "data": encoded}})
-    return parts
+    return parts or [{"text": ""}]
+
+
+def _api_role(message: ChatMessage) -> str:
+    """Google's two roles: "model" for the assistant, "user" for everything else — including a
+    tool result, which rides back as a user turn carrying a functionResponse part."""
+    return "model" if message.role == "assistant" else "user"
+
+
+def _tools_payload(tools: Sequence[ToolDefinition]) -> list[dict[str, object]]:
+    """Google wants every function wrapped in one `functionDeclarations` list."""
+    return [
+        {
+            "functionDeclarations": [
+                {"name": tool.name, "description": tool.description, "parameters": tool.parameters}
+                for tool in tools
+            ]
+        }
+    ]
 
 
 class GoogleProvider:
@@ -88,7 +123,12 @@ class GoogleProvider:
         return models
 
     async def stream(
-        self, *, model: str, messages: Sequence[ChatMessage], max_tokens: int
+        self,
+        *,
+        model: str,
+        messages: Sequence[ChatMessage],
+        max_tokens: int,
+        tools: Sequence[ToolDefinition] = (),
     ) -> AsyncIterator[Chunk]:
         """Stream a chat completion, translating Google's SSE chunks into normalized Chunks.
 
@@ -98,14 +138,19 @@ class GoogleProvider:
         system_prompt = next((m.content for m in messages if m.role == "system"), None)
         payload: dict[str, object] = {
             "contents": [
-                {"role": "model" if m.role == "assistant" else "user", "parts": _parts(m)}
-                for m in messages
-                if m.role != "system"
+                {"role": _api_role(m), "parts": _parts(m)} for m in messages if m.role != "system"
             ],
             "generationConfig": {"maxOutputTokens": max_tokens},
         }
         if system_prompt is not None:
             payload["systemInstruction"] = {"parts": [{"text": system_prompt}]}
+        if tools:
+            payload["tools"] = _tools_payload(tools)
+
+        # Google has no call id of its own — one is synthesized here purely so this adapter's
+        # output fits the same ToolCall shape every other adapter produces. It never round-trips
+        # back to Google: a tool result there is matched by name (see _parts above), not id.
+        call_index = 0
 
         url = f"{self._base_url}/models/{model}:streamGenerateContent"
         async with self._client(_STREAM_TIMEOUT) as client, client.stream(
@@ -131,12 +176,23 @@ class GoogleProvider:
 
                 candidates = event.get("candidates") or []
                 finish_reason = None
+                calls: list[ToolCall] = []
                 if candidates:
                     candidate = candidates[0]
                     for part in candidate.get("content", {}).get("parts", []):
                         text = part.get("text")
                         if text:
                             yield TextDelta(text=text)
+                        function_call = part.get("functionCall")
+                        if function_call:
+                            calls.append(
+                                ToolCall(
+                                    id=f"{function_call.get('name', 'tool')}-{call_index}",
+                                    name=function_call.get("name", ""),
+                                    arguments=function_call.get("args") or {},
+                                )
+                            )
+                            call_index += 1
                     finish_reason = candidate.get("finishReason")
 
                 usage = event.get("usageMetadata")
@@ -145,6 +201,9 @@ class GoogleProvider:
                         input_tokens=usage.get("promptTokenCount", 0),
                         output_tokens=usage.get("candidatesTokenCount", 0),
                     )
+                if calls:
+                    yield ToolCallRequest(calls=tuple(calls))
+                    return
                 if finish_reason:
                     yield Done(finish_reason=finish_reason)
                     return
