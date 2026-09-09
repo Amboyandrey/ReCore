@@ -3,6 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import { useRequireAuth } from "@/lib/auth-context";
+import { listAssistants, type Assistant } from "@/lib/assistant-client";
 import { AttachmentError, listAttachments, uploadAttachment, type Attachment } from "@/lib/attachment-client";
 import {
   ChatError,
@@ -121,6 +122,10 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
   const [modelSupportsVision, setModelSupportsVision] = useState(false);
   const [switchingModel, setSwitchingModel] = useState(false);
   const [togglingShared, setTogglingShared] = useState(false);
+  // The workspace's saved assistants, for the badge showing which one is answering and the
+  // switcher beside the model picker.
+  const [assistants, setAssistants] = useState<Assistant[]>([]);
+  const [switchingAssistant, setSwitchingAssistant] = useState(false);
 
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -192,15 +197,17 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     async function load() {
       if (!workspace) return;
       try {
-        const [conv, convs, msgs, activeId, fetchedModels, attachments, invocations] = await Promise.all([
-          getConversation(workspace.id, conversationId),
-          listConversations(workspace.id),
-          listMessages(workspace.id, conversationId),
-          getActiveGeneration(workspace.id, conversationId),
-          listModels(workspace.id),
-          attachmentsEnabled ? listAttachments(workspace.id, conversationId) : Promise.resolve([]),
-          toolsEnabled ? listToolInvocations(workspace.id, conversationId) : Promise.resolve([]),
-        ]);
+        const [conv, convs, msgs, activeId, fetchedModels, fetchedAssistants, attachments, invocations] =
+          await Promise.all([
+            getConversation(workspace.id, conversationId),
+            listConversations(workspace.id),
+            listMessages(workspace.id, conversationId),
+            getActiveGeneration(workspace.id, conversationId),
+            listModels(workspace.id),
+            listAssistants(workspace.id),
+            attachmentsEnabled ? listAttachments(workspace.id, conversationId) : Promise.resolve([]),
+            toolsEnabled ? listToolInvocations(workspace.id, conversationId) : Promise.resolve([]),
+          ]);
         if (cancelled) return;
         setConversation(conv);
         setSiblings(convs);
@@ -208,6 +215,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
         setAttachmentsByMessageId(groupByMessageId(attachments));
         setToolInvocationsByMessageId(groupToolInvocationsByMessageId(invocations));
         setModels(fetchedModels);
+        setAssistants(fetchedAssistants);
         setModelSupportsVision(
           fetchedModels.find((m) => m.id === conv.model_id)?.supports_vision ?? false
         );
@@ -343,6 +351,24 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     }
   }
 
+  // Switches (or, choosing "No assistant", clears) which assistant governs this conversation —
+  // resolved live on the very next send, same as the model switch above.
+  async function handleAssistantChange(assistantId: string) {
+    if (!workspace || assistantId === (conversation?.assistant_id ?? "")) return;
+    setSwitchingAssistant(true);
+    setError(null);
+    try {
+      const updated = await updateConversation(workspace.id, conversationId, {
+        assistant_id: assistantId || null,
+      });
+      setConversation(updated);
+    } catch (err) {
+      setError(err instanceof ChatError ? err.message : "Something went wrong.");
+    } finally {
+      setSwitchingAssistant(false);
+    }
+  }
+
   // Only the conversation's owner may share or unshare it — enforced server-side too; this just
   // keeps the UI from offering a control that would 403.
   async function handleToggleShared(shared: boolean) {
@@ -411,6 +437,22 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
                   Shared with you
                 </span>
               )
+            )}
+            {assistants.length > 0 && (
+              <select
+                value={conversation.assistant_id ?? ""}
+                onChange={(e) => handleAssistantChange(e.target.value)}
+                disabled={switchingAssistant || sending}
+                title="Assistant"
+                className="rounded-md border border-border bg-surface px-2 py-1 text-xs text-text-soft outline-none focus:border-accent disabled:opacity-60"
+              >
+                <option value="">No assistant</option>
+                {assistants.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.name}
+                  </option>
+                ))}
+              </select>
             )}
             {models.length > 0 && (
               <select
