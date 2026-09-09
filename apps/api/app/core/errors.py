@@ -203,3 +203,11 @@ class ToolNotFound(AppError):
 
     status_code = 404
     detail = "Tool not found."
+
+
+class ToolNameAlreadyExists(AppError):
+    """Raised when registering a tool whose name is already taken in this workspace — the model
+    sees this name as the function it's calling, so two tools can't share one."""
+
+    status_code = 409
+    detail = "A tool with this name already exists."
