@@ -623,6 +623,11 @@ async def test_record_turn_writes_to_the_personal_namespace(
         {"role": "user", "content": "Hello"},
         {"role": "assistant", "content": "Hi there"},
     ]
+    # Biases mem0's own extraction classifier toward capturing preferences and explicit "remember
+    # this" requests — found live to matter: without these, a clearly stated preference ("I like
+    # song X, remember that") produced zero extracted memories.
+    assert captured["includes"]
+    assert captured["agent_custom_instructions"]
 
 
 async def test_record_turn_is_a_no_op_without_a_credential(db: AsyncSession) -> None:

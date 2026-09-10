@@ -38,6 +38,23 @@ Scope = Literal["curated", "personal"]
 # score well below what a dense, large corpus's matches typically would.
 _SEARCH_TOP_K = 20
 _SEARCH_THRESHOLD = 0.1
+
+# Biases mem0's own extraction classifier for record_turn()'s writes — observed live to be needed:
+# a user explicitly saying "I like song X, remember that", with the assistant confirming it back,
+# still produced zero extracted memories without this. `agent_custom_instructions`, specifically
+# — not the more commonly-referenced `custom_instructions` — is what actually governs extraction
+# here, per mem0's own docs: once both `agent_id` and `user_id` are on one call (mem0's "hybrid
+# mode", which every personal-scope write is), `custom_instructions` covers only *non-assistant*
+# memories, and would silently have had no effect on these calls at all.
+_PERSONAL_MEMORY_INCLUDES = (
+    "personal preferences, likes and dislikes, opinions, and anything the user explicitly asks "
+    "to be remembered"
+)
+_PERSONAL_MEMORY_INSTRUCTIONS = (
+    "Capture any preference, like, dislike, or opinion the user states about themselves, even a "
+    "small one (a favorite song, food, color, and similar), and anything the user explicitly "
+    "asks you to remember. Do not skip these just because they seem minor."
+)
 _MEMORY_BLOCK_MAX_CHARS = 2_000
 
 
@@ -347,6 +364,8 @@ async def record_turn(
         agent_id=personal_agent_id(workspace_id, assistant_id),
         user_id=user_entity_id(workspace_id, user_id),
         infer=True,
+        includes=_PERSONAL_MEMORY_INCLUDES,
+        agent_custom_instructions=_PERSONAL_MEMORY_INSTRUCTIONS,
     )
     if not ok:
         logger.warning(
