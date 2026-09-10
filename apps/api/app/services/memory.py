@@ -322,18 +322,16 @@ async def record_turn(
     isn't a bug that can be introduced later by a careless call site, it's unexpressible by this
     function's own signature.
 
-    Stored verbatim (`infer=False`), the same way a curated fact is, rather than left to mem0's
-    own extraction classifier — tried twice (biasing it with `includes`/`agent_custom_instructions`
-    toward capturing preferences, then narrowing it again to stop it also capturing the
-    assistant's own suggestions as if they were the user's) and found live, both times, to still
-    silently produce zero memories from a plain, explicit statement of a preference. mem0's own
-    dashboard showed the *effective* instructions governing that call weren't the ones this
-    module sent at all — something in mem0's own handling of an agent-scoped, `infer=True` call
-    was substituting a completely different, agent-persona-oriented prompt in their place, not
-    what our own request was documented to control. Verbatim storage sidesteps that class of
-    problem entirely: there's no classification step left for anything to silently override.
-    Only the user's own words are stored — the assistant's reply isn't, so a long response
-    doesn't become "memory" in its own right.
+    Uses `infer=True` — mem0's own classifier decides both whether this turn has anything worth
+    remembering and, if so, what to actually store, the same as any plain personal-memory add.
+    Two earlier attempts to steer that classifier with `includes`/`agent_custom_instructions`
+    were both found live to backfire (mem0's own dashboard showed a completely different,
+    unrelated instruction set actually governing the call), and a since-reverted attempt at our
+    own deterministic pre-filter (rejecting anything shaped like a question) turned out to be the
+    wrong amount of engineering for this. What's sent now is deliberately plain: no bias fields,
+    no filtering, closest to mem0's own default behavior for a personal memory. Only the user's
+    own words are sent — the assistant's reply isn't, so a long response doesn't become "memory"
+    in its own right.
 
     Runs fire-and-forget from _run_generation, after that generation's own reply has already been
     committed and its terminal SSE event sent — so a slow or unreachable mem0 can never delay a
@@ -355,7 +353,7 @@ async def record_turn(
         messages=[{"role": "user", "content": user_message}],
         agent_id=personal_agent_id(workspace_id, assistant_id),
         user_id=user_entity_id(workspace_id, user_id),
-        infer=False,
+        infer=True,
     )
     if not ok:
         logger.warning(

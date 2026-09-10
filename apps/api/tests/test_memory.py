@@ -617,9 +617,10 @@ async def test_record_turn_writes_to_the_personal_namespace(
 
     assert captured["agent_id"] == personal_agent_id(workspace.id, assistant.id)
     assert captured["user_id"] == user_entity_id(workspace.id, owner.id)
-    # Stored verbatim, like a curated fact — see record_turn's own docstring for why relying on
-    # mem0's extraction classifier (infer=True) was tried twice and failed live both times.
-    assert captured["infer"] is False
+    # Plain infer=True — mem0's own classifier, with no bias fields and no pre-filtering of our
+    # own layered on top. See record_turn's own docstring for why both of those were tried and
+    # backed out.
+    assert captured["infer"] is True
     assert captured["messages"] == [{"role": "user", "content": "Hello"}]
 
 

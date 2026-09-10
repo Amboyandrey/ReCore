@@ -1262,10 +1262,8 @@ async def test_memory_writes_only_the_personal_scope_even_for_the_assistants_own
 
     assert captured["agent_id"] == personal_agent_id(workspace.id, assistant.id)
     assert captured["user_id"] is not None
-    # Stored verbatim, like a curated fact — see record_turn's own docstring for why relying on
-    # mem0's own extraction classifier (infer=True) was tried and found live to silently drop
-    # explicit statements of a preference.
-    assert captured["infer"] is False
+    # Plain infer=True — mem0's own classifier, no bias fields — see record_turn's own docstring.
+    assert captured["infer"] is True
     assert captured["messages"] == [{"role": "user", "content": "Remember I like tea."}]
     assert "immutable" not in captured  # only a curated add ever sets this
 

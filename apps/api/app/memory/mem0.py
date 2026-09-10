@@ -43,18 +43,20 @@ async def add(
 
     mem0 processes this asynchronously — a `True` return means the request was accepted, not that
     extraction has finished (or that it produced anything: `infer=True` is a genuine LLM
-    classifier on mem0's side, which can decide a turn has nothing memorable in it at all — see
-    services/memory.py's record_turn for why every caller in this codebase now uses `infer=False`
-    instead). `infer=False` stores the given text verbatim, skipping that classifier entirely;
-    `immutable=True` excludes a memory from mem0's own later consolidation, so chat-driven
-    learning can never silently rewrite a deliberately curated fact.
+    classifier on mem0's side, which can decide a turn has nothing memorable in it at all).
+    `infer=False` stores the given text verbatim, skipping that classifier entirely — what a
+    deliberately curated fact wants, so it's never left to interpretation. `immutable=True`
+    excludes a memory from mem0's own later consolidation, so chat-driven learning can never
+    silently rewrite a curated one.
 
     Deliberately doesn't expose `includes`/`agent_custom_instructions` (real, documented mem0
     parameters meant to bias that classifier): live testing found the *effective* instructions
     mem0 actually applied to an agent-scoped, `infer=True` call weren't the ones sent in the
     request at all — something in mem0's own handling substituted a different, agent-persona
-    -oriented prompt in their place. Re-add them here only alongside a live-verified case where
-    they're confirmed to actually govern the call they're sent on.
+    -oriented prompt in their place. `record_turn()` in services/memory.py now sends a plain
+    `infer=True` call with none of these, closest to mem0's own unmodified default behavior.
+    Re-add either field here only alongside a live-verified case where it's confirmed to actually
+    govern the call it's sent on.
     """
     body: dict[str, object] = {"messages": messages, "agent_id": agent_id, "infer": infer}
     if user_id is not None:
