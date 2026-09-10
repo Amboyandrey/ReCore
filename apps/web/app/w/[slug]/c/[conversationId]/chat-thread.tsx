@@ -454,6 +454,14 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
                 ))}
               </select>
             )}
+            {assistants.find((a) => a.id === conversation.assistant_id)?.memory_enabled && (
+              <span
+                title="This assistant recalls curated facts and what it's learned about you"
+                className="rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-xs text-accent"
+              >
+                Memory on
+              </span>
+            )}
             {models.length > 0 && (
               <select
                 value={conversation.model_id}

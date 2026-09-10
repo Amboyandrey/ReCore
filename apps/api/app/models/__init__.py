@@ -13,6 +13,7 @@ from app.models.flag_scope import FlagScope
 from app.models.flag_type import FlagType
 from app.models.invitation import Invitation
 from app.models.llm_model import LLMModel
+from app.models.memory_credential import MemoryCredential
 from app.models.message import Message
 from app.models.message_role import MessageRole
 from app.models.provider import Provider
@@ -38,6 +39,7 @@ __all__ = [
     "FlagType",
     "Invitation",
     "LLMModel",
+    "MemoryCredential",
     "Message",
     "MessageRole",
     "Provider",

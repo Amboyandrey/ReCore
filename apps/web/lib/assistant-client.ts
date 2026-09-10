@@ -6,6 +6,8 @@ export type Assistant = {
   instructions: string;
   model_id: string | null;
   tool_ids: string[];
+  memory_enabled: boolean;
+  created_by: string;
   created_at: string;
 };
 
@@ -14,6 +16,7 @@ export type AssistantCreateInput = {
   instructions: string;
   model_id?: string;
   tool_ids?: string[];
+  memory_enabled?: boolean;
 };
 
 // Only the fields present change (see AssistantUpdate's `exclude_unset` on the API side) —
@@ -24,6 +27,7 @@ export type AssistantUpdateInput = {
   instructions?: string;
   model_id?: string | null;
   tool_ids?: string[];
+  memory_enabled?: boolean;
 };
 
 export class AssistantError extends Error {}

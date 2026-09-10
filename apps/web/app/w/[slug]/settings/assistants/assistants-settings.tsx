@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState, type FormEvent } from "react";
 import {
   AssistantError,
@@ -10,8 +11,15 @@ import {
   type Assistant,
 } from "@/lib/assistant-client";
 import { useRequireAuth } from "@/lib/auth-context";
+import {
+  deleteMemoryCredential,
+  getMemoryCredential,
+  MemoryError,
+  setMemoryCredential,
+} from "@/lib/memory-client";
 import { listModels, type EnabledModel } from "@/lib/provider-client";
 import { listTools, type Tool } from "@/lib/tool-client";
+import { useWorkspaceFlags } from "@/lib/use-workspace-flags";
 import { useWorkspaceBySlug } from "@/lib/workspace-context";
 
 type AssistantFormState = {
@@ -19,6 +27,7 @@ type AssistantFormState = {
   instructions: string;
   modelId: string; // "" means "workspace default"
   toolIds: Set<string>;
+  memoryEnabled: boolean;
 };
 
 const EMPTY_FORM: AssistantFormState = {
@@ -26,15 +35,21 @@ const EMPTY_FORM: AssistantFormState = {
   instructions: "",
   modelId: "",
   toolIds: new Set(),
+  memoryEnabled: false,
 };
 
 // The assistants settings page: save a name + required instructions + an optional preferred
-// model + an optional set of tools. Open to any member, not just admins — the same floor
-// registering a tool or sending a message already has, since an assistant is only ever usable
-// inside a chat.
+// model + an optional set of tools + optional ReMind memory. Open to any member, not just
+// admins — the same floor registering a tool or sending a message already has, since an
+// assistant is only ever usable inside a chat. The mem0 credential section is admin-only,
+// matching provider credentials.
 export function AssistantsSettings({ slug }: { slug: string }) {
-  const { loading: authLoading } = useRequireAuth();
+  const { user, loading: authLoading } = useRequireAuth();
   const { workspace, loading: wsLoading } = useWorkspaceBySlug(slug);
+  const { flags, loading: flagsLoading } = useWorkspaceFlags(workspace?.id);
+  const memoryFeatureEnabled = flags.memory === true;
+  const isAdmin = workspace?.role === "admin" || workspace?.role === "owner";
+  const isOwner = workspace?.role === "owner";
 
   const [assistants, setAssistants] = useState<Assistant[]>([]);
   const [models, setModels] = useState<EnabledModel[]>([]);
@@ -46,27 +61,39 @@ export function AssistantsSettings({ slug }: { slug: string }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
+  const [hasMemoryKey, setHasMemoryKey] = useState(false);
+  const [memoryApiKey, setMemoryApiKey] = useState("");
+  const [savingMemoryKey, setSavingMemoryKey] = useState(false);
+
   useEffect(() => {
     // Deferred into a .then()/.catch() chain, never called directly at the effect's top level —
     // see workspace-context.tsx for why: calling setState synchronously there risks cascading
     // renders under Next's stricter react-hooks rules.
     if (!workspace) return;
     let cancelled = false;
-    Promise.all([listAssistants(workspace.id), listModels(workspace.id), listTools(workspace.id)])
-      .then(([fetchedAssistants, fetchedModels, fetchedTools]) => {
+    Promise.all([
+      listAssistants(workspace.id),
+      listModels(workspace.id),
+      listTools(workspace.id),
+      memoryFeatureEnabled && isAdmin ? getMemoryCredential(workspace.id) : Promise.resolve(false),
+    ])
+      .then(([fetchedAssistants, fetchedModels, fetchedTools, fetchedHasKey]) => {
         if (cancelled) return;
         setAssistants(fetchedAssistants);
         setModels(fetchedModels);
         setTools(fetchedTools);
+        setHasMemoryKey(fetchedHasKey);
       })
       .catch((err) => {
-        if (!cancelled) setError(err instanceof AssistantError ? err.message : "Something went wrong.");
+        if (!cancelled) {
+          setError(err instanceof AssistantError || err instanceof MemoryError ? err.message : "Something went wrong.");
+        }
       })
       .finally(() => !cancelled && setLoadingData(false));
     return () => {
       cancelled = true;
     };
-  }, [workspace]);
+  }, [workspace, memoryFeatureEnabled, isAdmin]);
 
   function startEditing(assistant: Assistant) {
     setEditingId(assistant.id);
@@ -75,6 +102,7 @@ export function AssistantsSettings({ slug }: { slug: string }) {
       instructions: assistant.instructions,
       modelId: assistant.model_id ?? "",
       toolIds: new Set(assistant.tool_ids),
+      memoryEnabled: assistant.memory_enabled,
     });
   }
 
@@ -92,6 +120,32 @@ export function AssistantsSettings({ slug }: { slug: string }) {
     });
   }
 
+  async function handleSetMemoryKey(e: FormEvent) {
+    e.preventDefault();
+    if (!workspace || !memoryApiKey.trim()) return;
+    setSavingMemoryKey(true);
+    setError(null);
+    try {
+      setHasMemoryKey(await setMemoryCredential(workspace.id, memoryApiKey));
+      setMemoryApiKey("");
+    } catch (err) {
+      setError(err instanceof MemoryError ? err.message : "Something went wrong.");
+    } finally {
+      setSavingMemoryKey(false);
+    }
+  }
+
+  async function handleDeleteMemoryKey() {
+    if (!workspace) return;
+    setError(null);
+    try {
+      await deleteMemoryCredential(workspace.id);
+      setHasMemoryKey(false);
+    } catch (err) {
+      setError(err instanceof MemoryError ? err.message : "Something went wrong.");
+    }
+  }
+
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     if (!workspace) return;
@@ -104,6 +158,7 @@ export function AssistantsSettings({ slug }: { slug: string }) {
           instructions: form.instructions,
           model_id: form.modelId || null,
           tool_ids: [...form.toolIds],
+          memory_enabled: form.memoryEnabled,
         });
         setAssistants((prev) => prev.map((a) => (a.id === updated.id ? updated : a)));
       } else {
@@ -112,6 +167,7 @@ export function AssistantsSettings({ slug }: { slug: string }) {
           instructions: form.instructions,
           model_id: form.modelId || undefined,
           tool_ids: [...form.toolIds],
+          memory_enabled: form.memoryEnabled,
         });
         setAssistants((prev) => [...prev, created]);
       }
@@ -136,7 +192,7 @@ export function AssistantsSettings({ slug }: { slug: string }) {
     }
   }
 
-  if (authLoading || wsLoading || loadingData) {
+  if (authLoading || wsLoading || flagsLoading || loadingData) {
     return <div className="mx-auto max-w-3xl px-6 py-16 text-sm text-text-muted">Loading…</div>;
   }
   if (!workspace) {
@@ -166,44 +222,101 @@ export function AssistantsSettings({ slug }: { slug: string }) {
         </p>
       )}
 
+      {memoryFeatureEnabled && isAdmin && (
+        <div className="mt-8">
+          <h2 className="text-sm font-semibold text-text">Memory (ReMind)</h2>
+          <p className="mt-1 text-sm text-text-muted">
+            A <a href="https://app.mem0.ai" className="text-accent" target="_blank" rel="noreferrer">
+              mem0
+            </a>{" "}
+            API key, shared by every memory-enabled assistant in this workspace.
+          </p>
+          <form onSubmit={handleSetMemoryKey} className="mt-3 flex flex-wrap items-end gap-3">
+            <label className="flex flex-col gap-1.5 text-sm">
+              <span className="text-text-soft">mem0 API key</span>
+              <input
+                type="password"
+                required
+                value={memoryApiKey}
+                onChange={(e) => setMemoryApiKey(e.target.value)}
+                placeholder={hasMemoryKey ? "Enter a new key to rotate it" : "m0-..."}
+                className="w-64 rounded-md border border-border bg-surface px-3 py-2 text-text outline-none focus:border-accent"
+              />
+            </label>
+            <button
+              type="submit"
+              disabled={savingMemoryKey || !memoryApiKey.trim()}
+              className="rounded-md bg-accent px-3 py-2 text-sm font-medium text-accent-contrast disabled:opacity-60"
+            >
+              {savingMemoryKey ? "Saving…" : hasMemoryKey ? "Update key" : "Set key"}
+            </button>
+            {hasMemoryKey && (
+              <button
+                type="button"
+                onClick={handleDeleteMemoryKey}
+                className="text-xs text-danger hover:underline"
+              >
+                Remove
+              </button>
+            )}
+          </form>
+        </div>
+      )}
+
       {assistants.length > 0 && (
         <ul className="mt-8 flex flex-col gap-2">
-          {assistants.map((a) => (
-            <li key={a.id} className="rounded-md border border-border bg-surface px-3 py-2 text-sm">
-              <div className="flex items-center justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="text-text">{a.name}</span>
-                    <span className="rounded-full border border-border-strong px-2 py-0.5 font-mono text-xs text-text-soft">
-                      {modelName(a.model_id)}
-                    </span>
-                    {a.tool_ids.length > 0 && (
-                      <span className="rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-xs text-accent">
-                        {a.tool_ids.length} tool{a.tool_ids.length === 1 ? "" : "s"}
+          {assistants.map((a) => {
+            const canManageMemory = isOwner || a.created_by === user?.id;
+            return (
+              <li key={a.id} className="rounded-md border border-border bg-surface px-3 py-2 text-sm">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="text-text">{a.name}</span>
+                      <span className="rounded-full border border-border-strong px-2 py-0.5 font-mono text-xs text-text-soft">
+                        {modelName(a.model_id)}
                       </span>
-                    )}
+                      {a.tool_ids.length > 0 && (
+                        <span className="rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-xs text-accent">
+                          {a.tool_ids.length} tool{a.tool_ids.length === 1 ? "" : "s"}
+                        </span>
+                      )}
+                      {a.memory_enabled && (
+                        <span className="rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-xs text-accent">
+                          Memory on
+                        </span>
+                      )}
+                    </div>
+                    <p className="mt-0.5 truncate text-xs text-text-muted">{a.instructions}</p>
                   </div>
-                  <p className="mt-0.5 truncate text-xs text-text-muted">{a.instructions}</p>
+                  <div className="flex shrink-0 items-center gap-3">
+                    {memoryFeatureEnabled && a.memory_enabled && (
+                      <Link
+                        href={`/w/${slug}/settings/assistants/${a.id}/memories`}
+                        className="text-xs text-accent hover:underline"
+                      >
+                        {canManageMemory ? "Memories →" : "Your memories →"}
+                      </Link>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => startEditing(a)}
+                      className="text-xs text-text-soft hover:underline"
+                    >
+                      Edit
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleDelete(a.id)}
+                      className="text-xs text-danger hover:underline"
+                    >
+                      Delete
+                    </button>
+                  </div>
                 </div>
-                <div className="flex shrink-0 items-center gap-3">
-                  <button
-                    type="button"
-                    onClick={() => startEditing(a)}
-                    className="text-xs text-text-soft hover:underline"
-                  >
-                    Edit
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleDelete(a.id)}
-                    className="text-xs text-danger hover:underline"
-                  >
-                    Delete
-                  </button>
-                </div>
-              </div>
-            </li>
-          ))}
+              </li>
+            );
+          })}
         </ul>
       )}
 
@@ -276,6 +389,19 @@ export function AssistantsSettings({ slug }: { slug: string }) {
             </div>
           )}
         </div>
+
+        {memoryFeatureEnabled && (
+          <label className="flex items-center gap-2 text-sm text-text-soft">
+            <input
+              type="checkbox"
+              checked={form.memoryEnabled}
+              onChange={(e) => setForm((f) => ({ ...f, memoryEnabled: e.target.checked }))}
+            />
+            <span>
+              Memory (ReMind) — recall curated facts and what it&apos;s learned about each user
+            </span>
+          </label>
+        )}
 
         <div className="flex items-center gap-3">
           <button

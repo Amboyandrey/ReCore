@@ -20,6 +20,10 @@ class Assistant(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     assistant's assigned tools (see AssistantTool) are resolved live wherever a chat reads them,
     never copied onto a conversation — so retargeting an assistant's model, instructions, or tools
     later reaches every conversation still using it, not just new ones.
+
+    `memory_enabled` turns on mem0-backed recall for this assistant (see services/memory.py):
+    curated facts its creator taught it, plus — separately, and never visible to anyone else —
+    what it's learned about whichever member is chatting with it right now.
     """
 
     __tablename__ = "assistants"
@@ -31,3 +35,4 @@ class Assistant(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         ForeignKey("models.id", ondelete="SET NULL"), default=None
     )
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    memory_enabled: Mapped[bool] = mapped_column(default=False, server_default="false")
