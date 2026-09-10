@@ -32,7 +32,14 @@ class AssistantUpdate(BaseModel):
 
 
 class AssistantOut(BaseModel):
-    """One saved assistant, with the ids of the tools it's currently equipped with."""
+    """One saved assistant, with the ids of the tools it's currently equipped with.
+
+    `created_by` is exposed (unlike on most rows in this codebase) because it's load-bearing for
+    the client: only the creator or the workspace owner may add or delete this assistant's
+    curated memories (see services/memory.py), and the settings page needs to know which one it's
+    looking at to show that control correctly rather than showing it to everyone and leaning on a
+    403 to explain why.
+    """
 
     id: uuid.UUID
     name: str
@@ -40,4 +47,5 @@ class AssistantOut(BaseModel):
     model_id: uuid.UUID | None
     tool_ids: list[uuid.UUID]
     memory_enabled: bool
+    created_by: uuid.UUID
     created_at: datetime

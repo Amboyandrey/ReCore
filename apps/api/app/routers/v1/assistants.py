@@ -33,6 +33,7 @@ async def _to_assistant_out(db: AsyncSession, assistant: Assistant) -> Assistant
         model_id=assistant.model_id,
         tool_ids=tool_ids,
         memory_enabled=assistant.memory_enabled,
+        created_by=assistant.created_by,
         created_at=assistant.created_at,
     )
 
