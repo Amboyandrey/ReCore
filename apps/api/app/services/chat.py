@@ -65,6 +65,7 @@ from app.services.generations import (
     get_or_create_generation_id,
     set_active_generation,
 )
+from app.services.memory import record_turn, retrieve_for_turn
 from app.services.tools import list_enabled_tools, to_tool_definition
 from app.services.usage import record_usage_event
 from app.tools.execute import execute_tool
@@ -419,6 +420,28 @@ async def send_message(
     assistant = await db.get(Assistant, conversation.assistant_id) if conversation.assistant_id else None
     system_prompt = assistant.instructions if assistant is not None else conversation.system_prompt
 
+    # Memory only ever applies to an assistant-backed conversation — there's no "workspace-wide"
+    # memory the way there's a workspace-wide tool set, since a memory is meaningless without an
+    # assistant to scope it to. `memory_active` gates both directions (recall below, and the
+    # post-generation write in _run_generation) on the same two conditions, independent of
+    # whether mem0 itself is actually reachable this turn.
+    memory_flag_enabled = await evaluate_flag(
+        db, redis, key="memory", workspace_id=workspace_id, user_id=conversation.user_id
+    )
+    memory_active = memory_flag_enabled and assistant is not None and assistant.memory_enabled
+    memory_assistant_id: uuid.UUID | None = None
+    if memory_active and assistant is not None:
+        memory_assistant_id = assistant.id
+        memory_block = await retrieve_for_turn(
+            db,
+            workspace_id=workspace_id,
+            assistant_id=assistant.id,
+            user_id=conversation.user_id,
+            query=content,
+        )
+        if memory_block:
+            system_prompt = f"{system_prompt}\n\n{memory_block}" if system_prompt else memory_block
+
     history = await _to_chat_history(db, [*existing_messages], system_prompt=system_prompt)
     text, images = _augment_with_attachments(content, attachments)
     history.append(ChatMessage(role="user", content=text, images=images))
@@ -451,6 +474,8 @@ async def send_message(
             provider_model_id=model.provider_model_id,
             history=history,
             tools=tools,
+            user_content=content,
+            memory_assistant_id=memory_assistant_id,
         )
     )
     _background_tasks.add(task)
@@ -523,6 +548,8 @@ async def _run_generation(
     provider_model_id: str,
     history: list[ChatMessage],
     tools: list[Tool],
+    user_content: str,
+    memory_assistant_id: uuid.UUID | None = None,
 ) -> None:
     """Stream a reply from the provider, appending each chunk to Redis, then persist the result.
 
@@ -530,6 +557,11 @@ async def _run_generation(
     assistant's request and the tool's result to the working history, and calls the provider
     again, up to MAX_TOOL_ITERATIONS times. Every iteration's usage adds to the same running
     total, and everything is still one generation, one Redis stream, one persisted reply.
+
+    `memory_assistant_id`, when set, means this turn should be taught to mem0 once it finishes
+    successfully — always into that assistant's *personal* scope for `user_id` (see
+    services/memory.py's record_turn), fired off after the reply is already visible so a slow or
+    unreachable mem0 can never delay it.
 
     Owns its own database session and Redis client — it must keep running, and keep those
     connections, independent of whatever HTTP request (if any) is currently watching.
@@ -697,6 +729,22 @@ async def _run_generation(
     else:
         await append_event(redis, generation_id, "done", {"finish_reason": finish_reason})
     await clear_active_generation(redis, conversation_id)
+
+    if not error_message and memory_assistant_id is not None:
+        # Fire-and-forget, after the reply is already visible to its reader — a slow or
+        # unreachable mem0 must never be the reason a reply takes longer to arrive. A failed
+        # generation has nothing worth teaching mem0, hence the `not error_message` guard.
+        memory_task = asyncio.create_task(
+            record_turn(
+                workspace_id=workspace_id,
+                assistant_id=memory_assistant_id,
+                user_id=user_id,
+                user_message=user_content,
+                assistant_message="".join(text_parts),
+            )
+        )
+        _background_tasks.add(memory_task)
+        memory_task.add_done_callback(_background_tasks.discard)
 
     await pubsub.unsubscribe(f"gen:{generation_id}:stop")
     await pubsub.aclose()  # type: ignore[no-untyped-call]  # redis-py's stubs omit this method's types

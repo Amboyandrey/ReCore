@@ -22,6 +22,7 @@ from app.core.errors import (
     ModelDoesNotSupportImages,
     ModelNotFound,
 )
+from app.memory import mem0
 from app.models import (
     Attachment,
     FeatureFlag,
@@ -67,6 +68,7 @@ from app.services.chat import (
 )
 from app.services.flags import set_override
 from app.services.generations import read_events, request_stop
+from app.services.memory import curated_agent_id, personal_agent_id, set_credential
 from app.services.tools import to_tool_definition
 from app.tools.base import ToolExecutionResult
 
@@ -153,6 +155,16 @@ async def _failing_execute_tool(tool: Tool, arguments: dict[str, object]) -> tup
 async def _enable_tools(db: AsyncSession, redis: Redis, *, workspace_id: uuid.UUID) -> None:
     """Flip the `tools` flag on for one workspace — the lever the tools settings page pulls."""
     flag = await db.scalar(select(FeatureFlag).where(FeatureFlag.key == "tools"))
+    assert flag is not None
+    await set_override(
+        db, redis, flag_id=flag.id, scope=FlagScope.WORKSPACE, scope_id=workspace_id, value=True
+    )
+    await db.commit()  # this test's `db` session must commit for the client's own connection to see it
+
+
+async def _enable_memory(db: AsyncSession, redis: Redis, *, workspace_id: uuid.UUID) -> None:
+    """Flip the `memory` flag on for one workspace — the lever a memory settings page pulls."""
+    flag = await db.scalar(select(FeatureFlag).where(FeatureFlag.key == "memory"))
     assert flag is not None
     await set_override(
         db, redis, flag_id=flag.id, scope=FlagScope.WORKSPACE, scope_id=workspace_id, value=True
@@ -1142,6 +1154,243 @@ async def test_editing_an_assistant_is_reflected_on_the_very_next_send(
 
     assert captured[0].last_messages[0].content == "Version one."
     assert captured[1].last_messages[0].content == "Version two."
+
+
+async def test_memory_is_injected_into_the_system_prompt_when_enabled(
+    db: AsyncSession, redis_client: Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user, workspace, model = await _workspace_with_model(db)
+    await _enable_memory(db, redis_client, workspace_id=workspace.id)
+    assistant = await create_assistant(
+        db, workspace_id=workspace.id, created_by=user, name="Bot", instructions="Be terse.",
+        model_id=None, tool_ids=[], memory_enabled=True,
+    )
+    await set_credential(db, workspace_id=workspace.id, created_by=user, api_key="m0-test")
+    await db.commit()
+
+    async def fake_search(**kwargs: object) -> list[dict[str, object]]:
+        del kwargs
+        return [
+            {
+                "id": "m1",
+                "memory": "The user prefers metric units.",
+                "agent_id": curated_agent_id(workspace.id, assistant.id),
+            }
+        ]
+
+    monkeypatch.setattr(mem0, "search", fake_search)
+
+    async def fake_add(**kwargs: object) -> bool:
+        del kwargs
+        return True
+
+    monkeypatch.setattr(mem0, "add", fake_add)
+
+    captured: list[FakeProvider] = []
+
+    def _capturing_build_provider(
+        provider: Provider, *, api_key: str, base_url: str | None
+    ) -> FakeProvider:
+        instance = FakeProvider(api_key=api_key, base_url=base_url)
+        captured.append(instance)
+        return instance
+
+    monkeypatch.setattr("app.services.chat.build_provider", _capturing_build_provider)
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None,
+        assistant_id=assistant.id,
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db, redis_client, workspace_id=workspace.id, conversation=conversation,
+        content="What units should I use?", idempotency_key=None,
+    )
+    async for _ in read_events(redis_client, generation_id, block_ms=50):
+        pass
+
+    system_turn = captured[0].last_messages[0]
+    assert system_turn.role == "system"
+    assert "Be terse." in system_turn.content
+    assert "The user prefers metric units." in system_turn.content
+
+
+async def test_memory_writes_only_the_personal_scope_even_for_the_assistants_own_creator(
+    db: AsyncSession, redis_client: Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The chatter here *is* the assistant's creator — proving chatting still never reaches the
+    curated scope, not even for the one person who's otherwise allowed to edit it directly."""
+    user, workspace, model = await _workspace_with_model(db)
+    await _enable_memory(db, redis_client, workspace_id=workspace.id)
+    assistant = await create_assistant(
+        db, workspace_id=workspace.id, created_by=user, name="Bot", instructions="x",
+        model_id=None, tool_ids=[], memory_enabled=True,
+    )
+    await set_credential(db, workspace_id=workspace.id, created_by=user, api_key="m0-test")
+    await db.commit()
+
+    async def fake_search(**kwargs: object) -> list[dict[str, object]]:
+        del kwargs
+        return []
+
+    monkeypatch.setattr(mem0, "search", fake_search)
+
+    captured: dict[str, object] = {}
+    write_happened = asyncio.Event()
+
+    async def fake_add(**kwargs: object) -> bool:
+        captured.update(kwargs)
+        write_happened.set()
+        return True
+
+    monkeypatch.setattr(mem0, "add", fake_add)
+    monkeypatch.setattr("app.services.chat.build_provider", _fake_build_provider)
+
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None,
+        assistant_id=assistant.id,
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db, redis_client, workspace_id=workspace.id, conversation=conversation,
+        content="Remember I like tea.", idempotency_key=None,
+    )
+    async for _ in read_events(redis_client, generation_id, block_ms=50):
+        pass
+    await asyncio.wait_for(write_happened.wait(), timeout=2)
+
+    assert captured["agent_id"] == personal_agent_id(workspace.id, assistant.id)
+    assert captured["user_id"] is not None
+    assert captured["infer"] is True
+    assert "immutable" not in captured  # only a curated add ever sets this
+
+
+async def test_a_mem0_outage_during_retrieval_does_not_break_the_generation(
+    db: AsyncSession, redis_client: Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user, workspace, model = await _workspace_with_model(db)
+    await _enable_memory(db, redis_client, workspace_id=workspace.id)
+    assistant = await create_assistant(
+        db, workspace_id=workspace.id, created_by=user, name="Bot", instructions="x",
+        model_id=None, tool_ids=[], memory_enabled=True,
+    )
+    await set_credential(db, workspace_id=workspace.id, created_by=user, api_key="m0-test")
+    await db.commit()
+
+    async def failing_search(**kwargs: object) -> None:
+        del kwargs
+        return None  # what mem0.search() itself returns on any transport failure
+
+    async def failing_add(**kwargs: object) -> bool:
+        del kwargs
+        return False
+
+    monkeypatch.setattr(mem0, "search", failing_search)
+    monkeypatch.setattr(mem0, "add", failing_add)
+    monkeypatch.setattr("app.services.chat.build_provider", _fake_build_provider)
+
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None,
+        assistant_id=assistant.id,
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db, redis_client, workspace_id=workspace.id, conversation=conversation,
+        content="Hi", idempotency_key=None,
+    )
+    events = [e async for e in read_events(redis_client, generation_id, block_ms=50)]
+
+    assert events[-1].type == "done"
+
+
+async def test_memory_disabled_on_the_assistant_makes_no_mem0_calls(
+    db: AsyncSession, redis_client: Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user, workspace, model = await _workspace_with_model(db)
+    await _enable_memory(db, redis_client, workspace_id=workspace.id)
+    assistant = await create_assistant(
+        db, workspace_id=workspace.id, created_by=user, name="Bot", instructions="x",
+        model_id=None, tool_ids=[], memory_enabled=False,  # the flag is on; the assistant isn't
+    )
+    await set_credential(db, workspace_id=workspace.id, created_by=user, api_key="m0-test")
+    await db.commit()
+
+    calls: list[str] = []
+
+    async def tracked_search(**kwargs: object) -> list[dict[str, object]]:
+        del kwargs
+        calls.append("search")
+        return []
+
+    async def tracked_add(**kwargs: object) -> bool:
+        del kwargs
+        calls.append("add")
+        return True
+
+    monkeypatch.setattr(mem0, "search", tracked_search)
+    monkeypatch.setattr(mem0, "add", tracked_add)
+    monkeypatch.setattr("app.services.chat.build_provider", _fake_build_provider)
+
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None,
+        assistant_id=assistant.id,
+    )
+    await db.commit()
+    generation_id = await send_message(
+        db, redis_client, workspace_id=workspace.id, conversation=conversation,
+        content="Hi", idempotency_key=None,
+    )
+    async for _ in read_events(redis_client, generation_id, block_ms=50):
+        pass
+    await asyncio.sleep(0.05)  # let any (incorrectly) scheduled background task run
+
+    assert calls == []
+
+
+async def test_memory_flag_off_makes_no_mem0_calls_even_when_the_assistant_has_it_on(
+    db: AsyncSession, redis_client: Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user, workspace, model = await _workspace_with_model(db)
+    # `memory` flag is left off entirely.
+    assistant = await create_assistant(
+        db, workspace_id=workspace.id, created_by=user, name="Bot", instructions="x",
+        model_id=None, tool_ids=[], memory_enabled=True,
+    )
+    await set_credential(db, workspace_id=workspace.id, created_by=user, api_key="m0-test")
+    await db.commit()
+
+    calls: list[str] = []
+
+    async def tracked_search(**kwargs: object) -> list[dict[str, object]]:
+        del kwargs
+        calls.append("search")
+        return []
+
+    async def tracked_add(**kwargs: object) -> bool:
+        del kwargs
+        calls.append("add")
+        return True
+
+    monkeypatch.setattr(mem0, "search", tracked_search)
+    monkeypatch.setattr(mem0, "add", tracked_add)
+    monkeypatch.setattr("app.services.chat.build_provider", _fake_build_provider)
+
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None,
+        assistant_id=assistant.id,
+    )
+    await db.commit()
+    generation_id = await send_message(
+        db, redis_client, workspace_id=workspace.id, conversation=conversation,
+        content="Hi", idempotency_key=None,
+    )
+    async for _ in read_events(redis_client, generation_id, block_ms=50):
+        pass
+    await asyncio.sleep(0.05)
+
+    assert calls == []
 
 
 async def test_a_tool_call_is_executed_and_fed_back_for_a_final_answer(
