@@ -1,27 +1,36 @@
 # ReCore
 
-A multi-workspace chat platform that talks to any LLM, using API keys each workspace brings
-itself. Multiple workspaces, multiple people, multiple providers — one platform, one account.
+A multi-workspace chat platform that talks to any LLM, using API keys each workspace brings itself.
+Multiple workspaces, multiple people, multiple providers — one platform, one account.
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full architecture and phased build plan
-this was built against.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how it's built and why, including the parts
+that were deliberately left out.
 
 ## What it does
 
 - **Bring your own key** — register an Anthropic, OpenAI, Google, or any OpenAI-compatible
-  (Groq, Ollama, OpenRouter, vLLM, ...) credential per workspace; keys are envelope-encrypted at
-  rest and validated live before they're ever stored.
+  (Groq, Ollama, OpenRouter, vLLM, …) credential per workspace; keys are envelope-encrypted at rest
+  and validated live before they're ever stored.
 - **Chat, streamed and resumable** — Server-Sent Events over a Redis stream, so a refreshed tab or
-  a dropped connection picks the reply back up mid-answer instead of losing it.
+  a dropped connection picks the reply back up mid-answer instead of losing it. Stop works across
+  processes; a retried send attaches to the in-flight generation instead of billing twice.
+- **Tools the model can actually call** — a built-in web search (Tavily), plus any HTTP endpoint a
+  workspace registers as a tool: name, description, JSON Schema parameters, method, URL, and an
+  optional secret header. The agent loop executes calls, feeds results back, and records every one
+  in the transcript — bounded by a timeout, a result-size cap, and a 5-iteration ceiling.
+- **Assistants** — save a name, instructions, an optional preferred model and a set of tools, then
+  point a conversation at it. Instructions and tools are resolved live on every send, so editing an
+  assistant reaches conversations already using it.
 - **Workspaces, roles, and invitations** — viewer/member/admin/owner, enforced by one dependency
   chain and backstopped by Postgres row-level security.
 - **Feature flags** — user → workspace → percentage rollout → default resolution, cached in Redis
   and invalidated instantly on edit. A per-provider killswitch is the platform's own admin lever.
-- **Attachments** — upload a file into a chat (behind its own flag) and its text rides along with
-  the next message.
+- **Attachments** — PDF, DOCX, PPTX, XLSX and text files extract into the next message's context;
+  images (HEIC included) pass through to vision-capable models, and are refused pre-flight by
+  models that can't read them.
 - **Usage and audit** — every generation's tokens and cost land in an append-only ledger; every
-  privileged action (who invited whom, whose key got rejected, which flag got flipped) lands in an
-  immutable audit trail.
+  privileged action (who invited whom, whose key got rejected, which flag got flipped, who
+  registered a tool) lands in an immutable audit trail.
 
 ## Architecture
 
@@ -38,6 +47,7 @@ flowchart LR
     API --> PG
     API <-->|"sessions · rate limits · live streams<br/>stop signals · idempotency · flag cache"| Redis
     API -->|"streamed chat, one adapter per provider"| LLM["Anthropic · OpenAI · Google<br/>any OpenAI-compatible endpoint"]
+    API -->|"web search · registered HTTP tools"| Tools["Tool endpoints<br/>(SSRF-guarded)"]
 
     PG -.->|"row-level security backstop"| API
 ```
@@ -66,26 +76,42 @@ service's environment before the first boot and one gets registered and enabled 
 
 Re-running `docker compose up` is safe at any point — migrations and the seed are both idempotent.
 
+### Turning on tools
+
+Tools sit behind the `tools` flag, off by default, and flags are administered at `/admin/flags` —
+which requires a superuser. Nothing in the app grants that, so promote your account once, directly
+against the database:
+
+```bash
+docker compose -f infra/docker-compose.yml exec postgres \
+  psql -U recore -d recore -c "update users set is_superuser = true where email = 'demo@example.com';"
+```
+
+Then flip `tools` on for your workspace at `/admin/flags` and open **Settings → Tools** to paste a
+[Tavily](https://tavily.com) key for web search, or register an HTTP tool of your own. Assistants
+need no flag — they're at **Settings → Assistants**.
+
 ## Repository layout
 
 ```
-apps/api/          FastAPI backend
-  app/core/           settings, db/redis engines, crypto, tracing, middleware
+apps/api/          FastAPI backend (Python 3.12)
+  app/core/           settings, db/redis engines, crypto, SSRF guard, tracing, middleware
   app/models/         SQLAlchemy ORM models
   app/schemas/        Pydantic request/response shapes
   app/services/       business logic — no FastAPI imports, fully unit-testable
   app/routers/v1/     HTTP surface — thin, delegates to services
   app/providers/      one adapter per LLM backend behind a shared protocol
-  app/deps/           the auth → workspace → role dependency chain
-  app/scripts/        one-off scripts (the demo seed)
+  app/tools/          tool executors (web search, HTTP) + the bounded dispatcher
+  app/deps/           the auth → workspace → role dependency chain, plus flag gates
+  app/scripts/        one-off scripts (demo seed, load test)
   migrations/         Alembic, one revision per schema change
-  tests/              pytest, ~170 tests
-apps/web/           Next.js (App Router) frontend
+  tests/              pytest, 290 tests
+apps/web/           Next.js 16 (App Router), React 19, Tailwind 4
   app/                routes — auth, workspace, chat, settings, admin
-  lib/                typed API clients + React context per domain
+  lib/                one typed API client per domain + React context
   components/         shared UI
 infra/              docker-compose.yml, Dockerfiles for both apps
-docs/               ARCHITECTURE.md — the plan this was built from
+docs/               ARCHITECTURE.md
 ```
 
 ## Local development without Docker
@@ -130,25 +156,36 @@ script's own docstring for what it found the first time it was run):
 cd apps/api && uv run python -m app.scripts.load_test
 ```
 
+CI runs the same API and web checks on every push and pull request.
+
 ## Security
 
-- Argon2id password hashing; opaque Redis-backed sessions, not JWTs; double-submit CSRF cookie
-- Envelope-encrypted provider credentials (AES-256-GCM, master key wraps a random per-credential
-  data key); the plaintext key is never a field on any response schema
-- SSRF guard on custom provider base URLs — resolve, reject private/loopback ranges, then connect
+- Argon2id password hashing; opaque Redis-backed sessions, not JWTs
+- Envelope-encrypted secrets — provider keys, the web-search key, and each HTTP tool's secret
+  header value all use the same AES-256-GCM scheme, where a master key wraps a random per-secret
+  data key. Plaintext is never a field on any response schema.
+- SSRF guard on every user-supplied URL — provider base URLs and tool endpoints, the latter
+  re-checked immediately before each call, not just when it was registered
+- Tool execution is bounded: a 15s timeout, an 8,000-character result cap, and a 5-iteration
+  ceiling per generation, so one bad tool degrades a single turn rather than a whole run
 - Tenancy enforced by one dependency chain (`current_user → workspace_ctx → require_role`), 404
   (not 403) for non-members, and backstopped by Postgres row-level security under a dedicated
-  low-privilege runtime role — see the RLS migration's own docstring for the details worth
-  knowing before touching it
+  low-privilege runtime role — see the RLS migration's own docstring for the details worth knowing
+  before touching it
 - CSP, HSTS, X-Content-Type-Options, and Referrer-Policy on every response, API and web alike
-- Every privileged action — invites, role changes, credential create/delete and validation
-  failures, flag edits — writes an immutable audit row
+- Every privileged action — invites, role changes, credential and tool and assistant lifecycle,
+  flag edits — writes an immutable audit row
 
-None of this is exhaustive; `docs/ARCHITECTURE.md` §10 has the full checklist and what's still
-explicitly deferred (a DNS-rebind TOCTOU gap on the SSRF guard, CSRF enforcement not yet wired
-past the logout route, no rate limiting beyond auth).
+`docs/ARCHITECTURE.md` §14 lists the known gaps in the same place, rather than leaving them
+implied: CSRF is issued but only enforced on logout, the SSRF guard still has a DNS-rebind TOCTOU
+window, rate limiting doesn't cover chat, logs have no redaction processor behind the
+don't-log-secrets discipline, and CI has no dependency or secret scanning.
 
-## Build status
+## Status
 
-All 8 phases in `docs/ARCHITECTURE.md`'s build order are complete: Foundation, Identity,
-Workspaces & Roles, LLM Registry, Chat, Flags & Attachments, Metering, and Hardening.
+Feature-complete for what it set out to be: identity, workspaces and roles, the LLM registry, chat
+with resumable streaming, feature flags, attachments, metering and audit, RLS hardening, tool
+calling with a built-in web search and third-party HTTP tools, and assistants.
+
+What's deliberately absent — programmatic API keys, background workers, usage rollup tables,
+embeddings and retrieval — is listed with the reasoning in `docs/ARCHITECTURE.md` §16.
