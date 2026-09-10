@@ -33,6 +33,11 @@ export function AssistantMemories({ slug, assistantId }: { slug: string; assista
   const [newFact, setNewFact] = useState("");
   const [adding, setAdding] = useState(false);
   const [justQueued, setJustQueued] = useState(false);
+  // Bumped by the Refresh button to re-run the fetch effect below on demand — this page has no
+  // other way to learn a new memory has finished processing: mem0's own extraction is
+  // asynchronous and, seen live, can take anywhere from seconds to several minutes, so a page
+  // loaded before that finishes would otherwise show a stale list forever with no way to tell.
+  const [refreshNonce, setRefreshNonce] = useState(0);
 
   const isOwner = workspace?.role === "owner";
   const canManageCurated = Boolean(assistant && (isOwner || assistant.created_by === user?.id));
@@ -66,7 +71,15 @@ export function AssistantMemories({ slug, assistantId }: { slug: string; assista
     return () => {
       cancelled = true;
     };
-  }, [workspace, assistantId, tab, memoryFeatureEnabled]);
+  }, [workspace, assistantId, tab, memoryFeatureEnabled, refreshNonce]);
+
+  // Setting loadingMemories here (a click handler, not the effect above) is what shows "Loading…"
+  // immediately on click rather than only once the fetch it triggers actually resolves.
+  function handleRefresh() {
+    setError(null);
+    setLoadingMemories(true);
+    setRefreshNonce((n) => n + 1);
+  }
 
   async function handleAdd(e: FormEvent) {
     e.preventDefault();
@@ -143,28 +156,39 @@ export function AssistantMemories({ slug, assistantId }: { slug: string; assista
         </p>
       )}
 
-      <div className="mt-6 flex gap-2 border-b border-border">
+      <div className="mt-6 flex items-center justify-between border-b border-border">
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={() => setTab("curated")}
+            className={`px-3 py-2 text-sm ${
+              tab === "curated"
+                ? "border-b-2 border-accent text-text"
+                : "text-text-soft hover:text-text"
+            }`}
+          >
+            Assistant
+          </button>
+          <button
+            type="button"
+            onClick={() => setTab("personal")}
+            className={`px-3 py-2 text-sm ${
+              tab === "personal"
+                ? "border-b-2 border-accent text-text"
+                : "text-text-soft hover:text-text"
+            }`}
+          >
+            Yours
+          </button>
+        </div>
         <button
           type="button"
-          onClick={() => setTab("curated")}
-          className={`px-3 py-2 text-sm ${
-            tab === "curated"
-              ? "border-b-2 border-accent text-text"
-              : "text-text-soft hover:text-text"
-          }`}
+          onClick={handleRefresh}
+          disabled={loadingMemories}
+          title="mem0 processes new memories in the background — sometimes for several minutes — so this list won't update on its own"
+          className="mb-1 shrink-0 text-xs text-text-soft hover:text-text disabled:opacity-60"
         >
-          Assistant
-        </button>
-        <button
-          type="button"
-          onClick={() => setTab("personal")}
-          className={`px-3 py-2 text-sm ${
-            tab === "personal"
-              ? "border-b-2 border-accent text-text"
-              : "text-text-soft hover:text-text"
-          }`}
-        >
-          Yours
+          {loadingMemories ? "Refreshing…" : "↻ Refresh"}
         </button>
       </div>
 
@@ -232,8 +256,8 @@ export function AssistantMemories({ slug, assistantId }: { slug: string; assista
             </button>
             {justQueued && (
               <span className="text-xs text-text-muted">
-                Queued — mem0 processes new memories in the background, so it may take a moment to
-                show up above.
+                Queued — mem0 processes new memories in the background, which can take anywhere
+                from a few seconds to several minutes. Use Refresh above once it&apos;s had a moment.
               </span>
             )}
           </div>
