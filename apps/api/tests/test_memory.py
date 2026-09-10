@@ -18,7 +18,6 @@ from app.models import Assistant, FeatureFlag, FlagScope, Role, User, Workspace,
 from app.services.assistants import create_assistant
 from app.services.flags import set_override
 from app.services.memory import (
-    _pending_reindex_key,
     add_curated,
     curated_agent_id,
     delete_credential,
@@ -470,7 +469,7 @@ async def test_deleting_a_curated_memory_rejects_a_non_creator_non_owner(
 
 
 async def test_retrieve_for_turn_sends_the_expected_or_filter(
-    db: AsyncSession, redis_client: Redis, monkeypatch: pytest.MonkeyPatch
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     owner, workspace = await _user_with_workspace(db, email="ret1@example.com", slug="ret-ws1")
     assistant = await _assistant(db, workspace_id=workspace.id, created_by=owner)
@@ -484,7 +483,7 @@ async def test_retrieve_for_turn_sends_the_expected_or_filter(
     monkeypatch.setattr(mem0, "search", fake_search)
 
     await retrieve_for_turn(
-        db, redis_client, workspace_id=workspace.id, assistant_id=assistant.id, user_id=owner.id, query="hi"
+        db, workspace_id=workspace.id, assistant_id=assistant.id, user_id=owner.id, query="hi"
     )
 
     filters = captured["filters"]
@@ -501,7 +500,7 @@ async def test_retrieve_for_turn_sends_the_expected_or_filter(
 
 
 async def test_retrieve_for_turn_drops_a_result_outside_the_caller_s_scopes(
-    db: AsyncSession, redis_client: Redis, monkeypatch: pytest.MonkeyPatch
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Even if mem0's own filter had a bug and handed back another user's memory, the block built
     from it excludes anything whose agent_id/user_id doesn't match this exact caller's scopes."""
@@ -524,7 +523,7 @@ async def test_retrieve_for_turn_drops_a_result_outside_the_caller_s_scopes(
     monkeypatch.setattr(mem0, "search", fake_search)
 
     block = await retrieve_for_turn(
-        db, redis_client, workspace_id=workspace.id, assistant_id=assistant.id, user_id=owner.id, query="hi"
+        db, workspace_id=workspace.id, assistant_id=assistant.id, user_id=owner.id, query="hi"
     )
 
     assert block is not None
@@ -533,7 +532,7 @@ async def test_retrieve_for_turn_drops_a_result_outside_the_caller_s_scopes(
 
 
 async def test_retrieve_for_turn_drops_a_personal_result_with_the_wrong_user_id(
-    db: AsyncSession, redis_client: Redis, monkeypatch: pytest.MonkeyPatch
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The agent_id alone isn't enough for the personal scope — user_id must match too, or a mem0
     response mixing users under one namespace would leak across them."""
@@ -555,27 +554,25 @@ async def test_retrieve_for_turn_drops_a_personal_result_with_the_wrong_user_id(
     monkeypatch.setattr(mem0, "search", fake_search)
 
     block = await retrieve_for_turn(
-        db, redis_client, workspace_id=workspace.id, assistant_id=assistant.id, user_id=owner.id, query="hi"
+        db, workspace_id=workspace.id, assistant_id=assistant.id, user_id=owner.id, query="hi"
     )
 
     assert block is None
 
 
-async def test_retrieve_for_turn_returns_none_without_a_credential(
-    db: AsyncSession, redis_client: Redis
-) -> None:
+async def test_retrieve_for_turn_returns_none_without_a_credential(db: AsyncSession) -> None:
     owner, workspace = await _user_with_workspace(db, email="ret4@example.com", slug="ret-ws4")
     assistant = await _assistant(db, workspace_id=workspace.id, created_by=owner)
 
     block = await retrieve_for_turn(
-        db, redis_client, workspace_id=workspace.id, assistant_id=assistant.id, user_id=owner.id, query="hi"
+        db, workspace_id=workspace.id, assistant_id=assistant.id, user_id=owner.id, query="hi"
     )
 
     assert block is None
 
 
 async def test_retrieve_for_turn_returns_none_on_a_mem0_outage(
-    db: AsyncSession, redis_client: Redis, monkeypatch: pytest.MonkeyPatch
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     owner, workspace = await _user_with_workspace(db, email="ret5@example.com", slug="ret-ws5")
     assistant = await _assistant(db, workspace_id=workspace.id, created_by=owner)
@@ -587,72 +584,10 @@ async def test_retrieve_for_turn_returns_none_on_a_mem0_outage(
     monkeypatch.setattr(mem0, "search", failing_search)
 
     block = await retrieve_for_turn(
-        db, redis_client, workspace_id=workspace.id, assistant_id=assistant.id, user_id=owner.id, query="hi"
+        db, workspace_id=workspace.id, assistant_id=assistant.id, user_id=owner.id, query="hi"
     )
 
     assert block is None
-
-
-async def test_retrieve_for_turn_does_not_retry_without_a_pending_write_marker(
-    db: AsyncSession, redis_client: Redis, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The common case — a turn with no relevant memory at all — must not pay any retry cost:
-    no marker was ever set for this scope, so one empty search is the end of it."""
-    owner, workspace = await _user_with_workspace(db, email="ret6@example.com", slug="ret-ws6")
-    assistant = await _assistant(db, workspace_id=workspace.id, created_by=owner)
-    await _set_key(db, workspace_id=workspace.id, created_by=owner)
-    call_count = 0
-
-    async def fake_search(**kwargs: object) -> list[dict[str, object]]:
-        nonlocal call_count
-        call_count += 1
-        return []
-
-    monkeypatch.setattr(mem0, "search", fake_search)
-
-    block = await retrieve_for_turn(
-        db, redis_client, workspace_id=workspace.id, assistant_id=assistant.id, user_id=owner.id, query="hi"
-    )
-
-    assert block is None
-    assert call_count == 1
-
-
-async def test_retrieve_for_turn_retries_once_when_a_write_is_marked_pending(
-    db: AsyncSession, redis_client: Redis, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Simulates exactly the live-observed case: record_turn marked a write as pending, the first
-    search (mem0 hasn't indexed it yet) comes back empty, and the one retry finds it."""
-    owner, workspace = await _user_with_workspace(db, email="ret7@example.com", slug="ret-ws7")
-    assistant = await _assistant(db, workspace_id=workspace.id, created_by=owner)
-    await _set_key(db, workspace_id=workspace.id, created_by=owner)
-    await redis_client.set(_pending_reindex_key(workspace.id, assistant.id, owner.id), "1", ex=90)
-    call_count = 0
-
-    async def fake_search(**kwargs: object) -> list[dict[str, object]]:
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return []
-        return [
-            {
-                "id": "fresh-1",
-                "memory": "likes the song What Is Love",
-                "agent_id": personal_agent_id(workspace.id, assistant.id),
-                "user_id": user_entity_id(workspace.id, owner.id),
-            }
-        ]
-
-    monkeypatch.setattr(mem0, "search", fake_search)
-    monkeypatch.setattr("app.services.memory._REINDEX_RETRY_DELAY_SECONDS", 0.01)
-
-    block = await retrieve_for_turn(
-        db, redis_client, workspace_id=workspace.id, assistant_id=assistant.id, user_id=owner.id, query="hi"
-    )
-
-    assert call_count == 2
-    assert block is not None
-    assert "likes the song What Is Love" in block
 
 
 # ---------- record_turn ----------
@@ -697,8 +632,6 @@ async def test_record_turn_writes_to_the_personal_namespace(
     # extractor turned every song the *assistant* recommended in its own reply into a separate
     # personal memory, flooding the scope with facts about nothing the user ever said.
     assert "assistant" in str(captured["agent_custom_instructions"]).lower()
-    # And marks the write as pending, so retrieve_for_turn knows a retry may be worthwhile soon.
-    assert await redis_client.get(_pending_reindex_key(workspace.id, assistant.id, owner.id)) == "1"
 
 
 async def test_record_turn_is_a_no_op_without_a_credential(db: AsyncSession) -> None:
