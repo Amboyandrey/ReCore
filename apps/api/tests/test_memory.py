@@ -693,6 +693,10 @@ async def test_record_turn_writes_to_the_personal_namespace(
     # song X, remember that") produced zero extracted memories.
     assert captured["includes"]
     assert captured["agent_custom_instructions"]
+    # Also found live to matter in the other direction: without explicit guidance not to, the
+    # extractor turned every song the *assistant* recommended in its own reply into a separate
+    # personal memory, flooding the scope with facts about nothing the user ever said.
+    assert "assistant" in str(captured["agent_custom_instructions"]).lower()
     # And marks the write as pending, so retrieve_for_turn knows a retry may be worthwhile soon.
     assert await redis_client.get(_pending_reindex_key(workspace.id, assistant.id, owner.id)) == "1"
 

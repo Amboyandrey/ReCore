@@ -51,12 +51,15 @@ _SEARCH_THRESHOLD = 0.1
 # memories, and would silently have had no effect on these calls at all.
 _PERSONAL_MEMORY_INCLUDES = (
     "personal preferences, likes and dislikes, opinions, and anything the user explicitly asks "
-    "to be remembered"
+    "to be remembered — about the user themselves, not about the assistant's own replies"
 )
 _PERSONAL_MEMORY_INSTRUCTIONS = (
     "Capture any preference, like, dislike, or opinion the user states about themselves, even a "
     "small one (a favorite song, food, color, and similar), and anything the user explicitly "
-    "asks you to remember. Do not skip these just because they seem minor."
+    "asks you to remember. Do not skip these just because they seem minor. Do NOT create a "
+    "separate memory for each individual item, song, or fact the assistant itself lists, "
+    "recommends, or explains in its reply — only what the user actually said about themselves is "
+    "worth remembering; the assistant's own suggestions are not memories of the user."
 )
 _MEMORY_BLOCK_MAX_CHARS = 2_000
 
