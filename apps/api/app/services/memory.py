@@ -1,6 +1,5 @@
 """The memory layer (ReMind): curated facts an assistant's creator teaches it, and personal
-memories mem0 learns about each user from their own chats with it — kept in two structurally
-separate mem0 namespaces so a bug in a filter can drop a memory, never leak one.
+memories mem0 learns about each user from their own chats with it.
 
 mem0 is the store; nothing here mirrors a memory locally in Postgres. Its own `add` is
 asynchronous (it returns a queued event, not a memory id) and it consolidates and rewrites
@@ -8,6 +7,13 @@ memories on its own, so a local copy would start drifting the moment it was writ
 module keeps in Postgres instead is just the encrypted API key and the `memory_enabled` bit on
 each assistant; authorization comes from the scope encoding below plus a verify-before-delete
 step, and the audit trail is the same `audit_logs` table every other privileged action uses.
+
+Personal-memory scoping folds the assistant into the mem0 `user_id` value itself, rather than
+relying on a separate `agent_id` tag the way curated facts do — see `user_entity_id`'s own
+docstring for why: found live, mem0's own consolidation (what `infer=True` triggers) reliably
+keeps a memory's `user_id` tag intact even as it rewrites and merges raw statements into a new,
+tidied fact, but does not reliably keep every `agent_id` tag it started with. A memory scoped
+only by a tag that can silently disappear isn't scoped at all once it does.
 """
 
 import uuid
@@ -51,17 +57,23 @@ def curated_agent_id(workspace_id: uuid.UUID, assistant_id: uuid.UUID) -> str:
 
 
 def personal_agent_id(workspace_id: uuid.UUID, assistant_id: uuid.UUID) -> str:
-    """The mem0 namespace for what this assistant has learned about individual users — always
-    paired with a `user_id` (see user_entity_id) so one user's chats can never surface in
-    another's. A *different* agent_id than curated_agent_id's, not the same one distinguished by
-    the presence of user_id — sharing one namespace would make any query that filters on
-    agent_id alone return every user's personal memories at once."""
+    """Still sent as the `agent_id` on every personal-scope write, and still a different value
+    than `curated_agent_id`'s — but advisory now, not authoritative: nothing in this module's own
+    filters relies on it surviving. See `user_entity_id` for the value that actually does."""
     return f"ws:{workspace_id}:assistant:{assistant_id}:user"
 
 
-def user_entity_id(workspace_id: uuid.UUID, user_id: uuid.UUID) -> str:
-    """The mem0 `user_id` value for one member of one workspace."""
-    return f"ws:{workspace_id}:user:{user_id}"
+def user_entity_id(workspace_id: uuid.UUID, assistant_id: uuid.UUID, user_id: uuid.UUID) -> str:
+    """The mem0 `user_id` value for one member's personal memories with one specific assistant —
+    the assistant is folded into this string itself, rather than left to a separate `agent_id`
+    tag the way curated facts scope by one alone. Found live to matter: mem0's own consolidation
+    keeps a memory's `user_id` tag intact even when it rewrites and merges several raw statements
+    into one new, tidied fact, but does not reliably keep every `agent_id` tag from the original
+    writes on that new memory. Scoping personal memories by the value mem0 actually preserves is
+    what keeps one assistant's memories of a user from becoming unscoped — not leaked to another
+    assistant, just untethered from any — the moment mem0 tidies them.
+    """
+    return f"ws:{workspace_id}:assistant:{assistant_id}:user:{user_id}"
 
 
 # ---------- Credential ----------
@@ -188,11 +200,8 @@ async def list_personal(
     "list every user's personal memories" function anywhere in this module, on purpose."""
     await get_assistant(db, workspace_id=workspace_id, assistant_id=assistant_id)
     api_key = await _require_api_key(db, workspace_id=workspace_id)
-    ns = personal_agent_id(workspace_id, assistant_id)
-    entity = user_entity_id(workspace_id, user_id)
-    results = await mem0.list_memories(
-        api_key=api_key, filters={"AND": [{"agent_id": ns}, {"user_id": entity}]}
-    )
+    entity = user_entity_id(workspace_id, assistant_id, user_id)
+    results = await mem0.list_memories(api_key=api_key, filters={"user_id": entity})
     if results is None:
         raise MemoryUpstreamError()
     return results
@@ -224,13 +233,7 @@ async def delete_memory(
         _assert_can_manage_curated(assistant, caller_id=caller_id, is_owner=is_owner)
         filters: dict[str, object] = {"agent_id": curated_agent_id(workspace_id, assistant_id)}
     else:
-        entity = user_entity_id(workspace_id, caller_id)
-        filters = {
-            "AND": [
-                {"agent_id": personal_agent_id(workspace_id, assistant_id)},
-                {"user_id": entity},
-            ]
-        }
+        filters = {"user_id": user_entity_id(workspace_id, assistant_id, caller_id)}
 
     existing = await mem0.list_memories(api_key=api_key, filters=filters)
     if existing is None:
@@ -269,18 +272,12 @@ async def retrieve_for_turn(
     api_key = decrypt_secret(secret)
 
     curated_ns = curated_agent_id(workspace_id, assistant_id)
-    personal_ns = personal_agent_id(workspace_id, assistant_id)
-    entity = user_entity_id(workspace_id, user_id)
+    entity = user_entity_id(workspace_id, assistant_id, user_id)
 
     results = await mem0.search(
         api_key=api_key,
         query=query,
-        filters={
-            "OR": [
-                {"agent_id": curated_ns},
-                {"AND": [{"agent_id": personal_ns}, {"user_id": entity}]},
-            ]
-        },
+        filters={"OR": [{"agent_id": curated_ns}, {"user_id": entity}]},
         top_k=_SEARCH_TOP_K,
         threshold=_SEARCH_THRESHOLD,
         rerank=True,
@@ -289,15 +286,11 @@ async def retrieve_for_turn(
         return None
 
     # Post-filtered against the two scopes this exact call is entitled to, independent of
-    # whether mem0's own filter is applied correctly — a row missing or mismatching agent_id (or,
-    # for the personal scope, user_id) is dropped rather than trusted, so a filtering bug on
-    # mem0's side can only ever hide a memory, never leak one that isn't this caller's to see.
-    kept = [
-        r
-        for r in results
-        if r.get("agent_id") == curated_ns
-        or (r.get("agent_id") == personal_ns and r.get("user_id") == entity)
-    ]
+    # whether mem0's own filter is applied correctly — a row missing or mismatching agent_id (for
+    # the curated scope) or user_id (for the personal one) is dropped rather than trusted, so a
+    # filtering bug on mem0's side can only ever hide a memory, never leak one that isn't this
+    # caller's to see.
+    kept = [r for r in results if r.get("agent_id") == curated_ns or r.get("user_id") == entity]
     if not kept:
         return None
 
@@ -352,7 +345,7 @@ async def record_turn(
         api_key=api_key,
         messages=[{"role": "user", "content": user_message}],
         agent_id=personal_agent_id(workspace_id, assistant_id),
-        user_id=user_entity_id(workspace_id, user_id),
+        user_id=user_entity_id(workspace_id, assistant_id, user_id),
         infer=True,
     )
     if not ok:

@@ -107,9 +107,12 @@ def test_curated_and_personal_use_distinct_namespaces() -> None:
     assert "curated" not in personal
 
 
-def test_user_entity_id_is_scoped_to_workspace() -> None:
-    ws1, ws2, user = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
-    assert user_entity_id(ws1, user) != user_entity_id(ws2, user)
+def test_user_entity_id_is_scoped_to_workspace_and_assistant() -> None:
+    """The assistant is folded into this value itself — see its own docstring for why personal
+    scoping doesn't rely on a separate agent_id tag the way curated does."""
+    ws1, ws2, aid1, aid2, user = uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    assert user_entity_id(ws1, aid1, user) != user_entity_id(ws2, aid1, user)
+    assert user_entity_id(ws1, aid1, user) != user_entity_id(ws1, aid2, user)
 
 
 # ---------- Credential ----------
@@ -313,8 +316,8 @@ async def test_list_personal_only_ever_queries_the_caller_s_own_entity(
     await list_personal(db, workspace_id=workspace.id, assistant_id=assistant.id, user_id=user_b.id)
 
     filters = captured["filters"]
-    assert {"user_id": user_entity_id(workspace.id, user_b.id)} in filters["AND"]  # type: ignore[index]
-    assert user_entity_id(workspace.id, owner.id) not in str(filters)
+    assert filters == {"user_id": user_entity_id(workspace.id, assistant.id, user_b.id)}
+    assert user_entity_id(workspace.id, assistant.id, owner.id) not in str(filters)
 
 
 async def test_a_workspace_owner_cannot_delete_another_member_s_personal_memory(
@@ -332,7 +335,7 @@ async def test_a_workspace_owner_cannot_delete_another_member_s_personal_memory(
         filters = kwargs["filters"]
         # ...but the owner's delete call scopes the list to the *owner's own* entity, which never
         # matches user_b's memory — simulating mem0 correctly reporting nothing for that filter.
-        if user_entity_id(workspace.id, user_b.id) in str(filters):
+        if user_entity_id(workspace.id, assistant.id, user_b.id) in str(filters):
             return [{"id": "mem-b-1", "memory": "user b's secret"}]
         return []
 
@@ -488,14 +491,8 @@ async def test_retrieve_for_turn_sends_the_expected_or_filter(
 
     filters = captured["filters"]
     curated_ns = curated_agent_id(workspace.id, assistant.id)
-    personal_ns = personal_agent_id(workspace.id, assistant.id)
-    entity = user_entity_id(workspace.id, owner.id)
-    assert filters == {
-        "OR": [
-            {"agent_id": curated_ns},
-            {"AND": [{"agent_id": personal_ns}, {"user_id": entity}]},
-        ]
-    }
+    entity = user_entity_id(workspace.id, assistant.id, owner.id)
+    assert filters == {"OR": [{"agent_id": curated_ns}, {"user_id": entity}]}
     assert captured["rerank"] is True
 
 
@@ -516,7 +513,7 @@ async def test_retrieve_for_turn_drops_a_result_outside_the_caller_s_scopes(
                 "id": "mine-1",
                 "memory": "my own fact",
                 "agent_id": personal_agent_id(workspace.id, assistant.id),
-                "user_id": user_entity_id(workspace.id, owner.id),
+                "user_id": user_entity_id(workspace.id, assistant.id, owner.id),
             },
         ]
 
@@ -547,7 +544,7 @@ async def test_retrieve_for_turn_drops_a_personal_result_with_the_wrong_user_id(
                 "id": "other-1",
                 "memory": "belongs to someone else",
                 "agent_id": personal_agent_id(workspace.id, assistant.id),
-                "user_id": user_entity_id(workspace.id, other_user_id),
+                "user_id": user_entity_id(workspace.id, assistant.id, other_user_id),
             }
         ]
 
@@ -558,6 +555,38 @@ async def test_retrieve_for_turn_drops_a_personal_result_with_the_wrong_user_id(
     )
 
     assert block is None
+
+
+async def test_retrieve_for_turn_finds_a_personal_memory_with_no_agent_id_tag_at_all(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact bug found live: mem0's own consolidation (what infer=True triggers) rewrites
+    several raw statements into one new, tidied fact, and that new memory doesn't reliably carry
+    forward every original agent_id tag — sometimes it has none at all. Personal-scope matching
+    must not depend on that tag surviving, only on user_id (which mem0 does reliably keep)."""
+    owner, workspace = await _user_with_workspace(db, email="ret6@example.com", slug="ret-ws6")
+    assistant = await _assistant(db, workspace_id=workspace.id, created_by=owner)
+    await _set_key(db, workspace_id=workspace.id, created_by=owner)
+
+    async def fake_search(**kwargs: object) -> list[dict[str, object]]:
+        del kwargs
+        return [
+            {
+                "id": "consolidated-1",
+                "memory": "User's bias (favorite TWICE member) is Sana",
+                "user_id": user_entity_id(workspace.id, assistant.id, owner.id),
+                # no agent_id at all — this is what mem0 actually returned live
+            }
+        ]
+
+    monkeypatch.setattr(mem0, "search", fake_search)
+
+    block = await retrieve_for_turn(
+        db, workspace_id=workspace.id, assistant_id=assistant.id, user_id=owner.id, query="who is my bias"
+    )
+
+    assert block is not None
+    assert "Sana" in block
 
 
 async def test_retrieve_for_turn_returns_none_without_a_credential(db: AsyncSession) -> None:
@@ -616,7 +645,7 @@ async def test_record_turn_writes_to_the_personal_namespace(
     )
 
     assert captured["agent_id"] == personal_agent_id(workspace.id, assistant.id)
-    assert captured["user_id"] == user_entity_id(workspace.id, owner.id)
+    assert captured["user_id"] == user_entity_id(workspace.id, assistant.id, owner.id)
     # Plain infer=True — mem0's own classifier, with no bias fields and no pre-filtering of our
     # own layered on top. See record_turn's own docstring for why both of those were tried and
     # backed out.
