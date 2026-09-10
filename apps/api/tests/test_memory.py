@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import EncryptedSecret, decrypt_secret
-from app.core.errors import InsufficientRole, MemoryNotConfigured, MemoryNotFound
+from app.core.errors import InsufficientRole, MemoryNotConfigured, MemoryNotFound, MemoryUpstreamError
 from app.memory import mem0
 from app.models import Assistant, FeatureFlag, FlagScope, Role, User, Workspace, WorkspaceMember
 from app.services.assistants import create_assistant
@@ -231,6 +231,48 @@ async def test_add_curated_without_a_credential_raises(db: AsyncSession) -> None
         )
 
 
+async def test_add_curated_raises_when_mem0_rejects_the_request(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deliberate, user-initiated action — unlike the chat pipeline's own writes, this must not
+    silently report success (mem0.add() returning False, e.g. an invalid API key) as if the fact
+    were actually queued. Caught live: the first version of this let exactly that happen."""
+    user, workspace = await _user_with_workspace(db, email="cur6@example.com", slug="cur-ws6")
+    assistant = await _assistant(db, workspace_id=workspace.id, created_by=user)
+    await _set_key(db, workspace_id=workspace.id, created_by=user)
+
+    async def rejecting_add(**kwargs: object) -> bool:
+        del kwargs
+        return False  # what mem0.add() itself returns on a non-2xx or transport failure
+
+    monkeypatch.setattr(mem0, "add", rejecting_add)
+
+    with pytest.raises(MemoryUpstreamError):
+        await add_curated(
+            db, workspace_id=workspace.id, assistant_id=assistant.id,
+            caller_id=user.id, is_owner=False, text="x",
+        )
+
+
+async def test_list_curated_raises_on_a_mem0_outage(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed list must not be indistinguishable from a genuinely empty one — the settings page
+    needs to tell "nothing here yet" apart from "couldn't check"."""
+    user, workspace = await _user_with_workspace(db, email="cur7@example.com", slug="cur-ws7")
+    assistant = await _assistant(db, workspace_id=workspace.id, created_by=user)
+    await _set_key(db, workspace_id=workspace.id, created_by=user)
+
+    async def failing_list(**kwargs: object) -> None:
+        del kwargs
+        return None
+
+    monkeypatch.setattr(mem0, "list_memories", failing_list)
+
+    with pytest.raises(MemoryUpstreamError):
+        await list_curated(db, workspace_id=workspace.id, assistant_id=assistant.id)
+
+
 async def test_list_curated_is_visible_to_any_member(
     db: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -353,6 +395,54 @@ async def test_deleting_a_curated_memory_that_exists_succeeds(
     )
 
     assert deleted == {"api_key": "m0-test-key", "memory_id": "c-1"}
+
+
+async def test_deleting_a_memory_raises_when_mem0_cannot_be_reached_to_verify(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Distinct from MemoryNotFound: this is "couldn't even check," not "checked, wasn't there" —
+    conflating the two would tell a user their memory doesn't exist when the truth is mem0 is
+    just unreachable right now."""
+    creator, workspace = await _user_with_workspace(db, email="pers6@example.com", slug="pers-ws6")
+    assistant = await _assistant(db, workspace_id=workspace.id, created_by=creator)
+    await _set_key(db, workspace_id=workspace.id, created_by=creator)
+
+    async def failing_list(**kwargs: object) -> None:
+        del kwargs
+        return None
+
+    monkeypatch.setattr(mem0, "list_memories", failing_list)
+
+    with pytest.raises(MemoryUpstreamError):
+        await delete_memory(
+            db, workspace_id=workspace.id, assistant_id=assistant.id,
+            memory_id="c-1", scope="curated", caller_id=creator.id, is_owner=False,
+        )
+
+
+async def test_deleting_a_memory_raises_when_the_delete_call_itself_fails(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    creator, workspace = await _user_with_workspace(db, email="pers7@example.com", slug="pers-ws7")
+    assistant = await _assistant(db, workspace_id=workspace.id, created_by=creator)
+    await _set_key(db, workspace_id=workspace.id, created_by=creator)
+
+    async def fake_list(**kwargs: object) -> list[dict[str, object]]:
+        del kwargs
+        return [{"id": "c-1", "memory": "curated fact"}]
+
+    async def failing_delete(**kwargs: object) -> bool:
+        del kwargs
+        return False
+
+    monkeypatch.setattr(mem0, "list_memories", fake_list)
+    monkeypatch.setattr(mem0, "delete", failing_delete)
+
+    with pytest.raises(MemoryUpstreamError):
+        await delete_memory(
+            db, workspace_id=workspace.id, assistant_id=assistant.id,
+            memory_id="c-1", scope="curated", caller_id=creator.id, is_owner=False,
+        )
 
 
 async def test_deleting_a_curated_memory_rejects_a_non_creator_non_owner(

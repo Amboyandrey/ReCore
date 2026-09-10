@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import EncryptedSecret, decrypt_secret, encrypt_secret
 from app.core.db import async_session_factory, set_workspace_scope
-from app.core.errors import InsufficientRole, MemoryNotConfigured, MemoryNotFound
+from app.core.errors import InsufficientRole, MemoryNotConfigured, MemoryNotFound, MemoryUpstreamError
 from app.core.logging import get_logger
 from app.memory import mem0
 from app.models import Assistant, MemoryCredential, User
@@ -139,7 +139,9 @@ async def list_curated(
     api_key = await _require_api_key(db, workspace_id=workspace_id)
     ns = curated_agent_id(workspace_id, assistant_id)
     results = await mem0.list_memories(api_key=api_key, filters={"agent_id": ns})
-    return results or []
+    if results is None:
+        raise MemoryUpstreamError()
+    return results
 
 
 async def add_curated(
@@ -158,13 +160,15 @@ async def add_curated(
     _assert_can_manage_curated(assistant, caller_id=caller_id, is_owner=is_owner)
     api_key = await _require_api_key(db, workspace_id=workspace_id)
     ns = curated_agent_id(workspace_id, assistant_id)
-    await mem0.add(
+    ok = await mem0.add(
         api_key=api_key,
         messages=[{"role": "user", "content": text}],
         agent_id=ns,
         infer=False,
         immutable=True,
     )
+    if not ok:
+        raise MemoryUpstreamError()
 
 
 # ---------- Personal memories ----------
@@ -182,7 +186,9 @@ async def list_personal(
     results = await mem0.list_memories(
         api_key=api_key, filters={"AND": [{"agent_id": ns}, {"user_id": entity}]}
     )
-    return results or []
+    if results is None:
+        raise MemoryUpstreamError()
+    return results
 
 
 # ---------- Deleting a memory, safely ----------
@@ -220,10 +226,15 @@ async def delete_memory(
         }
 
     existing = await mem0.list_memories(api_key=api_key, filters=filters)
-    if existing is None or not any(str(m.get("id")) == memory_id for m in existing):
+    if existing is None:
+        # Couldn't even check — genuinely different from "checked, and it wasn't there" (below),
+        # which is why this isn't folded into the same 404 as a real not-found.
+        raise MemoryUpstreamError()
+    if not any(str(m.get("id")) == memory_id for m in existing):
         raise MemoryNotFound()
 
-    await mem0.delete(api_key=api_key, memory_id=memory_id)
+    if not await mem0.delete(api_key=api_key, memory_id=memory_id):
+        raise MemoryUpstreamError()
 
 
 # ---------- The chat-pipeline hooks ----------
