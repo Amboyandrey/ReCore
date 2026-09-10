@@ -740,7 +740,6 @@ async def _run_generation(
                 assistant_id=memory_assistant_id,
                 user_id=user_id,
                 user_message=user_content,
-                assistant_message="".join(text_parts),
             )
         )
         _background_tasks.add(memory_task)

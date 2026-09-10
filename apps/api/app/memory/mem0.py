@@ -38,33 +38,29 @@ async def add(
     user_id: str | None = None,
     infer: bool = True,
     immutable: bool = False,
-    includes: str | None = None,
-    agent_custom_instructions: str | None = None,
 ) -> bool:
     """Queue `messages` to be turned into memories under `agent_id` (and `user_id`, if given).
 
     mem0 processes this asynchronously — a `True` return means the request was accepted, not that
     extraction has finished (or that it produced anything: `infer=True` is a genuine LLM
-    classifier on mem0's side, which can decide a turn has nothing memorable in it at all).
-    `infer=False` stores the given text verbatim instead of having mem0 interpret it, which is
-    what a deliberately curated fact wants; `immutable=True` excludes it from mem0's own later
-    consolidation, so chat-driven learning can never silently rewrite it.
+    classifier on mem0's side, which can decide a turn has nothing memorable in it at all — see
+    services/memory.py's record_turn for why every caller in this codebase now uses `infer=False`
+    instead). `infer=False` stores the given text verbatim, skipping that classifier entirely;
+    `immutable=True` excludes a memory from mem0's own later consolidation, so chat-driven
+    learning can never silently rewrite a deliberately curated fact.
 
-    `includes` and `agent_custom_instructions` both bias that classifier rather than overriding
-    it — see services/memory.py's own use of them for why the latter, specifically, is the field
-    that actually governs extraction here: mem0 documents `custom_instructions` as covering only
-    non-assistant memories once both `agent_id` and `user_id` are present on the same call (its
-    "hybrid mode"), which every call this module makes with `user_id` set always is.
+    Deliberately doesn't expose `includes`/`agent_custom_instructions` (real, documented mem0
+    parameters meant to bias that classifier): live testing found the *effective* instructions
+    mem0 actually applied to an agent-scoped, `infer=True` call weren't the ones sent in the
+    request at all — something in mem0's own handling substituted a different, agent-persona
+    -oriented prompt in their place. Re-add them here only alongside a live-verified case where
+    they're confirmed to actually govern the call they're sent on.
     """
     body: dict[str, object] = {"messages": messages, "agent_id": agent_id, "infer": infer}
     if user_id is not None:
         body["user_id"] = user_id
     if immutable:
         body["immutable"] = True
-    if includes is not None:
-        body["includes"] = includes
-    if agent_custom_instructions is not None:
-        body["agent_custom_instructions"] = agent_custom_instructions
     try:
         async with _client(api_key) as client:
             response = await client.post("/v3/memories/add/", json=body)

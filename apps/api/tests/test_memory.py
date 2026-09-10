@@ -613,25 +613,14 @@ async def test_record_turn_writes_to_the_personal_namespace(
         assistant_id=assistant.id,
         user_id=owner.id,
         user_message="Hello",
-        assistant_message="Hi there",
     )
 
     assert captured["agent_id"] == personal_agent_id(workspace.id, assistant.id)
     assert captured["user_id"] == user_entity_id(workspace.id, owner.id)
-    assert captured["infer"] is True
-    assert captured["messages"] == [
-        {"role": "user", "content": "Hello"},
-        {"role": "assistant", "content": "Hi there"},
-    ]
-    # Biases mem0's own extraction classifier toward capturing preferences and explicit "remember
-    # this" requests — found live to matter: without these, a clearly stated preference ("I like
-    # song X, remember that") produced zero extracted memories.
-    assert captured["includes"]
-    assert captured["agent_custom_instructions"]
-    # Also found live to matter in the other direction: without explicit guidance not to, the
-    # extractor turned every song the *assistant* recommended in its own reply into a separate
-    # personal memory, flooding the scope with facts about nothing the user ever said.
-    assert "assistant" in str(captured["agent_custom_instructions"]).lower()
+    # Stored verbatim, like a curated fact — see record_turn's own docstring for why relying on
+    # mem0's extraction classifier (infer=True) was tried twice and failed live both times.
+    assert captured["infer"] is False
+    assert captured["messages"] == [{"role": "user", "content": "Hello"}]
 
 
 async def test_record_turn_is_a_no_op_without_a_credential(db: AsyncSession) -> None:
@@ -642,8 +631,7 @@ async def test_record_turn_is_a_no_op_without_a_credential(db: AsyncSession) -> 
     # No mem0.add monkeypatch — if this tried to reach the real network it would time out and
     # fail the test; reaching the end without one proves it returned early.
     await record_turn(
-        workspace_id=workspace.id, assistant_id=assistant.id, user_id=owner.id,
-        user_message="Hello", assistant_message="Hi",
+        workspace_id=workspace.id, assistant_id=assistant.id, user_id=owner.id, user_message="Hello"
     )
 
 

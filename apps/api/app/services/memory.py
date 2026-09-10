@@ -38,26 +38,6 @@ Scope = Literal["curated", "personal"]
 # score well below what a dense, large corpus's matches typically would.
 _SEARCH_TOP_K = 20
 _SEARCH_THRESHOLD = 0.1
-
-# Biases mem0's own extraction classifier for record_turn()'s writes — observed live to be needed:
-# a user explicitly saying "I like song X, remember that", with the assistant confirming it back,
-# still produced zero extracted memories without this. `agent_custom_instructions`, specifically
-# — not the more commonly-referenced `custom_instructions` — is what actually governs extraction
-# here, per mem0's own docs: once both `agent_id` and `user_id` are on one call (mem0's "hybrid
-# mode", which every personal-scope write is), `custom_instructions` covers only *non-assistant*
-# memories, and would silently have had no effect on these calls at all.
-_PERSONAL_MEMORY_INCLUDES = (
-    "personal preferences, likes and dislikes, opinions, and anything the user explicitly asks "
-    "to be remembered — about the user themselves, not about the assistant's own replies"
-)
-_PERSONAL_MEMORY_INSTRUCTIONS = (
-    "Capture any preference, like, dislike, or opinion the user states about themselves, even a "
-    "small one (a favorite song, food, color, and similar), and anything the user explicitly "
-    "asks you to remember. Do not skip these just because they seem minor. Do NOT create a "
-    "separate memory for each individual item, song, or fact the assistant itself lists, "
-    "recommends, or explains in its reply — only what the user actually said about themselves is "
-    "worth remembering; the assistant's own suggestions are not memories of the user."
-)
 _MEMORY_BLOCK_MAX_CHARS = 2_000
 
 
@@ -336,12 +316,24 @@ async def record_turn(
     assistant_id: uuid.UUID,
     user_id: uuid.UUID,
     user_message: str,
-    assistant_message: str,
 ) -> None:
     """Let mem0 learn from one completed turn — always into the *personal* scope. There is no
     parameter here capable of targeting the curated scope: "chatting fine-tunes the assistant"
     isn't a bug that can be introduced later by a careless call site, it's unexpressible by this
     function's own signature.
+
+    Stored verbatim (`infer=False`), the same way a curated fact is, rather than left to mem0's
+    own extraction classifier — tried twice (biasing it with `includes`/`agent_custom_instructions`
+    toward capturing preferences, then narrowing it again to stop it also capturing the
+    assistant's own suggestions as if they were the user's) and found live, both times, to still
+    silently produce zero memories from a plain, explicit statement of a preference. mem0's own
+    dashboard showed the *effective* instructions governing that call weren't the ones this
+    module sent at all — something in mem0's own handling of an agent-scoped, `infer=True` call
+    was substituting a completely different, agent-persona-oriented prompt in their place, not
+    what our own request was documented to control. Verbatim storage sidesteps that class of
+    problem entirely: there's no classification step left for anything to silently override.
+    Only the user's own words are stored — the assistant's reply isn't, so a long response
+    doesn't become "memory" in its own right.
 
     Runs fire-and-forget from _run_generation, after that generation's own reply has already been
     committed and its terminal SSE event sent — so a slow or unreachable mem0 can never delay a
@@ -360,15 +352,10 @@ async def record_turn(
 
     ok = await mem0.add(
         api_key=api_key,
-        messages=[
-            {"role": "user", "content": user_message},
-            {"role": "assistant", "content": assistant_message},
-        ],
+        messages=[{"role": "user", "content": user_message}],
         agent_id=personal_agent_id(workspace_id, assistant_id),
         user_id=user_entity_id(workspace_id, user_id),
-        infer=True,
-        includes=_PERSONAL_MEMORY_INCLUDES,
-        agent_custom_instructions=_PERSONAL_MEMORY_INSTRUCTIONS,
+        infer=False,
     )
     if not ok:
         logger.warning(

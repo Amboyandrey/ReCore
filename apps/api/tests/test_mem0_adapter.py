@@ -61,34 +61,6 @@ async def test_add_omits_user_id_and_sets_immutable_when_given(
     assert body["immutable"] is True
 
 
-async def test_add_sends_includes_and_agent_custom_instructions_only_when_given(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    bodies: list[bytes] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        bodies.append(request.content)
-        return httpx.Response(200, json={"event_id": "evt-3", "status": "PENDING"})
-
-    monkeypatch.setattr(mem0, "_transport", httpx.MockTransport(handler))
-
-    await mem0.add(
-        api_key="m0-x",
-        messages=[{"role": "user", "content": "x"}],
-        agent_id="ns-1",
-        includes="preferences",
-        agent_custom_instructions="capture likes and dislikes",
-    )
-    await mem0.add(api_key="m0-x", messages=[{"role": "user", "content": "x"}], agent_id="ns-1")
-
-    with_hints = json.loads(bodies[0])
-    without_hints = json.loads(bodies[1])
-    assert with_hints["includes"] == "preferences"
-    assert with_hints["agent_custom_instructions"] == "capture likes and dislikes"
-    assert "includes" not in without_hints
-    assert "agent_custom_instructions" not in without_hints
-
-
 async def test_add_returns_false_on_a_rejected_key(monkeypatch: pytest.MonkeyPatch) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={"detail": "invalid api key"})
