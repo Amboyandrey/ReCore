@@ -434,6 +434,7 @@ async def send_message(
         memory_assistant_id = assistant.id
         memory_block = await retrieve_for_turn(
             db,
+            redis,
             workspace_id=workspace_id,
             assistant_id=assistant.id,
             user_id=conversation.user_id,

@@ -10,15 +10,18 @@ each assistant; authorization comes from the scope encoding below plus a verify-
 step, and the audit trail is the same `audit_logs` table every other privileged action uses.
 """
 
+import asyncio
 import uuid
 from typing import Literal
 
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import EncryptedSecret, decrypt_secret, encrypt_secret
 from app.core.db import async_session_factory, set_workspace_scope
 from app.core.errors import InsufficientRole, MemoryNotConfigured, MemoryNotFound, MemoryUpstreamError
 from app.core.logging import get_logger
+from app.core.redis import new_redis_client
 from app.memory import mem0
 from app.models import Assistant, MemoryCredential, User
 from app.services.assistants import get_assistant
@@ -56,6 +59,20 @@ _PERSONAL_MEMORY_INSTRUCTIONS = (
     "asks you to remember. Do not skip these just because they seem minor."
 )
 _MEMORY_BLOCK_MAX_CHARS = 2_000
+
+# record_turn()'s `add()` reports success once mem0 *accepts* a memory for extraction, not once
+# it's actually searchable — observed live to lag real search calls by well over a minute for a
+# personal-scope write. Retrying every empty search on a fixed delay would be the wrong trade:
+# most turns have no relevant memory at all, and that (common, legitimate) case shouldn't pay
+# extra latency for a problem it doesn't have. Instead, record_turn marks in Redis, with a TTL,
+# that *this exact (workspace, assistant, user)* has a write that may still be indexing —
+# retrieve_for_turn only pays the retry's cost when that marker says it's actually warranted.
+_PENDING_REINDEX_TTL_SECONDS = 90
+_REINDEX_RETRY_DELAY_SECONDS = 3.0
+
+
+def _pending_reindex_key(workspace_id: uuid.UUID, assistant_id: uuid.UUID, user_id: uuid.UUID) -> str:
+    return f"memory:pending:{workspace_id}:{assistant_id}:{user_id}"
 
 
 # ---------- Scope encoding — the only place these strings are built ----------
@@ -264,8 +281,35 @@ async def delete_memory(
 # ---------- The chat-pipeline hooks ----------
 
 
+async def _search_and_filter(
+    api_key: str, *, query: str, filters: dict[str, object], curated_ns: str, personal_ns: str, entity: str
+) -> list[dict[str, object]]:
+    """One search call, then post-filtered against the two scopes this exact caller is entitled
+    to — independent of whether mem0's own filter is applied correctly. A row missing or
+    mismatching `agent_id` (or, for the personal scope, `user_id`) is dropped rather than
+    trusted, so a filtering bug on mem0's side can only ever hide a memory, never leak one that
+    isn't this caller's to see."""
+    results = await mem0.search(
+        api_key=api_key,
+        query=query,
+        filters=filters,
+        top_k=_SEARCH_TOP_K,
+        threshold=_SEARCH_THRESHOLD,
+        rerank=True,
+    )
+    if not results:
+        return []
+    return [
+        r
+        for r in results
+        if r.get("agent_id") == curated_ns
+        or (r.get("agent_id") == personal_ns and r.get("user_id") == entity)
+    ]
+
+
 async def retrieve_for_turn(
     db: AsyncSession,
+    redis: Redis,
     *,
     workspace_id: uuid.UUID,
     assistant_id: uuid.UUID,
@@ -288,33 +332,31 @@ async def retrieve_for_turn(
     curated_ns = curated_agent_id(workspace_id, assistant_id)
     personal_ns = personal_agent_id(workspace_id, assistant_id)
     entity = user_entity_id(workspace_id, user_id)
+    filters: dict[str, object] = {
+        "OR": [
+            {"agent_id": curated_ns},
+            {"AND": [{"agent_id": personal_ns}, {"user_id": entity}]},
+        ]
+    }
 
-    results = await mem0.search(
-        api_key=api_key,
-        query=query,
-        filters={
-            "OR": [
-                {"agent_id": curated_ns},
-                {"AND": [{"agent_id": personal_ns}, {"user_id": entity}]},
-            ]
-        },
-        top_k=_SEARCH_TOP_K,
-        threshold=_SEARCH_THRESHOLD,
-        rerank=True,
+    kept = await _search_and_filter(
+        api_key, query=query, filters=filters, curated_ns=curated_ns, personal_ns=personal_ns, entity=entity
     )
-    if not results:
-        return None
-
-    # Post-filtered against the two scopes this exact call is entitled to, independent of
-    # whether mem0's own filter is applied correctly — a row missing or mismatching agent_id (or,
-    # for the personal scope, user_id) is dropped rather than trusted, so a filtering bug on
-    # mem0's side can only ever hide a memory, never leak one that isn't this caller's to see.
-    kept = [
-        r
-        for r in results
-        if r.get("agent_id") == curated_ns
-        or (r.get("agent_id") == personal_ns and r.get("user_id") == entity)
-    ]
+    if not kept and await redis.get(_pending_reindex_key(workspace_id, assistant_id, user_id)):
+        # A write for this exact (workspace, assistant, user) was queued recently enough that it
+        # may not be searchable yet (see record_turn) — worth one bounded retry rather than
+        # silently treating "not indexed yet" the same as "nothing relevant exists." Every other
+        # empty search (the common case — most turns have no relevant memory at all) skips this
+        # entirely and pays no extra latency for a problem it doesn't have.
+        await asyncio.sleep(_REINDEX_RETRY_DELAY_SECONDS)
+        kept = await _search_and_filter(
+            api_key,
+            query=query,
+            filters=filters,
+            curated_ns=curated_ns,
+            personal_ns=personal_ns,
+            entity=entity,
+        )
     if not kept:
         return None
 
@@ -342,8 +384,8 @@ async def record_turn(
 
     Runs fire-and-forget from _run_generation, after that generation's own reply has already been
     committed and its terminal SSE event sent — so a slow or unreachable mem0 can never delay a
-    reply reaching its reader. Opens its own database session for exactly that reason: whatever
-    session the generation used is already closed by the time this runs.
+    reply reaching its reader. Opens its own database session and Redis client for exactly that
+    reason: whichever ones the generation used are already closed by the time this runs.
     """
     async with async_session_factory() as db:
         await set_workspace_scope(db, workspace_id)
@@ -371,3 +413,16 @@ async def record_turn(
         logger.warning(
             "memory.record_turn_failed", workspace_id=str(workspace_id), assistant_id=str(assistant_id)
         )
+        return
+
+    # Marks that a search against this exact scope, soon, may need retrieve_for_turn's one retry
+    # — mem0 accepted this write, but that isn't the same moment as it becoming searchable.
+    redis = new_redis_client()
+    try:
+        await redis.set(
+            _pending_reindex_key(workspace_id, assistant_id, user_id),
+            "1",
+            ex=_PENDING_REINDEX_TTL_SECONDS,
+        )
+    finally:
+        await redis.aclose()
