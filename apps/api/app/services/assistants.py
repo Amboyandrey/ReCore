@@ -55,6 +55,7 @@ async def create_assistant(
     instructions: str,
     model_id: uuid.UUID | None,
     tool_ids: list[uuid.UUID],
+    memory_enabled: bool = False,
 ) -> Assistant:
     """Save a new assistant. `model_id` and every id in `tool_ids` must already belong to this
     workspace — the same 404 a stale or cross-workspace id gets anywhere else in this codebase."""
@@ -68,6 +69,7 @@ async def create_assistant(
         instructions=instructions,
         model_id=model_id,
         created_by=created_by.id,
+        memory_enabled=memory_enabled,
     )
     db.add(assistant)
     await db.flush()
@@ -132,6 +134,8 @@ async def update_assistant(
         tool_ids = changes["tool_ids"] or []
         await _assert_tools_in_workspace(db, workspace_id=workspace_id, tool_ids=tool_ids)
         await _set_assistant_tools(db, assistant_id=assistant.id, tool_ids=tool_ids)
+    if "memory_enabled" in changes:
+        assistant.memory_enabled = bool(changes["memory_enabled"])
     await db.flush()
     await db.refresh(assistant)  # same onupdate=func.now() reload update_tool() needs
     return assistant

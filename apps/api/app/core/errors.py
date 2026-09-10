@@ -218,3 +218,20 @@ class AssistantNotFound(AppError):
 
     status_code = 404
     detail = "Assistant not found."
+
+
+class MemoryNotConfigured(AppError):
+    """Raised when a memory route is used before the workspace has set a mem0 API key."""
+
+    status_code = 409
+    detail = "This workspace hasn't set a memory (mem0) API key yet."
+
+
+class MemoryNotFound(AppError):
+    """Raised for a memory id that doesn't exist in the scope (curated or personal) it was
+    looked up under — including one that exists in mem0 but under a different scope, which gets
+    exactly the same 404 as one that doesn't exist at all (see services/memory.py's own
+    docstring for why the caller never gets to tell the difference)."""
+
+    status_code = 404
+    detail = "Memory not found."

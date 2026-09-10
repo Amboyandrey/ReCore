@@ -32,6 +32,7 @@ async def _to_assistant_out(db: AsyncSession, assistant: Assistant) -> Assistant
         instructions=assistant.instructions,
         model_id=assistant.model_id,
         tool_ids=tool_ids,
+        memory_enabled=assistant.memory_enabled,
         created_at=assistant.created_at,
     )
 
@@ -52,6 +53,7 @@ async def create_assistant_route(
         instructions=body.instructions,
         model_id=body.model_id,
         tool_ids=body.tool_ids,
+        memory_enabled=body.memory_enabled,
     )
     await record_audit(
         db,
