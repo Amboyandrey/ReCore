@@ -9,7 +9,11 @@ into "no memories this turn," not a broken generation.
 import httpx
 
 BASE_URL = "https://api.mem0.ai"
-_TIMEOUT = 5.0
+# Generous on purpose: a search with `rerank=True` costs real extra latency on mem0's side, and a
+# slow-but-successful search is worth far more to this feature than a fast, silent failure — a
+# 5s timeout was found live to trip often enough that some replies proceeded with no memory at
+# all, indistinguishable from the model simply not having anything relevant to say.
+_TIMEOUT = 10.0
 
 # Overridable only from tests, to exercise this module's request/response handling against a
 # fake transport instead of the real network — the same seam every other executor in this
@@ -62,16 +66,28 @@ async def search(
     query: str,
     filters: dict[str, object],
     top_k: int = 10,
-    threshold: float = 0.3,
+    threshold: float = 0.1,
+    rerank: bool = False,
 ) -> list[dict[str, object]] | None:
     """Semantic search over memories matching `filters`. Returns `None` on any failure — never an
-    empty list, which would be indistinguishable from "searched, found nothing relevant."""
+    empty list, which would be indistinguishable from "searched, found nothing relevant."
+
+    `rerank` turns on mem0's own managed reranker — its documented lever for better ordering,
+    worth the extra latency for a chat-time recall call where getting the *right* memory back
+    matters more than shaving off a few hundred milliseconds (see services/memory.py's own use
+    of this).
+    """
+    body: dict[str, object] = {
+        "query": query,
+        "filters": filters,
+        "top_k": top_k,
+        "threshold": threshold,
+    }
+    if rerank:
+        body["rerank"] = True
     try:
         async with _client(api_key) as client:
-            response = await client.post(
-                "/v3/memories/search/",
-                json={"query": query, "filters": filters, "top_k": top_k, "threshold": threshold},
-            )
+            response = await client.post("/v3/memories/search/", json=body)
             response.raise_for_status()
         return list(response.json().get("results", []))
     except httpx.HTTPError:

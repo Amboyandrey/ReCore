@@ -496,6 +496,7 @@ async def test_retrieve_for_turn_sends_the_expected_or_filter(
             {"AND": [{"agent_id": personal_ns}, {"user_id": entity}]},
         ]
     }
+    assert captured["rerank"] is True
 
 
 async def test_retrieve_for_turn_drops_a_result_outside_the_caller_s_scopes(

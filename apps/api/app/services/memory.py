@@ -29,8 +29,15 @@ Scope = Literal["curated", "personal"]
 
 # What a chat-time search asks for, and how much of it is worth reading — a handful of the most
 # relevant facts, not a wall of everything mem0 has ever learned.
-_SEARCH_TOP_K = 10
-_SEARCH_THRESHOLD = 0.3
+#
+# A wider candidate pool (top_k) than what's actually injected: mem0 scores and orders the whole
+# pool before threshold trims it, so a too-small top_k can drop the actually-relevant memory
+# before it's ever considered, not just before it's shown. `threshold` is mem0's own documented
+# default (0.1) rather than a stricter one this project picked itself — a real personal-memory
+# corpus is small, and a memory that's genuinely the best (or only) match for a query can still
+# score well below what a dense, large corpus's matches typically would.
+_SEARCH_TOP_K = 20
+_SEARCH_THRESHOLD = 0.1
 _MEMORY_BLOCK_MAX_CHARS = 2_000
 
 
@@ -276,6 +283,7 @@ async def retrieve_for_turn(
         },
         top_k=_SEARCH_TOP_K,
         threshold=_SEARCH_THRESHOLD,
+        rerank=True,
     )
     if not results:
         return None
