@@ -12,7 +12,7 @@ import json
 import uuid
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, Depends, Header, Request
+from fastapi import APIRouter, Depends, Header, Query, Request
 from fastapi.responses import StreamingResponse
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -75,10 +75,16 @@ async def create_conversation_route(
 async def list_conversations_route(
     ctx: WorkspaceCtx = Depends(require_role(Role.VIEWER)),
     db: AsyncSession = Depends(get_db),
+    limit: int = Query(default=30, ge=1, le=100),
+    before: str | None = Query(default=None),
+    q: str | None = Query(default=None),
 ) -> list[ConversationOut]:
-    """List every conversation this caller can see: their own, plus any of the workspace's
-    conversations that have been shared."""
-    conversations = await list_conversations(db, workspace_id=ctx.workspace_id, viewer_id=ctx.user.id)
+    """List conversations this caller can see: their own, plus any of the workspace's that have
+    been shared — most recently active first, cursor-paginated via `before` (a previous page's
+    last row's `updated_at`), optionally filtered to titles containing `q`."""
+    conversations = await list_conversations(
+        db, workspace_id=ctx.workspace_id, viewer_id=ctx.user.id, limit=limit, before=before, q=q
+    )
     return [ConversationOut.model_validate(c, from_attributes=True) for c in conversations]
 
 
