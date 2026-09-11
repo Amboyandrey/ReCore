@@ -83,8 +83,16 @@ async function* consumeSSE(response: Response): AsyncGenerator<SSEEvent> {
 }
 
 // Lists a workspace's conversations, most recently active first.
-export async function listConversations(workspaceId: string): Promise<Conversation[]> {
-  const res = await api(`/api/v1/workspaces/${workspaceId}/conversations`);
+export async function listConversations(
+  workspaceId: string,
+  options: { limit?: number; before?: string; q?: string } = {}
+): Promise<Conversation[]> {
+  const params = new URLSearchParams();
+  if (options.limit) params.set("limit", String(options.limit));
+  if (options.before) params.set("before", options.before);
+  if (options.q) params.set("q", options.q);
+  const query = params.toString();
+  const res = await api(`/api/v1/workspaces/${workspaceId}/conversations${query ? `?${query}` : ""}`);
   await throwIfNotOk(res);
   return (await res.json()) as Conversation[];
 }

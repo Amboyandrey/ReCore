@@ -10,7 +10,6 @@ import {
   deleteConversation,
   getActiveGeneration,
   getConversation,
-  listConversations,
   listMessages,
   resumeGeneration,
   sendMessage,
@@ -91,7 +90,10 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
   const toolsEnabled = flags.tools === true;
 
   const [conversation, setConversation] = useState<Conversation | null>(null);
-  const [siblings, setSiblings] = useState<Conversation[]>([]);
+  // Bumped whenever this conversation's ordering in the sidebar might have changed (a message
+  // just landed, moving it to the top) — the sidebar owns its own fetch entirely, so this is the
+  // one signal this page sends it to reset back to a fresh first page instead of going stale.
+  const [sidebarRefreshKey, setSidebarRefreshKey] = useState(0);
   const [messages, setMessages] = useState<Message[]>([]);
   const [loadingData, setLoadingData] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -182,6 +184,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
         setLiveToolActivity([]);
         setActiveGenerationId(null);
         setSending(false);
+        setSidebarRefreshKey((prev) => prev + 1);
       }
     },
     [workspace, conversationId, attachmentsEnabled, toolsEnabled]
@@ -197,10 +200,9 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     async function load() {
       if (!workspace) return;
       try {
-        const [conv, convs, msgs, activeId, fetchedModels, fetchedAssistants, attachments, invocations] =
+        const [conv, msgs, activeId, fetchedModels, fetchedAssistants, attachments, invocations] =
           await Promise.all([
             getConversation(workspace.id, conversationId),
-            listConversations(workspace.id),
             listMessages(workspace.id, conversationId),
             getActiveGeneration(workspace.id, conversationId),
             listModels(workspace.id),
@@ -210,7 +212,6 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
           ]);
         if (cancelled) return;
         setConversation(conv);
-        setSiblings(convs);
         setMessages(msgs);
         setAttachmentsByMessageId(groupByMessageId(attachments));
         setToolInvocationsByMessageId(groupToolInvocationsByMessageId(invocations));
@@ -324,7 +325,6 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     if (!workspace) return;
     try {
       await deleteConversation(workspace.id, id);
-      setSiblings((prev) => prev.filter((c) => c.id !== id));
       // The conversation on screen just deleted itself out from under this page — nothing left
       // to show here, so hop to a fresh chat instead of leaving a dead 404'd thread visible.
       if (id === conversationId) router.replace(`/w/${slug}/c/new`);
@@ -400,17 +400,19 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
   const isOwner = conversation.user_id === user?.id;
 
   return (
-    <div className="mx-auto flex max-w-5xl gap-6 px-6 py-8">
+    <div className="flex w-full">
       <ConversationSidebar
         slug={slug}
+        workspaceId={workspace.id}
         currentUserId={user?.id}
         activeConversationId={conversationId}
-        conversations={siblings}
+        refreshKey={sidebarRefreshKey}
         onDelete={handleDeleteConversation}
       />
 
-      <div className="flex min-h-[70vh] flex-1 flex-col">
-        <div className="flex items-center justify-between gap-3">
+      <div className="flex min-h-screen min-w-0 flex-1 flex-col">
+        <div className="sticky top-0 z-40 border-b border-border bg-surface px-6 py-4">
+        <div className="mx-auto flex max-w-3xl items-center justify-between gap-3">
           <h1 className="truncate text-lg font-semibold text-text">{conversation.title}</h1>
           <div className="flex shrink-0 items-center gap-2">
             {isOwner ? (
@@ -478,14 +480,16 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
             )}
           </div>
         </div>
+        </div>
 
+        <div className="mx-auto w-full max-w-3xl flex-1 px-6">
         {error && (
           <p className="mt-3 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger">
             {error}
           </p>
         )}
 
-        <div className="mt-4 flex-1 space-y-4 overflow-y-auto">
+        <div className="space-y-4 py-4">
           {messages.map((m) => (
             <div
               key={m.id}
@@ -526,54 +530,59 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
           )}
           <div ref={bottomRef} />
         </div>
+        </div>
 
-        {attachmentsEnabled && (
-          <PendingAttachmentChips
-            attachments={pendingAttachments}
-            modelSupportsVision={modelSupportsVision}
-            onRemove={handleRemoveAttachment}
-          />
-        )}
-
-        {blockedImage && (
-          <p className="mt-2 text-xs text-danger">
-            This model can&apos;t read images. Remove the image or switch to a vision-capable model.
-          </p>
-        )}
-
-        <form onSubmit={handleSend} className="mt-4 flex items-end gap-2">
+        <div className="sticky bottom-0 z-40 border-t border-border bg-surface px-6 pb-6 pt-3">
+        <div className="mx-auto w-full max-w-3xl">
           {attachmentsEnabled && (
-            <label className="cursor-pointer rounded-md border border-border px-3 py-2 text-sm text-text-soft hover:border-border-strong">
-              {uploading ? "…" : "+ File"}
-              <input type="file" onChange={handleFileSelect} disabled={uploading} className="hidden" />
-            </label>
+            <PendingAttachmentChips
+              attachments={pendingAttachments}
+              modelSupportsVision={modelSupportsVision}
+              onRemove={handleRemoveAttachment}
+            />
           )}
-          <textarea
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
-            rows={2}
-            placeholder="Message… (Enter to send, Shift+Enter for a new line)"
-            className="flex-1 resize-none rounded-md border border-border bg-surface px-3 py-2 text-sm text-text outline-none focus:border-accent"
-          />
-          {sending && activeGenerationId ? (
-            <button
-              type="button"
-              onClick={handleStop}
-              className="rounded-md border border-danger px-3 py-2 text-sm text-danger"
-            >
-              Stop
-            </button>
-          ) : (
-            <button
-              type="submit"
-              disabled={sending || !input.trim() || blockedImage}
-              className="rounded-md bg-accent px-3 py-2 text-sm font-medium text-accent-contrast disabled:opacity-60"
-            >
-              Send
-            </button>
+
+          {blockedImage && (
+            <p className="mt-2 text-xs text-danger">
+              This model can&apos;t read images. Remove the image or switch to a vision-capable model.
+            </p>
           )}
-        </form>
+
+          <form onSubmit={handleSend} className="mt-2 flex items-end gap-2">
+            {attachmentsEnabled && (
+              <label className="cursor-pointer rounded-md border border-border px-3 py-2 text-sm text-text-soft hover:border-border-strong">
+                {uploading ? "…" : "+ File"}
+                <input type="file" onChange={handleFileSelect} disabled={uploading} className="hidden" />
+              </label>
+            )}
+            <textarea
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={handleKeyDown}
+              rows={2}
+              placeholder="Message… (Enter to send, Shift+Enter for a new line)"
+              className="flex-1 resize-none rounded-md border border-border bg-surface px-3 py-2 text-sm text-text outline-none focus:border-accent"
+            />
+            {sending && activeGenerationId ? (
+              <button
+                type="button"
+                onClick={handleStop}
+                className="rounded-md border border-danger px-3 py-2 text-sm text-danger"
+              >
+                Stop
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={sending || !input.trim() || blockedImage}
+                className="rounded-md bg-accent px-3 py-2 text-sm font-medium text-accent-contrast disabled:opacity-60"
+              >
+                Send
+              </button>
+            )}
+          </form>
+        </div>
+        </div>
       </div>
     </div>
   );

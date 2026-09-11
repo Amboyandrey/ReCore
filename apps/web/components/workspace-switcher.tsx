@@ -7,7 +7,13 @@ import { useAuth } from "@/lib/auth-context";
 import { useWorkspaces } from "@/lib/workspace-context";
 
 // Lets the signed-in user see which workspace they're in, jump to another, or create one.
-export function WorkspaceSwitcher() {
+// `destination` picks where choosing a different workspace lands — the workspace's own home page
+// by default, or (from the chat sidebar) that workspace's own new-chat page instead.
+export function WorkspaceSwitcher({
+  destination = (slug: string) => `/w/${slug}`,
+}: {
+  destination?: (slug: string) => string;
+}) {
   const { user } = useAuth();
   const { workspaces, loading } = useWorkspaces();
   const pathname = usePathname();
@@ -51,7 +57,7 @@ export function WorkspaceSwitcher() {
               type="button"
               onClick={() => {
                 setOpen(false);
-                router.push(`/w/${w.slug}`);
+                router.push(destination(w.slug));
               }}
               className="flex w-full items-center justify-between px-3 py-1.5 text-left text-sm text-text hover:bg-surface-sunk"
             >

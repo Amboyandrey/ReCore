@@ -6,14 +6,7 @@ import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 
 import { useRequireAuth } from "@/lib/auth-context";
 import { listAssistants, type Assistant } from "@/lib/assistant-client";
 import { AttachmentError, uploadAttachment, type Attachment } from "@/lib/attachment-client";
-import {
-  ChatError,
-  createConversation,
-  deleteConversation,
-  listConversations,
-  updateConversation,
-  type Conversation,
-} from "@/lib/chat-client";
+import { ChatError, createConversation, deleteConversation, updateConversation } from "@/lib/chat-client";
 import { getLastModelId, setLastModelId } from "@/lib/last-model";
 import { setPendingFirstMessage } from "@/lib/pending-first-message";
 import { listModels, type EnabledModel } from "@/lib/provider-client";
@@ -45,7 +38,10 @@ export function NewChat({ slug }: { slug: string }) {
   const router = useRouter();
   const attachmentsEnabled = flags.attachments === true;
 
-  const [siblings, setSiblings] = useState<Conversation[]>([]);
+  // Bumped after this draft becomes a real, persisted conversation (a file attached, or the
+  // sidebar's own delete happening) — the sidebar owns its own fetch, so this is the one signal
+  // this page sends it to pick up a newly created conversation.
+  const [sidebarRefreshKey, setSidebarRefreshKey] = useState(0);
   const [models, setModels] = useState<EnabledModel[]>([]);
   const [modelId, setModelId] = useState("");
   const [assistants, setAssistants] = useState<Assistant[]>([]);
@@ -69,10 +65,9 @@ export function NewChat({ slug }: { slug: string }) {
   useEffect(() => {
     if (!workspace) return;
     let cancelled = false;
-    Promise.all([listConversations(workspace.id), listModels(workspace.id), listAssistants(workspace.id)])
-      .then(([convs, fetchedModels, fetchedAssistants]) => {
+    Promise.all([listModels(workspace.id), listAssistants(workspace.id)])
+      .then(([fetchedModels, fetchedAssistants]) => {
         if (cancelled) return;
-        setSiblings(convs);
         setModels(fetchedModels);
         setAssistants(fetchedAssistants);
         const initial = pickDefaultModel(workspace.id, fetchedModels);
@@ -94,6 +89,7 @@ export function NewChat({ slug }: { slug: string }) {
         .then((conversation) => {
           conversationIdRef.current = conversation.id;
           setLastModelId(workspace.id, modelId);
+          setSidebarRefreshKey((prev) => prev + 1);
           return conversation.id;
         })
         .catch((err) => {
@@ -201,7 +197,6 @@ export function NewChat({ slug }: { slug: string }) {
     if (!workspace) return;
     try {
       await deleteConversation(workspace.id, id);
-      setSiblings((prev) => prev.filter((c) => c.id !== id));
     } catch (err) {
       setError(err instanceof ChatError ? err.message : "Something went wrong.");
     }
@@ -221,36 +216,44 @@ export function NewChat({ slug }: { slug: string }) {
   const blockedImage = hasBlockedImage(pendingAttachments, modelSupportsVision);
 
   return (
-    <div className="mx-auto flex max-w-5xl gap-6 px-6 py-8">
+    <div className="flex w-full">
       <ConversationSidebar
         slug={slug}
+        workspaceId={workspace.id}
         currentUserId={user?.id}
         activeConversationId={null}
-        conversations={siblings}
+        refreshKey={sidebarRefreshKey}
         onDelete={handleDeleteConversation}
       />
 
-      <div className="flex min-h-[70vh] flex-1 flex-col">
-        <h1 className="text-lg font-semibold text-text">New chat</h1>
+      <div className="flex min-h-screen min-w-0 flex-1 flex-col">
+        <div className="sticky top-0 z-40 border-b border-border bg-surface px-6 py-4">
+          <div className="mx-auto max-w-3xl">
+            <h1 className="text-lg font-semibold text-text">New chat</h1>
+          </div>
+        </div>
 
-        {error && (
-          <p className="mt-3 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger">
-            {error}
-          </p>
-        )}
+        <div className="mx-auto w-full max-w-3xl flex-1 px-6">
+          {error && (
+            <p className="mt-3 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger">
+              {error}
+            </p>
+          )}
 
-        {models.length === 0 ? (
-          <p className="mt-6 text-sm text-text-soft">
-            No models are enabled yet.{" "}
-            <Link href={`/w/${slug}/settings/providers`} className="text-accent">
-              Enable one
-            </Link>{" "}
-            first.
-          </p>
-        ) : (
-          <>
-            <div className="flex-1" />
+          {models.length === 0 && (
+            <p className="mt-6 text-sm text-text-soft">
+              No models are enabled yet.{" "}
+              <Link href={`/w/${slug}/settings/providers`} className="text-accent">
+                Enable one
+              </Link>{" "}
+              first.
+            </p>
+          )}
+        </div>
 
+        {models.length > 0 && (
+          <div className="sticky bottom-0 z-40 border-t border-border bg-surface px-6 pb-6 pt-3">
+          <div className="mx-auto w-full max-w-3xl">
             {attachmentsEnabled && (
               <PendingAttachmentChips
                 attachments={pendingAttachments}
@@ -265,7 +268,7 @@ export function NewChat({ slug }: { slug: string }) {
               </p>
             )}
 
-            <form onSubmit={handleSend} className="mt-4 flex items-end gap-2">
+            <form onSubmit={handleSend} className="mt-2 flex items-end gap-2">
               {assistants.length > 0 && (
                 <select
                   value={assistantId}
@@ -322,7 +325,8 @@ export function NewChat({ slug }: { slug: string }) {
                 {sending ? "Starting…" : "Send"}
               </button>
             </form>
-          </>
+          </div>
+          </div>
         )}
       </div>
     </div>
