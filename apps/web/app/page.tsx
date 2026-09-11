@@ -1,4 +1,5 @@
 import { getApiStatus } from "@/lib/api";
+import { WorkspacePicker } from "@/components/workspace-picker";
 
 // Renders a status pill whose color communicates state at a glance, not just its label.
 function StatusPill({ ok, label }: { ok: boolean; label: string }) {
@@ -51,24 +52,7 @@ export default async function Home() {
         )}
       </div>
 
-      <div className="mt-6 rounded-lg border border-border bg-surface-sunk p-6">
-        <h2 className="font-mono text-xs uppercase tracking-wider text-text-muted">
-          Build order
-        </h2>
-        <ol className="mt-3 space-y-1.5 text-sm text-text-soft">
-          <li>
-            <span className="text-text">01 Foundation</span> — this shell, both apps talking to
-            each other
-          </li>
-          <li>02 Identity — accounts, sessions, login</li>
-          <li>03 Workspaces &amp; roles — invites, membership</li>
-          <li>04 LLM registry — bring your own API key</li>
-          <li>05 Chat — streaming conversations</li>
-          <li>06 Flags &amp; attachments</li>
-          <li>07 Metering — usage and cost</li>
-          <li>08 Hardening — RLS, security headers, seed data</li>
-        </ol>
-      </div>
+      <WorkspacePicker />
     </div>
   );
 }
