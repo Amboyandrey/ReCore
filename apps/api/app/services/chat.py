@@ -23,6 +23,7 @@ from app.core.db import async_session_factory, set_workspace_scope
 from app.core.errors import (
     ConversationNotFound,
     InsufficientRole,
+    InvalidCursor,
     ModelDoesNotSupportImages,
     ModelNotFound,
     ProviderDisabled,
@@ -210,18 +211,38 @@ async def delete_conversation(
 
 
 async def list_conversations(
-    db: AsyncSession, *, workspace_id: uuid.UUID, viewer_id: uuid.UUID
+    db: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    viewer_id: uuid.UUID,
+    limit: int | None = None,
+    before: str | None = None,
+    q: str | None = None,
 ) -> list[Conversation]:
-    """List every conversation in the workspace this viewer is allowed to see: their own, plus
-    anyone else's that's been explicitly shared — most recently active first."""
-    stmt = (
-        select(Conversation)
-        .where(
-            Conversation.workspace_id == workspace_id,
-            (Conversation.user_id == viewer_id) | (Conversation.shared.is_(True)),
-        )
-        .order_by(Conversation.updated_at.desc())
+    """List conversations in the workspace this viewer is allowed to see: their own, plus anyone
+    else's that's been explicitly shared — most recently active first.
+
+    `limit`/`before` cursor-paginate the same way the audit log does: `before` is a previous
+    page's last row's `updated_at`, a plain indexed range scan rather than an OFFSET, so a deep
+    page costs the same as the first one. `limit=None` (every existing caller before the sidebar
+    needed lazy loading) returns everything, unpaginated, exactly as before this parameter
+    existed. `q`, if given, filters to titles containing it, case-insensitively.
+    """
+    stmt = select(Conversation).where(
+        Conversation.workspace_id == workspace_id,
+        (Conversation.user_id == viewer_id) | (Conversation.shared.is_(True)),
     )
+    if q:
+        stmt = stmt.where(Conversation.title.ilike(f"%{q}%"))
+    if before is not None:
+        try:
+            cursor = datetime.fromisoformat(before)
+        except ValueError as exc:
+            raise InvalidCursor() from exc
+        stmt = stmt.where(Conversation.updated_at < cursor)
+    stmt = stmt.order_by(Conversation.updated_at.desc())
+    if limit is not None:
+        stmt = stmt.limit(limit)
     return list((await db.scalars(stmt)).all())
 
 

@@ -546,6 +546,55 @@ async def test_list_conversations_only_returns_the_workspaces_own(db: AsyncSessi
     assert conversations == []
 
 
+async def test_list_conversations_paginates_newest_first_by_cursor(db: AsyncSession) -> None:
+    """A `before` cursor from one page's last row fetches exactly the page after it — what the
+    sidebar's lazy loading relies on to fetch its next batch of 30.
+
+    One commit per row: Postgres's `now()` is stable for the whole duration of a transaction, so
+    several inserts in one uncommitted transaction would all land the same `updated_at` and make
+    DESC order a tie (see test_audit.py's own version of this same pattern).
+    """
+    user, workspace, model = await _workspace_with_model(db)
+    conversations = []
+    for _ in range(3):
+        conversations.append(
+            await create_conversation(
+                db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+            )
+        )
+        await db.commit()
+
+    first_page = await list_conversations(db, workspace_id=workspace.id, viewer_id=user.id, limit=2)
+    assert [c.id for c in first_page] == [conversations[2].id, conversations[1].id]
+
+    second_page = await list_conversations(
+        db,
+        workspace_id=workspace.id,
+        viewer_id=user.id,
+        limit=2,
+        before=first_page[-1].updated_at.isoformat(),
+    )
+    assert [c.id for c in second_page] == [conversations[0].id]
+
+
+async def test_list_conversations_filters_by_title_substring(db: AsyncSession) -> None:
+    user, workspace, model = await _workspace_with_model(db)
+    matching = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    matching.title = "Weekly planning notes"
+    other = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    other.title = "Recipe ideas"
+    await db.commit()
+
+    results = await list_conversations(db, workspace_id=workspace.id, viewer_id=user.id, q="planning")
+
+    assert [c.id for c in results] == [matching.id]
+    assert other.id not in [c.id for c in results]
+
+
 async def test_get_conversation_from_another_workspace_is_not_found(db: AsyncSession) -> None:
     """Fetching a real conversation id under the wrong workspace behaves like it doesn't exist."""
     user, workspace, model = await _workspace_with_model(db)

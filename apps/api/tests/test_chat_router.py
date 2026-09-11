@@ -201,6 +201,31 @@ async def test_deleting_a_conversation_removes_it_from_the_list(client: AsyncCli
     assert conversation_id not in {c["id"] for c in listed.json()}
 
 
+async def test_listing_conversations_honors_limit_and_before(client: AsyncClient) -> None:
+    """A thin smoke test over the HTTP wiring — list_conversations()'s own pagination logic is
+    exercised thoroughly in test_chat_service.py; this just confirms the query params reach it."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    for _ in range(3):
+        await client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id}
+        )
+
+    first_page = await client.get(
+        f"/api/v1/workspaces/{workspace_id}/conversations", params={"limit": 2}
+    )
+    assert first_page.status_code == 200
+    first_items = first_page.json()
+    assert len(first_items) == 2
+
+    second_page = await client.get(
+        f"/api/v1/workspaces/{workspace_id}/conversations",
+        params={"limit": 2, "before": first_items[-1]["updated_at"]},
+    )
+    assert second_page.status_code == 200
+    second_items = second_page.json()
+    assert {c["id"] for c in first_items}.isdisjoint({c["id"] for c in second_items})
+
+
 async def test_idempotency_key_prevents_a_duplicate_send(client: AsyncClient) -> None:
     """Two sends with the same Idempotency-Key produce only one user/assistant pair."""
     workspace_id, model_id = await _workspace_with_model(client)
