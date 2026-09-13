@@ -1,6 +1,9 @@
 @import "tailwindcss";
 
 :root {
+  /* Without this, the browser draws its native controls (scrollbars, checkboxes, etc.) in light
+     mode regardless of our own dark palette below — it has no other way to know which we're in. */
+  color-scheme: light;
   --bg: #f7f8fb;
   --surface: #ffffff;
   --surface-sunk: #eef0f5;
@@ -19,6 +22,7 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
+    color-scheme: dark;
     --bg: #0d0f15;
     --surface: #151822;
     --surface-sunk: #10121a;
