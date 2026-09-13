@@ -162,3 +162,13 @@ class LLMProvider(Protocol):
         already follows for images.
         """
         ...
+
+
+class EmbeddingProvider(Protocol):
+    """What a provider adapter implements if it can turn text into vectors — not every
+    `LLMProvider` does (Anthropic has no embeddings API); see `registry.supports_embeddings`."""
+
+    async def embed(self, *, model: str, texts: list[str]) -> list[list[float]]:
+        """Embed each of `texts`, returned in the same order. Callers own batching to whatever
+        limit a given provider enforces — this method makes exactly one request per call."""
+        ...

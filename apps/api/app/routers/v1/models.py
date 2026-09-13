@@ -2,7 +2,7 @@
 
 import uuid
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,7 +10,7 @@ from app.core.db import get_db
 from app.core.redis import get_redis
 from app.core.request_ip import client_ip
 from app.deps.workspace import WorkspaceCtx, require_role
-from app.models import LLMModel, Provider, Role
+from app.models import LLMModel, ModelKind, Provider, Role
 from app.schemas.model import AvailableModelOut, EnableModelRequest, ModelOut
 from app.services.audit import record_audit
 from app.services.credentials import get_credential
@@ -41,6 +41,7 @@ async def _to_model_out(
         cost_per_mtok_out=model.cost_per_mtok_out,
         provider_enabled=bool(provider_enabled),
         supports_vision=model.supports_vision,
+        kind=model.kind,
     )
 
 
@@ -77,6 +78,7 @@ async def enable_model_route(
         cost_per_mtok_in=body.cost_per_mtok_in,
         cost_per_mtok_out=body.cost_per_mtok_out,
         supports_vision=body.supports_vision,
+        kind=body.kind,
     )
     credential = await get_credential(db, workspace_id=ctx.workspace_id, credential_id=body.credential_id)
     await record_audit(
@@ -97,10 +99,12 @@ async def list_models_route(
     ctx: WorkspaceCtx = Depends(require_role(Role.VIEWER)),
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
+    kind: ModelKind = Query(default=ModelKind.CHAT),
 ) -> list[ModelOut]:
-    """List every model enabled for chat in the workspace, with its pricing and whether that
-    model's provider is currently switched on."""
-    models = await list_models(db, workspace_id=ctx.workspace_id)
+    """List every model of the given kind enabled in the workspace, with its pricing and whether
+    that model's provider is currently switched on. Defaults to chat models — the Knowledge
+    settings page is the one caller that asks for `?kind=embedding`."""
+    models = await list_models(db, workspace_id=ctx.workspace_id, kind=kind)
     return [
         await _to_model_out(db, redis, ctx=ctx, model=model, provider=provider) for model, provider in models
     ]

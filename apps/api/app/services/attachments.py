@@ -69,22 +69,26 @@ def _is_image(mime: str) -> bool:
     return mime in _IMAGE_MIMES or mime in _HEIC_MIMES
 
 
-def _cap(text: str) -> str:
-    """Truncate extracted text at MAX_EXTRACTED_CHARS, with a visible marker that it happened."""
-    if len(text) <= MAX_EXTRACTED_CHARS:
+def _cap(text: str, max_chars: int | None) -> str:
+    """Truncate extracted text at `max_chars`, with a visible marker that it happened. `None`
+    means uncapped — used by knowledge indexing (see extract_text below), which chunks the full
+    text itself rather than needing it pre-truncated to a context-budget-sized limit."""
+    if max_chars is None or len(text) <= max_chars:
         return text
-    return text[:MAX_EXTRACTED_CHARS] + "\n\n[...truncated]"
+    return text[:max_chars] + "\n\n[...truncated]"
 
 
-def _extract_plain_text(data: bytes) -> tuple[str | None, ExtractStatus, str | None]:
+def _extract_plain_text(
+    data: bytes, *, max_chars: int | None
+) -> tuple[str | None, ExtractStatus, str | None]:
     """Text-like files are already text — just decode them."""
     try:
-        return _cap(data.decode("utf-8")), ExtractStatus.DONE, None
+        return _cap(data.decode("utf-8"), max_chars), ExtractStatus.DONE, None
     except UnicodeDecodeError as exc:
         return None, ExtractStatus.FAILED, str(exc)
 
 
-def _extract_pdf_text(data: bytes) -> tuple[str | None, ExtractStatus, str | None]:
+def _extract_pdf_text(data: bytes, *, max_chars: int | None) -> tuple[str | None, ExtractStatus, str | None]:
     """Concatenate every page's extracted text, page breaks marked with a blank line."""
     try:
         reader = PdfReader(BytesIO(data))
@@ -93,10 +97,10 @@ def _extract_pdf_text(data: bytes) -> tuple[str | None, ExtractStatus, str | Non
         return None, ExtractStatus.FAILED, str(exc)
     if not text.strip():
         return None, ExtractStatus.FAILED, "No extractable text found (the PDF may be scanned images)."
-    return _cap(text), ExtractStatus.DONE, None
+    return _cap(text, max_chars), ExtractStatus.DONE, None
 
 
-def _extract_docx_text(data: bytes) -> tuple[str | None, ExtractStatus, str | None]:
+def _extract_docx_text(data: bytes, *, max_chars: int | None) -> tuple[str | None, ExtractStatus, str | None]:
     """Join every paragraph's text — tables and headers/footers aren't walked, just the body."""
     try:
         document = DocxDocument(BytesIO(data))
@@ -105,10 +109,10 @@ def _extract_docx_text(data: bytes) -> tuple[str | None, ExtractStatus, str | No
         return None, ExtractStatus.FAILED, str(exc)
     if not text.strip():
         return None, ExtractStatus.FAILED, "No extractable text found."
-    return _cap(text), ExtractStatus.DONE, None
+    return _cap(text, max_chars), ExtractStatus.DONE, None
 
 
-def _extract_pptx_text(data: bytes) -> tuple[str | None, ExtractStatus, str | None]:
+def _extract_pptx_text(data: bytes, *, max_chars: int | None) -> tuple[str | None, ExtractStatus, str | None]:
     """Join every slide's shape text, one slide per block — speaker notes aren't included."""
     try:
         presentation = Presentation(BytesIO(data))
@@ -123,10 +127,10 @@ def _extract_pptx_text(data: bytes) -> tuple[str | None, ExtractStatus, str | No
         return None, ExtractStatus.FAILED, str(exc)
     if not text.strip():
         return None, ExtractStatus.FAILED, "No extractable text found."
-    return _cap(text), ExtractStatus.DONE, None
+    return _cap(text, max_chars), ExtractStatus.DONE, None
 
 
-def _extract_xlsx_text(data: bytes) -> tuple[str | None, ExtractStatus, str | None]:
+def _extract_xlsx_text(data: bytes, *, max_chars: int | None) -> tuple[str | None, ExtractStatus, str | None]:
     """Render each sheet as tab-separated rows — formula cells read as their cached value, if
     the file was saved with one; a formula never actually recalculated has nothing to show."""
     try:
@@ -143,22 +147,29 @@ def _extract_xlsx_text(data: bytes) -> tuple[str | None, ExtractStatus, str | No
     text = "\n\n".join(sheets)
     if not text.strip():
         return None, ExtractStatus.FAILED, "No extractable text found."
-    return _cap(text), ExtractStatus.DONE, None
+    return _cap(text, max_chars), ExtractStatus.DONE, None
 
 
-def _extract_text(data: bytes, mime: str) -> tuple[str | None, ExtractStatus, str | None]:
+def extract_text(
+    data: bytes, mime: str, *, max_chars: int | None = MAX_EXTRACTED_CHARS
+) -> tuple[str | None, ExtractStatus, str | None]:
     """Dispatch to the right extractor for this mime type, or mark it unsupported. Images never
-    reach this — save_attachment routes them to _normalize_image before extraction would run."""
+    reach this — save_attachment routes them to _normalize_image before extraction would run.
+
+    `max_chars` defaults to the same per-attachment budget chat context needs (see
+    MAX_EXTRACTED_CHARS's own docstring); knowledge indexing (app/workers/index_connector.py)
+    passes `None` since it chunks the full text itself rather than needing it pre-truncated.
+    """
     if _is_text_like(mime):
-        return _extract_plain_text(data)
+        return _extract_plain_text(data, max_chars=max_chars)
     if mime == _PDF_MIME:
-        return _extract_pdf_text(data)
+        return _extract_pdf_text(data, max_chars=max_chars)
     if mime == _DOCX_MIME:
-        return _extract_docx_text(data)
+        return _extract_docx_text(data, max_chars=max_chars)
     if mime == _PPTX_MIME:
-        return _extract_pptx_text(data)
+        return _extract_pptx_text(data, max_chars=max_chars)
     if mime == _XLSX_MIME:
-        return _extract_xlsx_text(data)
+        return _extract_xlsx_text(data, max_chars=max_chars)
     return None, ExtractStatus.UNSUPPORTED, None
 
 
@@ -205,7 +216,7 @@ async def save_attachment(
         )
         extracted_text = None
     else:
-        extracted_text, extract_status, extract_error = _extract_text(data, mime)
+        extracted_text, extract_status, extract_error = extract_text(data, mime)
 
     # Checked after normalization, not before: the whole point of downscaling is that a 10-12MB
     # phone photo reaches the model at all, rather than being rejected here before it ever

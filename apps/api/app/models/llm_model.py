@@ -1,12 +1,13 @@
-"""One provider model, enabled for chat in a workspace via one of its credentials."""
+"""One provider model, enabled for chat (or embedding) in a workspace via one of its credentials."""
 
 import uuid
 
-from sqlalchemy import ForeignKey, Numeric, UniqueConstraint
+from sqlalchemy import Enum, ForeignKey, Numeric, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
 from app.models.mixins import TimestampMixin, UUIDPrimaryKeyMixin
+from app.models.model_kind import ModelKind
 
 
 class LLMModel(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -29,3 +30,9 @@ class LLMModel(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     # across arbitrary OpenAI-compatible endpoints (Ollama, OpenRouter, ...). Set by an admin
     # checkbox when the model is enabled (see services/models.py).
     supports_vision: Mapped[bool] = mapped_column(default=False, server_default="false")
+    # Same reasoning as supports_vision — an admin marks a model CHAT or EMBEDDING explicitly
+    # when enabling it, rather than this codebase guessing from an arbitrary provider's model id.
+    # Keeps embedding models (e.g. text-embedding-3-small) out of the chat picker and vice versa.
+    kind: Mapped[ModelKind] = mapped_column(
+        Enum(ModelKind, name="model_kind"), default=ModelKind.CHAT, server_default="CHAT"
+    )

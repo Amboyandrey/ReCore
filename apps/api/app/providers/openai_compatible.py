@@ -27,6 +27,7 @@ from app.providers.base import (
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 _TIMEOUT = 10.0
 _STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
+_EMBED_BATCH_SIZE = 100
 
 
 def _content(message: ChatMessage) -> str | list[dict[str, object]]:
@@ -128,6 +129,26 @@ class OpenAICompatibleProvider:
             response.raise_for_status()
         data = response.json()
         return [ModelInfo(id=m["id"], display_name=m["id"]) for m in data.get("data", [])]
+
+    async def embed(self, *, model: str, texts: list[str]) -> list[list[float]]:
+        """Embed `texts`, batched to stay under OpenAI's 2048-input-per-request limit (100 is a
+        conservative batch that also keeps any one request's payload small). Results come back
+        sorted by their own `index` — the API doesn't guarantee response order matches input
+        order — so callers can zip `texts` with the return value positionally.
+        """
+        vectors: list[list[float]] = []
+        async with self._client() as client:
+            for start in range(0, len(texts), _EMBED_BATCH_SIZE):
+                batch = texts[start : start + _EMBED_BATCH_SIZE]
+                response = await client.post(
+                    f"{self._base_url}/embeddings",
+                    headers=self._auth_header(),
+                    json={"model": model, "input": batch},
+                )
+                response.raise_for_status()
+                data = sorted(response.json()["data"], key=lambda d: d["index"])
+                vectors.extend(d["embedding"] for d in data)
+        return vectors
 
     async def stream(
         self,
