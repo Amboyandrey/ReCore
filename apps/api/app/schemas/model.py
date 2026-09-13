@@ -4,7 +4,7 @@ import uuid
 
 from pydantic import BaseModel, Field
 
-from app.models import Provider
+from app.models import ModelKind, Provider
 
 
 class AvailableModelOut(BaseModel):
@@ -30,6 +30,9 @@ class EnableModelRequest(BaseModel):
     cost_per_mtok_in: float | None = Field(default=None, ge=0)
     cost_per_mtok_out: float | None = Field(default=None, ge=0)
     supports_vision: bool = False
+    # Same explicit-not-inferred reasoning as supports_vision — keeps embedding models (e.g.
+    # text-embedding-3-small) out of the chat picker, and chat models out of the embedding one.
+    kind: ModelKind = ModelKind.CHAT
 
 
 class ModelOut(BaseModel):
@@ -49,3 +52,4 @@ class ModelOut(BaseModel):
     cost_per_mtok_out: float | None
     provider_enabled: bool
     supports_vision: bool
+    kind: ModelKind

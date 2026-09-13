@@ -28,6 +28,7 @@ from app.providers.base import (
 DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 _TIMEOUT = 10.0
 _STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
+_EMBED_BATCH_SIZE = 100
 
 
 def _parts(message: ChatMessage) -> list[dict[str, object]]:
@@ -121,6 +122,28 @@ class GoogleProvider:
                 )
             )
         return models
+
+    async def embed(self, *, model: str, texts: list[str]) -> list[list[float]]:
+        """Embed `texts` via Google's batch embedding endpoint, batched to keep any one request's
+        payload reasonable — order is preserved: `embeddings[i]` in the response corresponds to
+        `requests[i]` in the request, so no re-sorting is needed the way OpenAI's does.
+        """
+        vectors: list[list[float]] = []
+        url = f"{self._base_url}/models/{model}:batchEmbedContents"
+        async with self._client() as client:
+            for start in range(0, len(texts), _EMBED_BATCH_SIZE):
+                batch = texts[start : start + _EMBED_BATCH_SIZE]
+                payload = {
+                    "requests": [
+                        {"model": f"models/{model}", "content": {"parts": [{"text": text}]}}
+                        for text in batch
+                    ]
+                }
+                response = await client.post(url, headers=self._auth_header(), json=payload)
+                response.raise_for_status()
+                data = response.json()
+                vectors.extend(e["values"] for e in data["embeddings"])
+        return vectors
 
     async def stream(
         self,

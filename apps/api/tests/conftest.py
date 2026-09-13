@@ -96,7 +96,8 @@ async def _reset_state_after_test() -> AsyncGenerator[None]:
             text(
                 "TRUNCATE TABLE users, workspaces, workspace_members, invitations, "
                 "provider_credentials, models, conversations, messages, attachments, "
-                "flag_overrides CASCADE"
+                "flag_overrides, knowledge_settings, connectors, connector_documents, "
+                "connector_chunks, message_sources CASCADE"
             )
         )
         # feature_flags is deliberately NOT truncated: the migration seeds the provider

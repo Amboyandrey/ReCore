@@ -2,9 +2,10 @@
 
 from collections.abc import Callable
 
+from app.core.errors import EmbeddingsNotSupported
 from app.models.provider import Provider
 from app.providers.anthropic import AnthropicProvider
-from app.providers.base import LLMProvider
+from app.providers.base import EmbeddingProvider, LLMProvider
 from app.providers.google import GoogleProvider
 from app.providers.openai_compatible import OpenAICompatibleProvider
 
@@ -25,3 +26,24 @@ _ADAPTERS: dict[Provider, _Factory] = {
 def build_provider(provider: Provider, *, api_key: str, base_url: str | None) -> LLMProvider:
     """Instantiate the adapter for a given provider, wired with its credential."""
     return _ADAPTERS[provider](api_key=api_key, base_url=base_url)
+
+
+# Anthropic has no embeddings API — every other provider's adapter (all built on the same
+# OpenAI-compatible or Google shape) implements EmbeddingProvider.embed.
+_EMBEDDING_PROVIDERS = {Provider.OPENAI, Provider.OPENAI_COMPATIBLE, Provider.GOOGLE}
+
+
+def supports_embeddings(provider: Provider) -> bool:
+    return provider in _EMBEDDING_PROVIDERS
+
+
+def build_embedding_provider(
+    provider: Provider, *, api_key: str, base_url: str | None
+) -> EmbeddingProvider:
+    """Instantiate an embeddings-capable adapter, or raise if this provider has none."""
+    if not supports_embeddings(provider):
+        raise EmbeddingsNotSupported()
+    # Every _EMBEDDING_PROVIDERS entry's adapter class also implements EmbeddingProvider —
+    # asserted by the membership check above rather than a separate registry, since it's the
+    # same classes as _ADAPTERS.
+    return _ADAPTERS[provider](api_key=api_key, base_url=base_url)  # type: ignore[return-value]

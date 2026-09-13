@@ -245,6 +245,39 @@ class MemoryUpstreamError(AppError):
     detail = "Couldn't reach mem0 — check that the workspace's API key is still valid."
 
 
+class EmbeddingsNotSupported(AppError):
+    """Raised when a model chosen as the workspace's embedding model belongs to a provider with
+    no embeddings API (Anthropic), or isn't itself marked kind=embedding."""
+
+    status_code = 400
+    detail = "This model can't be used for embeddings."
+
+
+class KnowledgeNotConfigured(AppError):
+    """Raised when indexing or retrieval is attempted before the workspace has chosen an
+    embedding model in Knowledge settings."""
+
+    status_code = 409
+    detail = "This workspace hasn't chosen an embedding model yet."
+
+
+class ConnectorNotFound(AppError):
+    """Raised for a connector (or its document) id that doesn't exist in the workspace it was
+    looked up under."""
+
+    status_code = 404
+    detail = "Connector not found."
+
+
+class ConnectorLimitReached(AppError):
+    """Raised when creating a connector would exceed the per-workspace cap — indexing runs on the
+    workspace's own credentials and a shared worker, so unlike most resources here it needs a
+    hard ceiling rather than being merely a UI suggestion."""
+
+    status_code = 409
+    detail = "This workspace has reached its connector limit."
+
+
 class MemoryNotFound(AppError):
     """Raised for a memory id that doesn't exist in the scope (curated or personal) it was
     looked up under — including one that exists in mem0 but under a different scope, which gets

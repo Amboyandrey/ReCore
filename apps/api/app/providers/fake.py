@@ -1,5 +1,7 @@
 """A deterministic provider used by tests — no network calls, a fixed key that "works"."""
 
+import hashlib
+import math
 from collections.abc import AsyncIterator, Sequence
 
 from app.providers.base import (
@@ -21,6 +23,20 @@ VALID_KEY = "fake-valid-key"
 # one delta arriving — a single-chunk reply wouldn't exercise anything about streaming at all.
 FAKE_REPLY = "Hello from the fake provider."
 
+# Deterministic, tiny — real dimensions (1536, 3072, ...) would work identically through pgvector
+# but only add noise to test fixtures and assertions.
+EMBED_DIM = 8
+
+
+def _fake_embed_one(text: str) -> list[float]:
+    """A deterministic, L2-normalized vector derived from the text's own hash — same text always
+    embeds to the same vector (so "nearest chunk" tests are reproducible), and different text
+    reliably embeds to a different vector (so retrieval has something real to distinguish)."""
+    digest = hashlib.sha256(text.encode()).digest()
+    raw = [b / 255 for b in digest[:EMBED_DIM]]
+    norm = math.sqrt(sum(v * v for v in raw)) or 1.0
+    return [v / norm for v in raw]
+
 
 class FakeProvider:
     """Validates exactly one hardcoded key; everything else fails, deterministically."""
@@ -38,6 +54,7 @@ class FakeProvider:
         self.last_messages: Sequence[ChatMessage] = ()
         self.last_tools: Sequence[ToolDefinition] = ()
         self._stream_calls = 0
+        self.last_embed_texts: list[str] = []
 
     async def validate(self) -> CredentialCheck:
         """Report success only for the one key this fake recognizes."""
@@ -79,3 +96,8 @@ class FakeProvider:
             yield TextDelta(text=word + " ")
         yield Usage(input_tokens=input_tokens, output_tokens=len(FAKE_REPLY.split(" ")))
         yield Done(finish_reason="stop")
+
+    async def embed(self, *, model: str, texts: list[str]) -> list[list[float]]:
+        del model
+        self.last_embed_texts = texts
+        return [_fake_embed_one(text) for text in texts]

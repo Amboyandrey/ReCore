@@ -2,7 +2,11 @@ name: recore
 
 services:
   postgres:
-    image: postgres:16-alpine
+    # pgvector's own image, built FROM postgres:16 — same data directory layout, so the existing
+    # postgres_data volume keeps working across this swap. The `vector` extension itself is
+    # created by a migration (CREATE EXTENSION IF NOT EXISTS vector), not here, matching how
+    # every other schema change in this app is owned by Alembic rather than image/init scripts.
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: recore
       POSTGRES_PASSWORD: recore
@@ -57,6 +61,37 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+
+  # Indexes connectors (website crawls, uploaded files) in the background, off the same image as
+  # `api` — see app/workers/main.py. Needs the same env `api` does: MASTER_KEY to decrypt the
+  # workspace's embedding credential, and the attachments volume to read uploaded files.
+  worker:
+    build:
+      context: ../apps/api
+      dockerfile: ../../infra/Dockerfile.api
+    command: ["arq", "app.workers.main.WorkerSettings"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://recore:recore@postgres:5432/recore
+      APP_DATABASE_URL: postgresql+asyncpg://recore_app:recore_app_dev_only@postgres:5432/recore
+      REDIS_URL: redis://redis:6379/0
+      DEBUG: "false"
+      MASTER_KEY: "BpiLXgRyl3uYpRm32mG0+1lcq+BvToj7jg0XIuaENWA="
+      STORAGE_DIR: /app/uploads
+    volumes:
+      - attachments_data:/app/uploads
+    healthcheck:
+      test: ["CMD", "arq", "--check", "app.workers.main.WorkerSettings"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
 
   web:
     build:

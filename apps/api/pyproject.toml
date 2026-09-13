@@ -27,6 +27,9 @@ dependencies = [
     "openpyxl>=3.1.5",
     "pillow>=12.3.0",
     "pillow-heif>=1.7.0",
+    "arq>=0.26",
+    "pgvector>=0.3",
+    "beautifulsoup4>=4.12",
 ]
 
 [dependency-groups]
@@ -37,12 +40,18 @@ dev = [
     "pytest-asyncio>=0.24",
     "pytest-cov>=6.0",
     "types-openpyxl>=3.1.5.20260827",
+    "types-beautifulsoup4>=4.12",
 ]
 
 # This is an application, not a library — skip the build/install step uv
 # would otherwise require, since nothing ever imports `recore_api` as a package.
 [tool.uv]
 package = false
+# arq declares `redis<6`, but only uses long-stable connection/pool/pubsub APIs — nothing this
+# app's own redis 8.x-era type stubs depend on has actually changed underneath it. Overriding
+# keeps the one redis version this codebase already relies on (rate_limit.py, sessions.py) rather
+# than a same-repo dependency dragging it back down for everyone.
+override-dependencies = ["redis>=8.1"]
 
 [tool.ruff]
 # 110 gives the one-line module/function docstring convention (see ARCHITECTURE.md #13) room

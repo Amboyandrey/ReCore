@@ -40,6 +40,7 @@ from app.models import (
     LLMModel,
     Message,
     MessageRole,
+    ModelKind,
     Provider,
     Tool,
     ToolInvocation,
@@ -123,10 +124,12 @@ async def create_conversation(
     system_prompt: str | None,
     assistant_id: uuid.UUID | None = None,
 ) -> Conversation:
-    """Start a new, empty conversation pinned to one of the workspace's enabled models, and
+    """Start a new, empty conversation pinned to one of the workspace's enabled chat models, and
     optionally governed by one of its saved assistants (see Conversation's own docstring)."""
     model = await db.scalar(
-        select(LLMModel).where(LLMModel.id == model_id, LLMModel.workspace_id == workspace_id)
+        select(LLMModel).where(
+            LLMModel.id == model_id, LLMModel.workspace_id == workspace_id, LLMModel.kind == ModelKind.CHAT
+        )
     )
     if model is None:
         raise ModelNotFound()
@@ -175,7 +178,9 @@ async def update_conversation(
     if "model_id" in changes:
         model = await db.scalar(
             select(LLMModel).where(
-                LLMModel.id == changes["model_id"], LLMModel.workspace_id == workspace_id
+                LLMModel.id == changes["model_id"],
+                LLMModel.workspace_id == workspace_id,
+                LLMModel.kind == ModelKind.CHAT,
             )
         )
         if model is None:

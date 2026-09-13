@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ModelNotFound
-from app.models import LLMModel, Provider, ProviderCredential
+from app.models import LLMModel, ModelKind, Provider, ProviderCredential
 from app.providers.base import ModelInfo
 from app.providers.registry import build_provider
 from app.services.credentials import decrypt_credential_key, get_credential
@@ -33,8 +33,10 @@ async def enable_model(
     cost_per_mtok_in: float | None,
     cost_per_mtok_out: float | None,
     supports_vision: bool,
+    kind: ModelKind = ModelKind.CHAT,
 ) -> LLMModel:
-    """Make a credential's model available for chat, re-enabling it if it was disabled before."""
+    """Make a credential's model available for chat (or embedding), re-enabling it if it was
+    disabled before."""
     await get_credential(db, workspace_id=workspace_id, credential_id=credential_id)  # 404s if not ours
 
     existing = await db.scalar(
@@ -49,6 +51,7 @@ async def enable_model(
         existing.cost_per_mtok_in = cost_per_mtok_in
         existing.cost_per_mtok_out = cost_per_mtok_out
         existing.supports_vision = supports_vision
+        existing.kind = kind
         await db.flush()
         return existing
 
@@ -61,19 +64,26 @@ async def enable_model(
         cost_per_mtok_in=cost_per_mtok_in,
         cost_per_mtok_out=cost_per_mtok_out,
         supports_vision=supports_vision,
+        kind=kind,
     )
     db.add(model)
     await db.flush()
     return model
 
 
-async def list_models(db: AsyncSession, *, workspace_id: uuid.UUID) -> list[tuple[LLMModel, Provider]]:
-    """List every enabled model in the workspace, paired with its credential's provider — the
-    model picker needs the provider to know which killswitch flag applies to each model."""
+async def list_models(
+    db: AsyncSession, *, workspace_id: uuid.UUID, kind: ModelKind = ModelKind.CHAT
+) -> list[tuple[LLMModel, Provider]]:
+    """List every enabled model of the given kind in the workspace, paired with its credential's
+    provider — the model picker needs the provider to know which killswitch flag applies to each
+    model. Defaults to CHAT so every existing caller (the chat model picker) is unaffected; the
+    Knowledge settings page is the one caller that asks for `kind=EMBEDDING`."""
     stmt = (
         select(LLMModel, ProviderCredential.provider)
         .join(ProviderCredential, ProviderCredential.id == LLMModel.credential_id)
-        .where(LLMModel.workspace_id == workspace_id, LLMModel.enabled.is_(True))
+        .where(
+            LLMModel.workspace_id == workspace_id, LLMModel.enabled.is_(True), LLMModel.kind == kind
+        )
         .order_by(LLMModel.created_at)
     )
     return [(model, provider) for model, provider in (await db.execute(stmt)).all()]
