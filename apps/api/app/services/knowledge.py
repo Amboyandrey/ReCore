@@ -9,6 +9,7 @@ as that connector needing a re-index instead of silently mixing incompatible vec
 """
 
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 from sqlalchemy import delete, func, select
@@ -25,12 +26,16 @@ from app.core.errors import (
 )
 from app.core.ssrf import assert_safe_base_url
 from app.models import (
+    AssistantConnector,
     Connector,
+    ConnectorChunk,
     ConnectorDocument,
     ConnectorKind,
     ConnectorStatus,
     KnowledgeSettings,
     LLMModel,
+    Message,
+    MessageSource,
     ModelKind,
 )
 from app.providers.base import EmbeddingProvider
@@ -42,6 +47,13 @@ settings = get_settings()
 # A connector indexes on the workspace's own credentials and a shared worker — unlike most
 # per-workspace resources in this codebase, that needs a hard ceiling, not just a UI suggestion.
 MAX_CONNECTORS_PER_WORKSPACE = 20
+
+# How many distinct sources one turn folds in, how close (cosine distance, lower = closer) a
+# chunk must be to even qualify, and the character budget for the whole block — same reasoning
+# memory's own _MEMORY_BLOCK_MAX_CHARS follows: knowledge shouldn't crowd out the conversation.
+_RETRIEVAL_TOP_K = 8
+_RETRIEVAL_MAX_DISTANCE = 0.55
+_RETRIEVAL_MAX_CHARS = 6_000
 
 
 async def get_settings_row(db: AsyncSession, *, workspace_id: uuid.UUID) -> KnowledgeSettings | None:
@@ -245,3 +257,138 @@ def needs_reindex(connector: Connector, settings_row: KnowledgeSettings | None) 
     if settings_row is None or settings_row.embedding_model_id is None:
         return True
     return connector.embedding_model_id != settings_row.embedding_model_id
+
+
+@dataclass(frozen=True)
+class SourceHit:
+    """One chunk that was actually folded into a reply's prompt — what the chat UI's sources
+    sidebar shows for that message (see app/services/chat.py's fold-in and the `message_sources`
+    table those get persisted to)."""
+
+    ordinal: int
+    connector_id: uuid.UUID
+    connector_name: str
+    document_id: uuid.UUID
+    label: str
+    url: str | None
+    snippet: str
+    score: float
+
+
+@dataclass(frozen=True)
+class KnowledgeResult:
+    block: str
+    sources: list[SourceHit]
+
+
+async def retrieve_for_turn(
+    db: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    assistant_id: uuid.UUID,
+    query: str,
+    top_k: int = _RETRIEVAL_TOP_K,
+    max_distance: float = _RETRIEVAL_MAX_DISTANCE,
+    max_chars: int = _RETRIEVAL_MAX_CHARS,
+) -> KnowledgeResult | None:
+    """Search the assistant's own attached, ready, current-embedding-model connectors for chunks
+    relevant to `query`, and return them as a labeled block to fold into the system prompt,
+    alongside the per-chunk sources the sidebar shows.
+
+    Never raises and never fails a turn: a missing embedding setting, no matching connectors, or
+    any embedding/query failure all just mean no knowledge reaches this turn — the same
+    "degrade silently" contract services/memory.py's own retrieve_for_turn follows.
+
+    Only connectors whose `embedding_model_id` still matches the workspace's *current* setting
+    are searched — a connector indexed under a since-changed model has a vector space that isn't
+    comparable to a freshly embedded query, so it's skipped (and shown as "needs reindex" in the
+    UI) rather than silently returning nonsense distances.
+    """
+    try:
+        settings_row = await get_settings_row(db, workspace_id=workspace_id)
+        if settings_row is None or settings_row.embedding_model_id is None:
+            return None
+
+        ready_ids = list(
+            (
+                await db.scalars(
+                    select(Connector.id)
+                    .join(AssistantConnector, AssistantConnector.connector_id == Connector.id)
+                    .where(
+                        AssistantConnector.assistant_id == assistant_id,
+                        Connector.status == ConnectorStatus.READY,
+                        Connector.embedding_model_id == settings_row.embedding_model_id,
+                    )
+                )
+            ).all()
+        )
+        if not ready_ids:
+            return None
+
+        vectors, _model = await embed_texts(db, workspace_id=workspace_id, texts=[query])
+        distance = ConnectorChunk.embedding.cosine_distance(vectors[0])
+        stmt = (
+            select(ConnectorChunk, ConnectorDocument, Connector.name, distance.label("distance"))
+            .join(ConnectorDocument, ConnectorChunk.document_id == ConnectorDocument.id)
+            .join(Connector, ConnectorChunk.connector_id == Connector.id)
+            .where(ConnectorChunk.connector_id.in_(ready_ids), distance <= max_distance)
+            .order_by(distance)
+            .limit(top_k * 2)
+        )
+        rows = (await db.execute(stmt)).all()
+    except Exception:  # noqa: BLE001 — a retrieval failure must never fail the turn itself
+        return None
+
+    if not rows:
+        return None
+
+    sources: list[SourceHit] = []
+    seen_documents: set[uuid.UUID] = set()
+    lines: list[str] = []
+    total_chars = 0
+    for chunk, document, connector_name, dist in rows:
+        if len(sources) >= top_k:
+            break
+        if document.id in seen_documents:
+            continue
+        title = document.title or document.filename or document.source_url or connector_name
+        label = f"{title} — {document.source_url}" if document.source_url else title
+        ordinal = len(sources) + 1
+        line = f"[Source {ordinal}: {label}]\n{chunk.content}"
+        if total_chars + len(line) > max_chars:
+            break
+        seen_documents.add(document.id)
+        lines.append(line)
+        total_chars += len(line)
+        sources.append(
+            SourceHit(
+                ordinal=ordinal,
+                connector_id=chunk.connector_id,
+                connector_name=connector_name,
+                document_id=document.id,
+                label=title,
+                url=document.source_url,
+                snippet=chunk.content[:300],
+                score=1 - float(dist),
+            )
+        )
+
+    if not sources:
+        return None
+    return KnowledgeResult(block="Relevant knowledge:\n" + "\n\n".join(lines), sources=sources)
+
+
+async def list_message_sources(db: AsyncSession, *, conversation_id: uuid.UUID) -> list[MessageSource]:
+    """List every knowledge source folded into any reply in a conversation, oldest first.
+
+    Joined through messages since a MessageSource only carries the message_id it was recorded
+    for, not a conversation_id of its own — same reach-through-the-parent shape
+    services/tools.py's list_tool_invocations already uses for ToolInvocation.
+    """
+    stmt = (
+        select(MessageSource)
+        .join(Message, Message.id == MessageSource.message_id)
+        .where(Message.conversation_id == conversation_id)
+        .order_by(MessageSource.created_at, MessageSource.ordinal)
+    )
+    return list((await db.scalars(stmt)).all())

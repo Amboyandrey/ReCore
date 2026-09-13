@@ -40,7 +40,7 @@ def _active_key(conversation_id: uuid.UUID) -> str:
     return f"conv:{conversation_id}:active_generation"
 
 
-_EventType = Literal["delta", "tool_call", "tool_result", "done", "error"]
+_EventType = Literal["delta", "tool_call", "tool_result", "sources", "done", "error"]
 _TERMINAL_EVENT_TYPES = ("done", "error")
 
 
@@ -78,7 +78,7 @@ async def read_events(
         for entry_id, fields in entries:
             last_id = entry_id
             raw_type = fields["type"]
-            if raw_type not in ("delta", "tool_call", "tool_result", "done", "error"):
+            if raw_type not in ("delta", "tool_call", "tool_result", "sources", "done", "error"):
                 continue  # ignore anything unexpected rather than crash a long-lived stream reader
             event_type = cast(_EventType, raw_type)
             event = StreamEvent(id=entry_id, type=event_type, data=json.loads(fields["data"]))

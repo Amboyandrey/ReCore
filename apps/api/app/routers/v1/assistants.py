@@ -15,6 +15,7 @@ from app.schemas.assistant import AssistantCreate, AssistantOut, AssistantUpdate
 from app.services.assistants import (
     create_assistant,
     delete_assistant,
+    list_assistant_connector_ids,
     list_assistant_delegate_ids,
     list_assistant_tool_ids,
     list_assistants,
@@ -28,6 +29,7 @@ router = APIRouter(prefix="/workspaces/{workspace_id}/assistants", tags=["assist
 async def _to_assistant_out(db: AsyncSession, assistant: Assistant) -> AssistantOut:
     tool_ids = await list_assistant_tool_ids(db, assistant_id=assistant.id)
     delegate_ids = await list_assistant_delegate_ids(db, assistant_id=assistant.id)
+    connector_ids = await list_assistant_connector_ids(db, assistant_id=assistant.id)
     return AssistantOut(
         id=assistant.id,
         name=assistant.name,
@@ -36,6 +38,7 @@ async def _to_assistant_out(db: AsyncSession, assistant: Assistant) -> Assistant
         tool_ids=tool_ids,
         memory_enabled=assistant.memory_enabled,
         delegate_ids=delegate_ids,
+        connector_ids=connector_ids,
         created_by=assistant.created_by,
         created_at=assistant.created_at,
     )
@@ -59,6 +62,7 @@ async def create_assistant_route(
         tool_ids=body.tool_ids,
         memory_enabled=body.memory_enabled,
         delegate_ids=body.delegate_ids,
+        connector_ids=body.connector_ids,
     )
     await record_audit(
         db,
