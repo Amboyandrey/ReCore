@@ -2,6 +2,10 @@ import { apiPublicUrl } from "./config";
 
 export type ProviderId = "anthropic" | "openai" | "google" | "openai_compatible";
 
+// Whether an enabled model belongs in the chat picker or the embedding picker — explicit, not
+// inferred, same reasoning supports_vision already follows (see EnableModelRequest server-side).
+export type ModelKind = "chat" | "embedding";
+
 export type Credential = {
   id: string;
   provider: ProviderId;
@@ -29,6 +33,7 @@ export type EnabledModel = {
   // Whether this model accepts image attachments — set by an admin at enable time (model ids
   // can't be reliably classified across arbitrary OpenAI-compatible endpoints).
   supports_vision: boolean;
+  kind: ModelKind;
 };
 
 export class ProviderError extends Error {}
@@ -100,6 +105,9 @@ export async function enableModel(
     // Defaults false server-side, not inferred — omitting it on a re-enable (e.g. a price edit)
     // would silently turn vision back off, so every caller must pass the model's current value.
     supports_vision?: boolean;
+    // Defaults to "chat" server-side. Set to "embedding" to make this model available for the
+    // workspace's Knowledge (ReStore) embedding-model choice instead of the chat picker.
+    kind?: ModelKind;
   }
 ): Promise<EnabledModel> {
   const res = await api(`/api/v1/workspaces/${workspaceId}/models`, {
@@ -110,9 +118,11 @@ export async function enableModel(
   return (await res.json()) as EnabledModel;
 }
 
-// Lists every model enabled for chat in the workspace, with its pricing.
-export async function listModels(workspaceId: string): Promise<EnabledModel[]> {
-  const res = await api(`/api/v1/workspaces/${workspaceId}/models`);
+// Lists every model of the given kind enabled in the workspace, with its pricing. Defaults to
+// "chat" — the Knowledge settings page is the one caller that asks for "embedding".
+export async function listModels(workspaceId: string, kind?: ModelKind): Promise<EnabledModel[]> {
+  const query = kind ? `?kind=${kind}` : "";
+  const res = await api(`/api/v1/workspaces/${workspaceId}/models${query}`);
   await throwIfNotOk(res);
   return (await res.json()) as EnabledModel[];
 }

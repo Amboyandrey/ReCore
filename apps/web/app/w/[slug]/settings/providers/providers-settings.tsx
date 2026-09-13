@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState, type FormEvent } from "react";
 import { useRequireAuth } from "@/lib/auth-context";
 import {
@@ -34,6 +35,10 @@ export function ProvidersSettings({ slug }: { slug: string }) {
 
   const [credentials, setCredentials] = useState<Credential[]>([]);
   const [models, setModels] = useState<EnabledModel[]>([]);
+  // Embedding-kind models are fetched and shown separately — they don't belong in the chat
+  // picker's own enabled-models table, and editing pricing/vision on them isn't supported here
+  // (their pricing is set once at enable time; vision doesn't apply to embeddings at all).
+  const [embeddingModels, setEmbeddingModels] = useState<EnabledModel[]>([]);
   const [loadingData, setLoadingData] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -49,6 +54,10 @@ export function ProvidersSettings({ slug }: { slug: string }) {
   // Which of the currently-browsed available models the admin has checked "supports images" for
   // — read at enable time, since AvailableModel (what the provider reports) has no such field.
   const [visionChoices, setVisionChoices] = useState<Record<string, boolean>>({});
+  // Same idea, for "enable this as an embedding model instead of a chat model" — mutually
+  // exclusive with vision in practice (embedding models don't stream chat replies), but tracked
+  // independently since nothing stops both being left unchecked (defaults to a chat model).
+  const [embeddingChoices, setEmbeddingChoices] = useState<Record<string, boolean>>({});
 
   // Deferred entirely into .then()/.finally() — see workspace-context.tsx for why: calling
   // setState directly at an effect's top level (even in an early-return branch) risks cascading
@@ -56,12 +65,17 @@ export function ProvidersSettings({ slug }: { slug: string }) {
   useEffect(() => {
     const task =
       workspace && isAdmin
-        ? Promise.all([listCredentials(workspace.id), listModels(workspace.id)])
-        : Promise.resolve<[Credential[], EnabledModel[]]>([[], []]);
+        ? Promise.all([
+            listCredentials(workspace.id),
+            listModels(workspace.id),
+            listModels(workspace.id, "embedding"),
+          ])
+        : Promise.resolve<[Credential[], EnabledModel[], EnabledModel[]]>([[], [], []]);
     task
-      .then(([c, m]) => {
+      .then(([c, m, e]) => {
         setCredentials(c);
         setModels(m);
+        setEmbeddingModels(e);
         setBrowseCredentialId((prev) => prev || c[0]?.id || "");
       })
       .finally(() => setLoadingData(false));
@@ -98,6 +112,7 @@ export function ProvidersSettings({ slug }: { slug: string }) {
       await deleteCredential(workspace.id, id);
       setCredentials((prev) => prev.filter((c) => c.id !== id));
       setModels((prev) => prev.filter((m) => m.credential_id !== id));
+      setEmbeddingModels((prev) => prev.filter((m) => m.credential_id !== id));
     } catch (err) {
       setError(err instanceof ProviderError ? err.message : "Something went wrong.");
     }
@@ -120,6 +135,7 @@ export function ProvidersSettings({ slug }: { slug: string }) {
   async function handleEnable(m: AvailableModel) {
     if (!workspace || !browseCredentialId) return;
     setError(null);
+    const isEmbedding = embeddingChoices[m.id] ?? false;
     try {
       const enabled = await enableModel(workspace.id, {
         credential_id: browseCredentialId,
@@ -127,8 +143,13 @@ export function ProvidersSettings({ slug }: { slug: string }) {
         display_name: m.display_name,
         context_window: m.context_window,
         supports_vision: visionChoices[m.id] ?? false,
+        kind: isEmbedding ? "embedding" : "chat",
       });
-      setModels((prev) => [...prev.filter((x) => x.id !== enabled.id), enabled]);
+      if (isEmbedding) {
+        setEmbeddingModels((prev) => [...prev.filter((x) => x.id !== enabled.id), enabled]);
+      } else {
+        setModels((prev) => [...prev.filter((x) => x.id !== enabled.id), enabled]);
+      }
     } catch (err) {
       setError(err instanceof ProviderError ? err.message : "Something went wrong.");
     }
@@ -183,6 +204,7 @@ export function ProvidersSettings({ slug }: { slug: string }) {
     try {
       await disableModel(workspace.id, modelId);
       setModels((prev) => prev.filter((m) => m.id !== modelId));
+      setEmbeddingModels((prev) => prev.filter((m) => m.id !== modelId));
     } catch (err) {
       setError(err instanceof ProviderError ? err.message : "Something went wrong.");
     }
@@ -208,7 +230,9 @@ export function ProvidersSettings({ slug }: { slug: string }) {
     );
   }
 
-  const enabledKeys = new Set(models.map((m) => `${m.credential_id}:${m.provider_model_id}`));
+  const enabledKeys = new Set(
+    [...models, ...embeddingModels].map((m) => `${m.credential_id}:${m.provider_model_id}`)
+  );
 
   return (
     <div className="mx-auto max-w-3xl px-6 py-16">
@@ -371,6 +395,17 @@ export function ProvidersSettings({ slug }: { slug: string }) {
                         />
                         Supports images
                       </label>
+                      <label className="flex items-center gap-1.5 text-xs text-text-soft">
+                        <input
+                          type="checkbox"
+                          checked={embeddingChoices[m.id] ?? false}
+                          disabled={alreadyEnabled}
+                          onChange={(e) =>
+                            setEmbeddingChoices((prev) => ({ ...prev, [m.id]: e.target.checked }))
+                          }
+                        />
+                        Embedding model
+                      </label>
                       <button
                         type="button"
                         onClick={() => handleEnable(m)}
@@ -447,6 +482,36 @@ export function ProvidersSettings({ slug }: { slug: string }) {
               </tbody>
             </table>
           </div>
+        </div>
+      )}
+
+      {embeddingModels.length > 0 && (
+        <div className="mt-10">
+          <h2 className="text-sm font-semibold text-text">Embedding models</h2>
+          <p className="mt-1 text-sm text-text-muted">
+            Turn text into vectors for Knowledge (ReStore) connectors — chosen from these in{" "}
+            <Link href={`/w/${slug}/settings/knowledge`} className="text-accent">
+              Knowledge settings
+            </Link>
+            , not used for chat.
+          </p>
+          <ul className="mt-3 flex flex-col gap-2">
+            {embeddingModels.map((m) => (
+              <li
+                key={m.id}
+                className="flex items-center justify-between rounded-md border border-border bg-surface px-3 py-2 text-sm"
+              >
+                <span className="text-text">{m.display_name}</span>
+                <button
+                  type="button"
+                  onClick={() => handleDisable(m.id)}
+                  className="text-xs text-danger hover:underline"
+                >
+                  Disable
+                </button>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
     </div>

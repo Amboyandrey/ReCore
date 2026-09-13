@@ -84,6 +84,9 @@ export function WorkspaceHome({ slug }: { slug: string }) {
           <Link href={`/w/${workspace.slug}/settings/assistants`} className="text-sm text-accent">
             Assistants →
           </Link>
+          <Link href={`/w/${workspace.slug}/settings/knowledge`} className="text-sm text-accent">
+            Knowledge →
+          </Link>
           <Link href={`/w/${workspace.slug}/settings/usage`} className="text-sm text-accent">
             Usage →
           </Link>
