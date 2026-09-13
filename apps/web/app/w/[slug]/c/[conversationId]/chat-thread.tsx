@@ -61,6 +61,19 @@ function groupSourcesByMessageId(sources: MessageSource[]): Record<string, Messa
   return grouped;
 }
 
+// Pairs each assistant reply with the user question right before it, newest first — what lets
+// the sources sidebar label a group of sources by the question they answered, rather than two
+// groups citing the same document reading as one confusing duplicate list.
+function assistantTurnsNewestFirst(messages: Message[]): { messageId: string; label: string }[] {
+  const turns: { messageId: string; label: string }[] = [];
+  let lastUserContent = "";
+  for (const m of messages) {
+    if (m.role === "user") lastUserContent = m.content;
+    else if (m.role === "assistant") turns.push({ messageId: m.id, label: lastUserContent });
+  }
+  return turns.reverse();
+}
+
 // One tool call's activity, live (ok still null, mid-run) or from history (ok already settled).
 type ToolActivity = { name: string; ok: boolean | null };
 
@@ -630,10 +643,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
 
       {knowledgeEnabled && (
         <SourcesSidebar
-          assistantMessageIdsNewestFirst={messages
-            .filter((m) => m.role === "assistant")
-            .map((m) => m.id)
-            .reverse()}
+          turnsNewestFirst={assistantTurnsNewestFirst(messages)}
           sourcesByMessageId={sourcesByMessageId}
           liveSources={liveSources}
         />

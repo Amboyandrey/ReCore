@@ -26,8 +26,9 @@ function PanelIcon() {
 }
 
 // One group of sources: either the reply currently streaming in (no persisted id yet) or an
-// already-persisted assistant message.
-type SourceGroup = { key: string; sources: (LiveSource | MessageSource)[] };
+// already-persisted assistant message — `label` is the user question that reply answered, shown
+// as the group's header so two groups citing the same document are distinguishable at a glance.
+type SourceGroup = { key: string; label: string; sources: (LiveSource | MessageSource)[] };
 
 function SourceItem({ source }: { source: LiveSource | MessageSource }) {
   return (
@@ -58,13 +59,14 @@ function SourceItem({ source }: { source: LiveSource | MessageSource }) {
 // nothing to show, so a conversation with knowledge off (or simply no matches yet) looks no
 // different from before this feature existed.
 export function SourcesSidebar({
-  assistantMessageIdsNewestFirst,
+  turnsNewestFirst,
   sourcesByMessageId,
   liveSources,
 }: {
-  // Newest-first order of assistant message ids this conversation has — used only to order the
-  // persisted groups below the live one; a message with no sources contributes no group.
-  assistantMessageIdsNewestFirst: string[];
+  // Newest-first (assistant message id, the user question it answered) pairs — used to label
+  // each persisted group below the live one, so two groups citing the same document don't read
+  // as one confusing duplicate list. A message with no sources contributes no group.
+  turnsNewestFirst: { messageId: string; label: string }[];
   sourcesByMessageId: Record<string, MessageSource[]>;
   liveSources: LiveSource[];
 }) {
@@ -95,10 +97,10 @@ export function SourcesSidebar({
   }
 
   const groups: SourceGroup[] = [];
-  if (liveSources.length > 0) groups.push({ key: "live", sources: liveSources });
-  for (const messageId of assistantMessageIdsNewestFirst) {
+  if (liveSources.length > 0) groups.push({ key: "live", label: "Current reply", sources: liveSources });
+  for (const { messageId, label } of turnsNewestFirst) {
     const sources = sourcesByMessageId[messageId];
-    if (sources && sources.length > 0) groups.push({ key: messageId, sources });
+    if (sources && sources.length > 0) groups.push({ key: messageId, label, sources });
   }
 
   if (groups.length === 0) return null;
@@ -135,11 +137,16 @@ export function SourcesSidebar({
       </div>
       <div className="flex flex-col gap-4 px-3 py-3">
         {groups.map((group) => (
-          <ul key={group.key} className="flex flex-col gap-1.5">
-            {group.sources.map((source, index) => (
-              <SourceItem key={index} source={source} />
-            ))}
-          </ul>
+          <div key={group.key} className="flex flex-col gap-1.5">
+            <p className="truncate text-xs font-medium text-text-soft" title={group.label}>
+              {group.label || "Untitled question"}
+            </p>
+            <ul className="flex flex-col gap-1.5">
+              {group.sources.map((source, index) => (
+                <SourceItem key={index} source={source} />
+              ))}
+            </ul>
+          </div>
         ))}
       </div>
     </aside>

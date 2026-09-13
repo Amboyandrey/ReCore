@@ -54,6 +54,12 @@ MAX_CONNECTORS_PER_WORKSPACE = 20
 _RETRIEVAL_TOP_K = 8
 _RETRIEVAL_MAX_DISTANCE = 0.55
 _RETRIEVAL_MAX_CHARS = 6_000
+# More than 1: a single short document commonly produces 2-3 chunks (see
+# knowledge/chunk.py's DEFAULT_SINGLE_CHUNK_MAX_CHARS docstring for why most short documents
+# avoid this entirely, but longer ones still get split), and a near-tie in embedding distance
+# between two of that document's own chunks can otherwise fully exclude the one that actually
+# answers the query in favor of a chunk that merely ranked a hair closer.
+_RETRIEVAL_MAX_CHUNKS_PER_DOCUMENT = 2
 
 
 async def get_settings_row(db: AsyncSession, *, workspace_id: uuid.UUID) -> KnowledgeSettings | None:
@@ -290,6 +296,7 @@ async def retrieve_for_turn(
     top_k: int = _RETRIEVAL_TOP_K,
     max_distance: float = _RETRIEVAL_MAX_DISTANCE,
     max_chars: int = _RETRIEVAL_MAX_CHARS,
+    max_chunks_per_document: int = _RETRIEVAL_MAX_CHUNKS_PER_DOCUMENT,
 ) -> KnowledgeResult | None:
     """Search the assistant's own attached, ready, current-embedding-model connectors for chunks
     relevant to `query`, and return them as a labeled block to fold into the system prompt,
@@ -303,6 +310,10 @@ async def retrieve_for_turn(
     are searched — a connector indexed under a since-changed model has a vector space that isn't
     comparable to a freshly embedded query, so it's skipped (and shown as "needs reindex" in the
     UI) rather than silently returning nonsense distances.
+
+    Keeps up to `max_chunks_per_document` nearest chunks per document (not just the single
+    nearest) — a near-tie in distance between two of a document's own chunks would otherwise let
+    a merely-closer boilerplate chunk fully exclude the one that actually answers the query.
     """
     try:
         settings_row = await get_settings_row(db, workspace_id=workspace_id)
@@ -333,7 +344,7 @@ async def retrieve_for_turn(
             .join(Connector, ConnectorChunk.connector_id == Connector.id)
             .where(ConnectorChunk.connector_id.in_(ready_ids), distance <= max_distance)
             .order_by(distance)
-            .limit(top_k * 2)
+            .limit(top_k * 3)
         )
         rows = (await db.execute(stmt)).all()
     except Exception:  # noqa: BLE001 — a retrieval failure must never fail the turn itself
@@ -343,13 +354,13 @@ async def retrieve_for_turn(
         return None
 
     sources: list[SourceHit] = []
-    seen_documents: set[uuid.UUID] = set()
+    chunks_per_document: dict[uuid.UUID, int] = {}
     lines: list[str] = []
     total_chars = 0
     for chunk, document, connector_name, dist in rows:
         if len(sources) >= top_k:
             break
-        if document.id in seen_documents:
+        if chunks_per_document.get(document.id, 0) >= max_chunks_per_document:
             continue
         title = document.title or document.filename or document.source_url or connector_name
         label = f"{title} — {document.source_url}" if document.source_url else title
@@ -357,7 +368,7 @@ async def retrieve_for_turn(
         line = f"[Source {ordinal}: {label}]\n{chunk.content}"
         if total_chars + len(line) > max_chars:
             break
-        seen_documents.add(document.id)
+        chunks_per_document[document.id] = chunks_per_document.get(document.id, 0) + 1
         lines.append(line)
         total_chars += len(line)
         sources.append(

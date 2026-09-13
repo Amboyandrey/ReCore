@@ -261,9 +261,10 @@ async def test_a_connector_still_indexing_is_skipped(db: AsyncSession) -> None:
     assert result is None
 
 
-async def test_results_are_deduplicated_per_document_and_labeled_with_source_numbers(
-    db: AsyncSession,
-) -> None:
+async def test_up_to_two_chunks_from_the_same_document_are_kept(db: AsyncSession) -> None:
+    """A near-tie between two of a document's own chunks shouldn't fully exclude either one — see
+    knowledge.py's _RETRIEVAL_MAX_CHUNKS_PER_DOCUMENT docstring for the live failure this guards
+    against (the chunk with the real answer narrowly losing to a boilerplate one)."""
     workspace, model, assistant = await _workspace_with_embedding_model(db)
     connector = Connector(
         workspace_id=workspace.id,
@@ -284,20 +285,14 @@ async def test_results_are_deduplicated_per_document_and_labeled_with_source_num
     )
     db.add(document)
     await db.flush()
-    # Two chunks from the SAME document, both a perfect match — only the nearer one should
-    # surface as a source, since retrieval keeps at most one hit per document.
-    db.add(
-        ConnectorChunk(
-            workspace_id=workspace.id, connector_id=connector.id, document_id=document.id,
-            ordinal=0, content="First chunk.", embedding=[1.0, 0.0, 0.0],
+    # Three chunks from the SAME document, all a perfect match — only the cap (2) should surface.
+    for ordinal, content in enumerate(["First chunk.", "Second chunk.", "Third chunk."]):
+        db.add(
+            ConnectorChunk(
+                workspace_id=workspace.id, connector_id=connector.id, document_id=document.id,
+                ordinal=ordinal, content=content, embedding=[1.0, 0.0, 0.0],
+            )
         )
-    )
-    db.add(
-        ConnectorChunk(
-            workspace_id=workspace.id, connector_id=connector.id, document_id=document.id,
-            ordinal=1, content="Second chunk.", embedding=[1.0, 0.0, 0.0],
-        )
-    )
     db.add(AssistantConnector(assistant_id=assistant.id, connector_id=connector.id))
     await db.commit()
 
@@ -306,5 +301,6 @@ async def test_results_are_deduplicated_per_document_and_labeled_with_source_num
     )
 
     assert result is not None
-    assert len(result.sources) == 1
+    assert len(result.sources) == 2
     assert "[Source 1: My Document]" in result.block
+    assert "[Source 2: My Document]" in result.block
