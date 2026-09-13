@@ -11,6 +11,7 @@ import {
   type Assistant,
 } from "@/lib/assistant-client";
 import { useRequireAuth } from "@/lib/auth-context";
+import { KnowledgeError, listConnectors, type Connector } from "@/lib/knowledge-client";
 import {
   deleteMemoryCredential,
   getMemoryCredential,
@@ -29,6 +30,7 @@ type AssistantFormState = {
   toolIds: Set<string>;
   memoryEnabled: boolean;
   delegateIds: Set<string>;
+  connectorIds: Set<string>;
 };
 
 const EMPTY_FORM: AssistantFormState = {
@@ -38,6 +40,7 @@ const EMPTY_FORM: AssistantFormState = {
   toolIds: new Set(),
   memoryEnabled: false,
   delegateIds: new Set(),
+  connectorIds: new Set(),
 };
 
 // The assistants settings page: save a name + required instructions + an optional preferred
@@ -51,12 +54,14 @@ export function AssistantsSettings({ slug }: { slug: string }) {
   const { flags, loading: flagsLoading } = useWorkspaceFlags(workspace?.id);
   const memoryFeatureEnabled = flags.memory === true;
   const delegationFeatureEnabled = flags.delegation === true;
+  const knowledgeFeatureEnabled = flags.knowledge === true;
   const isAdmin = workspace?.role === "admin" || workspace?.role === "owner";
   const isOwner = workspace?.role === "owner";
 
   const [assistants, setAssistants] = useState<Assistant[]>([]);
   const [models, setModels] = useState<EnabledModel[]>([]);
   const [tools, setTools] = useState<Tool[]>([]);
+  const [connectors, setConnectors] = useState<Connector[]>([]);
   const [loadingData, setLoadingData] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -79,24 +84,30 @@ export function AssistantsSettings({ slug }: { slug: string }) {
       listModels(workspace.id),
       listTools(workspace.id),
       memoryFeatureEnabled && isAdmin ? getMemoryCredential(workspace.id) : Promise.resolve(false),
+      knowledgeFeatureEnabled ? listConnectors(workspace.id) : Promise.resolve([]),
     ])
-      .then(([fetchedAssistants, fetchedModels, fetchedTools, fetchedHasKey]) => {
+      .then(([fetchedAssistants, fetchedModels, fetchedTools, fetchedHasKey, fetchedConnectors]) => {
         if (cancelled) return;
         setAssistants(fetchedAssistants);
         setModels(fetchedModels);
         setTools(fetchedTools);
         setHasMemoryKey(fetchedHasKey);
+        setConnectors(fetchedConnectors);
       })
       .catch((err) => {
         if (!cancelled) {
-          setError(err instanceof AssistantError || err instanceof MemoryError ? err.message : "Something went wrong.");
+          setError(
+            err instanceof AssistantError || err instanceof MemoryError || err instanceof KnowledgeError
+              ? err.message
+              : "Something went wrong."
+          );
         }
       })
       .finally(() => !cancelled && setLoadingData(false));
     return () => {
       cancelled = true;
     };
-  }, [workspace, memoryFeatureEnabled, isAdmin]);
+  }, [workspace, memoryFeatureEnabled, isAdmin, knowledgeFeatureEnabled]);
 
   function startEditing(assistant: Assistant) {
     setEditingId(assistant.id);
@@ -107,6 +118,7 @@ export function AssistantsSettings({ slug }: { slug: string }) {
       toolIds: new Set(assistant.tool_ids),
       memoryEnabled: assistant.memory_enabled,
       delegateIds: new Set(assistant.delegate_ids),
+      connectorIds: new Set(assistant.connector_ids),
     });
   }
 
@@ -130,6 +142,15 @@ export function AssistantsSettings({ slug }: { slug: string }) {
       if (checked) delegateIds.add(assistantId);
       else delegateIds.delete(assistantId);
       return { ...f, delegateIds };
+    });
+  }
+
+  function toggleConnector(connectorId: string, checked: boolean) {
+    setForm((f) => {
+      const connectorIds = new Set(f.connectorIds);
+      if (checked) connectorIds.add(connectorId);
+      else connectorIds.delete(connectorId);
+      return { ...f, connectorIds };
     });
   }
 
@@ -173,6 +194,7 @@ export function AssistantsSettings({ slug }: { slug: string }) {
           tool_ids: [...form.toolIds],
           memory_enabled: form.memoryEnabled,
           delegate_ids: [...form.delegateIds],
+          connector_ids: [...form.connectorIds],
         });
         setAssistants((prev) => prev.map((a) => (a.id === updated.id ? updated : a)));
       } else {
@@ -183,6 +205,7 @@ export function AssistantsSettings({ slug }: { slug: string }) {
           tool_ids: [...form.toolIds],
           memory_enabled: form.memoryEnabled,
           delegate_ids: [...form.delegateIds],
+          connector_ids: [...form.connectorIds],
         });
         setAssistants((prev) => [...prev, created]);
       }
@@ -304,6 +327,11 @@ export function AssistantsSettings({ slug }: { slug: string }) {
                       {a.delegate_ids.length > 0 && (
                         <span className="rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-xs text-accent">
                           Delegates to {a.delegate_ids.length}
+                        </span>
+                      )}
+                      {knowledgeFeatureEnabled && a.connector_ids.length > 0 && (
+                        <span className="rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-xs text-accent">
+                          {a.connector_ids.length} connector{a.connector_ids.length === 1 ? "" : "s"}
                         </span>
                       )}
                     </div>
@@ -431,6 +459,31 @@ export function AssistantsSettings({ slug }: { slug: string }) {
                       <span className="text-text">{a.name}</span>
                     </label>
                   ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {knowledgeFeatureEnabled && (
+          <div className="flex flex-col gap-1.5 text-sm">
+            <span className="text-text-soft">Knowledge (optional)</span>
+            {connectors.length === 0 ? (
+              <p className="text-xs text-text-muted">
+                No connectors are registered in this workspace yet.
+              </p>
+            ) : (
+              <div className="flex flex-col gap-1.5">
+                {connectors.map((c) => (
+                  <label key={c.id} className="flex items-center gap-2 text-xs text-text-soft">
+                    <input
+                      type="checkbox"
+                      checked={form.connectorIds.has(c.id)}
+                      onChange={(e) => toggleConnector(c.id, e.target.checked)}
+                    />
+                    <span className="text-text">{c.name}</span>
+                    {c.status !== "ready" && <span className="text-text-muted">({c.status})</span>}
+                  </label>
+                ))}
               </div>
             )}
           </div>

@@ -16,8 +16,10 @@ import {
   stopGeneration,
   updateConversation,
   type Conversation,
+  type LiveSource,
   type Message,
 } from "@/lib/chat-client";
+import { listMessageSources, type MessageSource } from "@/lib/knowledge-client";
 import { setLastModelId } from "@/lib/last-model";
 import { takePendingFirstMessage } from "@/lib/pending-first-message";
 import { listModels, type EnabledModel } from "@/lib/provider-client";
@@ -25,6 +27,7 @@ import { listToolInvocations, type ToolInvocation } from "@/lib/tool-client";
 import { useWorkspaceFlags } from "@/lib/use-workspace-flags";
 import { useWorkspaceBySlug } from "@/lib/workspace-context";
 import { ConversationSidebar } from "@/components/conversation-sidebar";
+import { SourcesSidebar } from "@/components/sources-sidebar";
 import { PendingAttachmentChips, SentAttachmentChips, hasBlockedImage } from "@/components/attachment-chips";
 
 // Groups a conversation's attachments by the message they were sent with — what lets a message
@@ -44,6 +47,16 @@ function groupToolInvocationsByMessageId(invocations: ToolInvocation[]): Record<
   const grouped: Record<string, ToolInvocation[]> = {};
   for (const invocation of invocations) {
     (grouped[invocation.message_id] ??= []).push(invocation);
+  }
+  return grouped;
+}
+
+// Same grouping, for knowledge sources — a MessageSource always has a message_id (it's only ever
+// recorded once the final assistant message exists), same shape ToolInvocation follows above.
+function groupSourcesByMessageId(sources: MessageSource[]): Record<string, MessageSource[]> {
+  const grouped: Record<string, MessageSource[]> = {};
+  for (const source of sources) {
+    (grouped[source.message_id] ??= []).push(source);
   }
   return grouped;
 }
@@ -88,6 +101,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
   const router = useRouter();
   const attachmentsEnabled = flags.attachments === true;
   const toolsEnabled = flags.tools === true;
+  const knowledgeEnabled = flags.knowledge === true;
 
   const [conversation, setConversation] = useState<Conversation | null>(null);
   // Bumped whenever this conversation's ordering in the sidebar might have changed (a message
@@ -118,6 +132,12 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
   // Live tool activity for the reply currently streaming in — cleared once that reply finishes
   // and the real, persisted invocations (fetched into toolInvocationsByMessageId above) take over.
   const [liveToolActivity, setLiveToolActivity] = useState<ToolActivity[]>([]);
+  // Every knowledge source folded into a reply in this conversation, keyed by the assistant
+  // message it belongs to — same shape toolInvocationsByMessageId follows, for the same reason.
+  const [sourcesByMessageId, setSourcesByMessageId] = useState<Record<string, MessageSource[]>>({});
+  // Live sources for the reply currently streaming in, from the `sources` SSE event — cleared
+  // once that reply finishes and the persisted rows (fetched into sourcesByMessageId) take over.
+  const [liveSources, setLiveSources] = useState<LiveSource[]>([]);
   // The workspace's enabled models — for the model switcher, and to look up whether the current
   // one accepts images (Conversation only carries a model_id, not the model's own fields).
   const [models, setModels] = useState<EnabledModel[]>([]);
@@ -142,6 +162,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
       setSending(true);
       setStreamingText("");
       setLiveToolActivity([]);
+      setLiveSources([]);
       setError(null);
       setMessages((prev) => [...prev, pendingUserMessage(content)]);
 
@@ -167,27 +188,32 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
               next[index] = { name: evt.data.name, ok: evt.data.ok };
               return next;
             });
+          } else if (evt.event === "sources") {
+            setLiveSources(evt.data.sources);
           }
         }
       } catch (err) {
         setError(err instanceof ChatError ? err.message : "Something went wrong.");
       } finally {
-        const [msgs, attachments, invocations] = await Promise.all([
+        const [msgs, attachments, invocations, sources] = await Promise.all([
           listMessages(workspace.id, conversationId),
           attachmentsEnabled ? listAttachments(workspace.id, conversationId) : Promise.resolve([]),
           toolsEnabled ? listToolInvocations(workspace.id, conversationId) : Promise.resolve([]),
+          knowledgeEnabled ? listMessageSources(workspace.id, conversationId) : Promise.resolve([]),
         ]);
         setMessages(msgs);
         setAttachmentsByMessageId(groupByMessageId(attachments));
         setToolInvocationsByMessageId(groupToolInvocationsByMessageId(invocations));
+        setSourcesByMessageId(groupSourcesByMessageId(sources));
         setStreamingText("");
         setLiveToolActivity([]);
+        setLiveSources([]);
         setActiveGenerationId(null);
         setSending(false);
         setSidebarRefreshKey((prev) => prev + 1);
       }
     },
-    [workspace, conversationId, attachmentsEnabled, toolsEnabled]
+    [workspace, conversationId, attachmentsEnabled, toolsEnabled, knowledgeEnabled]
   );
 
   // Initial load, then — the only way a page reload can discover a reply was mid-stream — check
@@ -200,7 +226,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     async function load() {
       if (!workspace) return;
       try {
-        const [conv, msgs, activeId, fetchedModels, fetchedAssistants, attachments, invocations] =
+        const [conv, msgs, activeId, fetchedModels, fetchedAssistants, attachments, invocations, sources] =
           await Promise.all([
             getConversation(workspace.id, conversationId),
             listMessages(workspace.id, conversationId),
@@ -209,12 +235,14 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
             listAssistants(workspace.id),
             attachmentsEnabled ? listAttachments(workspace.id, conversationId) : Promise.resolve([]),
             toolsEnabled ? listToolInvocations(workspace.id, conversationId) : Promise.resolve([]),
+            knowledgeEnabled ? listMessageSources(workspace.id, conversationId) : Promise.resolve([]),
           ]);
         if (cancelled) return;
         setConversation(conv);
         setMessages(msgs);
         setAttachmentsByMessageId(groupByMessageId(attachments));
         setToolInvocationsByMessageId(groupToolInvocationsByMessageId(invocations));
+        setSourcesByMessageId(groupSourcesByMessageId(sources));
         setModels(fetchedModels);
         setAssistants(fetchedAssistants);
         setModelSupportsVision(
@@ -247,17 +275,22 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
                 next[index] = { name: evt.data.name, ok: evt.data.ok };
                 return next;
               });
+            } else if (evt.event === "sources") {
+              setLiveSources(evt.data.sources);
             }
           }
           if (cancelled) return;
-          const [resumedMessages, resumedInvocations] = await Promise.all([
+          const [resumedMessages, resumedInvocations, resumedSources] = await Promise.all([
             listMessages(workspace.id, conversationId),
             toolsEnabled ? listToolInvocations(workspace.id, conversationId) : Promise.resolve([]),
+            knowledgeEnabled ? listMessageSources(workspace.id, conversationId) : Promise.resolve([]),
           ]);
           setMessages(resumedMessages);
           setToolInvocationsByMessageId(groupToolInvocationsByMessageId(resumedInvocations));
+          setSourcesByMessageId(groupSourcesByMessageId(resumedSources));
           setStreamingText("");
           setLiveToolActivity([]);
+          setLiveSources([]);
           setActiveGenerationId(null);
         }
       } catch (err) {
@@ -270,7 +303,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
     return () => {
       cancelled = true;
     };
-  }, [workspace, conversationId, sendChat, attachmentsEnabled, toolsEnabled]);
+  }, [workspace, conversationId, sendChat, attachmentsEnabled, toolsEnabled, knowledgeEnabled]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -464,6 +497,16 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
                 Memory on
               </span>
             )}
+            {knowledgeEnabled &&
+              (assistants.find((a) => a.id === conversation.assistant_id)?.connector_ids.length ?? 0) >
+                0 && (
+                <span
+                  title="This assistant retrieves from its assigned connectors before replying"
+                  className="rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-xs text-accent"
+                >
+                  Knowledge on
+                </span>
+              )}
             {models.length > 0 && (
               <select
                 value={conversation.model_id}
@@ -584,6 +627,17 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
         </div>
         </div>
       </div>
+
+      {knowledgeEnabled && (
+        <SourcesSidebar
+          assistantMessageIdsNewestFirst={messages
+            .filter((m) => m.role === "assistant")
+            .map((m) => m.id)
+            .reverse()}
+          sourcesByMessageId={sourcesByMessageId}
+          liveSources={liveSources}
+        />
+      )}
     </div>
   );
 }
