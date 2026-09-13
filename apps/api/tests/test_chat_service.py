@@ -24,6 +24,7 @@ from app.core.errors import (
 )
 from app.memory import mem0
 from app.models import (
+    Assistant,
     Attachment,
     FeatureFlag,
     FlagScope,
@@ -53,12 +54,13 @@ from app.providers.base import (
     ToolDefinition,
     Usage,
 )
-from app.providers.fake import VALID_KEY, FakeProvider
-from app.services.assistants import create_assistant, update_assistant
+from app.providers.fake import FAKE_REPLY, VALID_KEY, FakeProvider
+from app.services.assistants import create_assistant, delete_assistant, update_assistant
 from app.services.attachments import save_attachment
 from app.services.chat import (
     MAX_TOOL_ITERATIONS,
     create_conversation,
+    delegate_tool_name,
     delete_conversation,
     get_conversation,
     list_conversations,
@@ -1596,3 +1598,519 @@ async def test_the_iteration_cap_stops_a_provider_that_never_finishes(
         await db.scalars(select(ToolInvocation).where(ToolInvocation.message_id == messages[1].id))
     ).all()
     assert len(invocations) == MAX_TOOL_ITERATIONS
+
+
+# --- Delegation ("ask another assistant") -----------------------------------------------------
+
+DELEGATE_INSTRUCTIONS = "You are the research delegate."
+
+
+class DelegatingFakeProvider(FakeProvider):
+    """Branches on what it's actually handed rather than on call count or SCRIPTED_TOOL_CALL,
+    since a delegate with no model of its own reuses this exact instance for both the
+    orchestrator's own turn(s) and the delegate's turn — nothing about "which call number is
+    this" can tell them apart on its own.
+
+    `INNER_TOOL_CALL`, if set, is requested once on the delegate's own turn before it gives its
+    final answer — for testing that a delegate's own tools run and get recorded. `FAIL_DELEGATE`,
+    if set, makes the delegate's turn fail with a StreamError instead of answering.
+    """
+
+    INNER_TOOL_CALL: ToolCall | None = None
+    FAIL_DELEGATE = False
+
+    def __init__(self, api_key: str, base_url: str | None = None) -> None:
+        super().__init__(api_key=api_key, base_url=base_url)
+        # Every stream() call this instance served, as (messages, tools) — lets a test inspect
+        # exactly what a specific turn (the orchestrator's, or a delegate's) was offered.
+        self.calls: list[tuple[Sequence[ChatMessage], Sequence[ToolDefinition]]] = []
+
+    async def stream(
+        self,
+        *,
+        model: str,
+        messages: Sequence[ChatMessage],
+        max_tokens: int,
+        tools: Sequence[ToolDefinition] = (),
+    ) -> AsyncIterator[Chunk]:
+        del model, max_tokens
+        self.last_messages, self.last_tools = messages, tools
+        self.calls.append((messages, tools))
+        self._stream_calls += 1
+        answered = any(m.role == "tool" for m in messages)
+
+        if messages[0].content == DELEGATE_INSTRUCTIONS:
+            if self.FAIL_DELEGATE:
+                yield StreamError(message="the delegate's provider disconnected")
+                return
+            if self.INNER_TOOL_CALL is not None and not answered:
+                yield Usage(input_tokens=3, output_tokens=0)
+                yield ToolCallRequest(calls=(self.INNER_TOOL_CALL,))
+                return
+            for word in ["Researcher", "says:", "42"]:
+                yield TextDelta(text=word + " ")
+            yield Usage(input_tokens=3, output_tokens=4)
+            yield Done(finish_reason="stop")
+            return
+
+        ask_tools = [t for t in tools if t.name.startswith("ask_")]
+        if ask_tools and not answered:
+            yield Usage(input_tokens=1, output_tokens=0)
+            yield ToolCallRequest(
+                calls=(ToolCall(id="call_1", name=ask_tools[0].name, arguments={"task": "Find X"}),)
+            )
+            return
+
+        for word in FAKE_REPLY.split(" "):
+            yield TextDelta(text=word + " ")
+        yield Usage(input_tokens=2, output_tokens=len(FAKE_REPLY.split(" ")))
+        yield Done(finish_reason="stop")
+
+
+class SlowDelegatingFakeProvider(DelegatingFakeProvider):
+    """Like DelegatingFakeProvider, but paces the delegate's own reply word by word — gives a
+    test time to call request_stop while a delegation is actually running."""
+
+    async def stream(
+        self,
+        *,
+        model: str,
+        messages: Sequence[ChatMessage],
+        max_tokens: int,
+        tools: Sequence[ToolDefinition] = (),
+    ) -> AsyncIterator[Chunk]:
+        del model, max_tokens
+        self.last_messages, self.last_tools = messages, tools
+        self.calls.append((messages, tools))
+        self._stream_calls += 1
+        answered = any(m.role == "tool" for m in messages)
+
+        if messages[0].content == DELEGATE_INSTRUCTIONS:
+            for word in ["one ", "two ", "three ", "four "]:
+                await asyncio.sleep(0.05)
+                yield TextDelta(text=word)
+            yield Usage(input_tokens=1, output_tokens=4)
+            yield Done(finish_reason="stop")
+            return
+
+        ask_tools = [t for t in tools if t.name.startswith("ask_")]
+        if ask_tools and not answered:
+            yield Usage(input_tokens=1, output_tokens=0)
+            yield ToolCallRequest(
+                calls=(ToolCall(id="call_1", name=ask_tools[0].name, arguments={"task": "Find X"}),)
+            )
+            return
+
+        for word in FAKE_REPLY.split(" "):
+            yield TextDelta(text=word + " ")
+        yield Usage(input_tokens=2, output_tokens=len(FAKE_REPLY.split(" ")))
+        yield Done(finish_reason="stop")
+
+
+async def _enable_delegation(db: AsyncSession, redis: Redis, *, workspace_id: uuid.UUID) -> None:
+    """Flip the `delegation` flag on for one workspace."""
+    flag = await db.scalar(select(FeatureFlag).where(FeatureFlag.key == "delegation"))
+    assert flag is not None
+    await set_override(
+        db, redis, flag_id=flag.id, scope=FlagScope.WORKSPACE, scope_id=workspace_id, value=True
+    )
+    await db.commit()  # this test's `db` session must commit for the client's own connection to see it
+
+
+async def _assistant_pair(
+    db: AsyncSession, *, workspace_id: uuid.UUID, created_by: User
+) -> tuple[Assistant, Assistant]:
+    """A "Researcher" assistant and a "Writer" assistant that delegates to it."""
+    researcher = await create_assistant(
+        db, workspace_id=workspace_id, created_by=created_by, name="Researcher",
+        instructions=DELEGATE_INSTRUCTIONS, model_id=None, tool_ids=[],
+    )
+    orchestrator = await create_assistant(
+        db, workspace_id=workspace_id, created_by=created_by, name="Writer", instructions="You write things.",
+        model_id=None, tool_ids=[], delegate_ids=[researcher.id],
+    )
+    await db.flush()
+    return researcher, orchestrator
+
+
+@pytest.fixture
+def delegating_provider(monkeypatch: pytest.MonkeyPatch) -> list[DelegatingFakeProvider]:
+    """Swap in DelegatingFakeProvider, capturing every instance built — a delegate with its own
+    model gets a separate instance from the conversation's own."""
+    captured: list[DelegatingFakeProvider] = []
+
+    def _build(provider: Provider, *, api_key: str, base_url: str | None) -> DelegatingFakeProvider:
+        instance = DelegatingFakeProvider(api_key=api_key, base_url=base_url)
+        captured.append(instance)
+        return instance
+
+    monkeypatch.setattr("app.services.chat.build_provider", _build)
+    return captured
+
+
+def test_delegate_tool_name_sanitizes_and_dedupes() -> None:
+    assert delegate_tool_name("Researcher", set()) == "ask_researcher"
+    assert delegate_tool_name("Dr. Smith!!", set()) == "ask_dr_smith"
+    assert delegate_tool_name("", set()) == "ask_assistant"
+    assert delegate_tool_name("Researcher", {"ask_researcher"}) == "ask_researcher_2"
+    assert delegate_tool_name("Researcher", {"ask_researcher", "ask_researcher_2"}) == "ask_researcher_3"
+
+
+async def test_assistant_can_delegate_to_another_assistant(
+    db: AsyncSession, redis_client: Redis, delegating_provider: list[DelegatingFakeProvider]
+) -> None:
+    """The orchestrator's model calls ask_researcher; the delegate's own answer is fed back and
+    used in the final reply — and its text never leaks out as a delta of its own."""
+    user, workspace, model = await _workspace_with_model(db)
+    await _enable_delegation(db, redis_client, workspace_id=workspace.id)
+    _researcher, orchestrator = await _assistant_pair(db, workspace_id=workspace.id, created_by=user)
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None,
+        assistant_id=orchestrator.id,
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db, redis_client, workspace_id=workspace.id, conversation=conversation,
+        content="Hi", idempotency_key=None,
+    )
+    events = [e async for e in read_events(redis_client, generation_id, block_ms=50)]
+
+    tool_calls = [e for e in events if e.type == "tool_call"]
+    tool_results = [e for e in events if e.type == "tool_result"]
+    assert [e.data["name"] for e in tool_calls] == ["ask_researcher"]
+    assert tool_results[0].data["ok"] is True
+    assert tool_results[0].data["content"] == "Researcher says: 42 "
+    deltas = [e for e in events if e.type == "delta"]
+    assert not any("Researcher" in e.data["text"] for e in deltas)
+    assert events[-1].type == "done"
+
+    messages = await list_messages(db, conversation_id=conversation.id)
+    assistant_message = messages[1]
+    assert assistant_message.content.strip() == FAKE_REPLY
+
+    invocations = (
+        await db.scalars(select(ToolInvocation).where(ToolInvocation.message_id == assistant_message.id))
+    ).all()
+    assert len(invocations) == 1
+    assert invocations[0].tool_id is None
+    assert invocations[0].name == "ask_researcher"
+    assert invocations[0].arguments == {"task": "Find X"}
+    assert invocations[0].status == ToolInvocationStatus.SUCCESS
+
+
+async def test_a_delegates_own_tool_calls_are_recorded_nested_under_it(
+    db: AsyncSession,
+    redis_client: Redis,
+    monkeypatch: pytest.MonkeyPatch,
+    delegating_provider: list[DelegatingFakeProvider],
+) -> None:
+    """A delegate calling its own tool shows up as a separate, name-prefixed invocation — visible
+    in the transcript as nested under the delegation that triggered it."""
+    user, workspace, model = await _workspace_with_model(db)
+    await _enable_delegation(db, redis_client, workspace_id=workspace.id)
+    await _enable_tools(db, redis_client, workspace_id=workspace.id)
+    researcher, orchestrator = await _assistant_pair(db, workspace_id=workspace.id, created_by=user)
+    weather_tool = await _add_tool(db, workspace_id=workspace.id, created_by=user.id, name="get_weather")
+    await update_assistant(
+        db, workspace_id=workspace.id, assistant_id=researcher.id, changes={"tool_ids": [weather_tool.id]}
+    )
+    await db.commit()
+    monkeypatch.setattr("app.services.chat.execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(
+        DelegatingFakeProvider,
+        "INNER_TOOL_CALL",
+        ToolCall(id="call_2", name="get_weather", arguments={"city": "Paris"}),
+    )
+
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None,
+        assistant_id=orchestrator.id,
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db, redis_client, workspace_id=workspace.id, conversation=conversation,
+        content="Hi", idempotency_key=None,
+    )
+    events = [e async for e in read_events(redis_client, generation_id, block_ms=50)]
+
+    assert "ask_researcher/get_weather" in [e.data["name"] for e in events if e.type == "tool_call"]
+
+    messages = await list_messages(db, conversation_id=conversation.id)
+    invocations = (
+        await db.scalars(select(ToolInvocation).where(ToolInvocation.message_id == messages[1].id))
+    ).all()
+    by_name = {i.name: i for i in invocations}
+    assert set(by_name) == {"ask_researcher", "ask_researcher/get_weather"}
+    assert by_name["ask_researcher/get_weather"].tool_id == weather_tool.id
+    assert by_name["ask_researcher/get_weather"].status == ToolInvocationStatus.SUCCESS
+
+
+async def test_a_delegate_on_its_own_model_bills_its_own_usage_event(
+    db: AsyncSession, redis_client: Redis, delegating_provider: list[DelegatingFakeProvider]
+) -> None:
+    """A delegate with its own model gets its own UsageEvent, priced on its own model, attached
+    to the outer message — and the outer message's own tokens_in/out stay outer-only."""
+    user, workspace, model = await _workspace_with_model(db)
+    await _enable_delegation(db, redis_client, workspace_id=workspace.id)
+    researcher, orchestrator = await _assistant_pair(db, workspace_id=workspace.id, created_by=user)
+    research_model = LLMModel(
+        workspace_id=workspace.id, credential_id=model.credential_id, provider_model_id="fake-large",
+        display_name="Fake Large", cost_per_mtok_in=5.0, cost_per_mtok_out=10.0,
+    )
+    db.add(research_model)
+    await db.flush()
+    await update_assistant(
+        db, workspace_id=workspace.id, assistant_id=researcher.id, changes={"model_id": research_model.id}
+    )
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None,
+        assistant_id=orchestrator.id,
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db, redis_client, workspace_id=workspace.id, conversation=conversation,
+        content="Hi", idempotency_key=None,
+    )
+    async for _ in read_events(redis_client, generation_id, block_ms=50):
+        pass
+
+    messages = await list_messages(db, conversation_id=conversation.id)
+    assistant_message = messages[1]
+    events = (
+        await db.scalars(select(UsageEvent).where(UsageEvent.message_id == assistant_message.id))
+    ).all()
+    by_model = {e.model_id: e for e in events}
+    assert set(by_model) == {model.id, research_model.id}
+
+    outer_event, delegate_event = by_model[model.id], by_model[research_model.id]
+    assert delegate_event.tokens_in == 3
+    assert delegate_event.tokens_out == 4
+    assert delegate_event.cost_usd == pytest.approx(3 / 1_000_000 * 5.0 + 4 / 1_000_000 * 10.0)
+    assert assistant_message.tokens_in == outer_event.tokens_in  # outer-only, never summed
+    assert assistant_message.cost_usd == pytest.approx(outer_event.cost_usd + delegate_event.cost_usd)
+
+
+async def test_delegation_flag_off_offers_no_delegate_tools(
+    db: AsyncSession, redis_client: Redis, delegating_provider: list[DelegatingFakeProvider]
+) -> None:
+    """The `delegation` flag defaults off — an assistant's configured delegates aren't offered as
+    tools at all unless the flag is explicitly turned on for the workspace."""
+    user, workspace, model = await _workspace_with_model(db)
+    _researcher, orchestrator = await _assistant_pair(db, workspace_id=workspace.id, created_by=user)
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None,
+        assistant_id=orchestrator.id,
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db, redis_client, workspace_id=workspace.id, conversation=conversation,
+        content="Hi", idempotency_key=None,
+    )
+    async for _ in read_events(redis_client, generation_id, block_ms=50):
+        pass
+
+    assert list(delegating_provider[0].last_tools) == []
+    messages = await list_messages(db, conversation_id=conversation.id)
+    assert messages[1].content.strip() == FAKE_REPLY  # never asked to delegate — nothing was offered
+
+
+async def test_a_failing_delegate_is_an_error_result_not_a_failed_generation(
+    db: AsyncSession,
+    redis_client: Redis,
+    monkeypatch: pytest.MonkeyPatch,
+    delegating_provider: list[DelegatingFakeProvider],
+) -> None:
+    """A delegate's own provider failure is reported back to the orchestrator as a failed tool
+    call — the outer generation still finishes normally, and only the outer turn is billed."""
+    user, workspace, model = await _workspace_with_model(db)
+    await _enable_delegation(db, redis_client, workspace_id=workspace.id)
+    _researcher, orchestrator = await _assistant_pair(db, workspace_id=workspace.id, created_by=user)
+    monkeypatch.setattr(DelegatingFakeProvider, "FAIL_DELEGATE", True)
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None,
+        assistant_id=orchestrator.id,
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db, redis_client, workspace_id=workspace.id, conversation=conversation,
+        content="Hi", idempotency_key=None,
+    )
+    events = [e async for e in read_events(redis_client, generation_id, block_ms=50)]
+
+    assert events[-1].type == "done"
+    tool_results = [e for e in events if e.type == "tool_result"]
+    assert tool_results[0].data["ok"] is False
+    assert "Delegate 'ask_researcher' failed" in tool_results[0].data["content"]
+
+    messages = await list_messages(db, conversation_id=conversation.id)
+    invocation = (
+        await db.scalars(select(ToolInvocation).where(ToolInvocation.message_id == messages[1].id))
+    ).one()
+    assert invocation.status == ToolInvocationStatus.ERROR
+
+    events_billed = (
+        await db.scalars(select(UsageEvent).where(UsageEvent.message_id == messages[1].id))
+    ).all()
+    assert len(events_billed) == 1  # only the outer turn — the failed delegate billed nothing
+
+
+async def test_a_deleted_delegate_is_no_longer_offered(
+    db: AsyncSession, redis_client: Redis, delegating_provider: list[DelegatingFakeProvider]
+) -> None:
+    """Deleting an assistant that was someone's delegate cascades the join row — the next send
+    just doesn't offer it, the same fallback a deleted tool assignment already gets."""
+    user, workspace, model = await _workspace_with_model(db)
+    await _enable_delegation(db, redis_client, workspace_id=workspace.id)
+    researcher, orchestrator = await _assistant_pair(db, workspace_id=workspace.id, created_by=user)
+    await delete_assistant(db, workspace_id=workspace.id, assistant_id=researcher.id)
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None,
+        assistant_id=orchestrator.id,
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db, redis_client, workspace_id=workspace.id, conversation=conversation,
+        content="Hi", idempotency_key=None,
+    )
+    async for _ in read_events(redis_client, generation_id, block_ms=50):
+        pass
+
+    assert list(delegating_provider[0].last_tools) == []
+    messages = await list_messages(db, conversation_id=conversation.id)
+    assert messages[1].content.strip() == FAKE_REPLY
+
+
+async def test_stop_during_a_running_delegation_aborts_it_without_a_further_provider_call(
+    db: AsyncSession, redis_client: Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stop request reaches a delegate's own loop through the same shared stop signal — without
+    it, the delegate's inner loop consuming the stop message would let the outer loop carry on
+    to another provider call once the delegation returned."""
+    captured: list[SlowDelegatingFakeProvider] = []
+
+    def _build(provider: Provider, *, api_key: str, base_url: str | None) -> SlowDelegatingFakeProvider:
+        instance = SlowDelegatingFakeProvider(api_key=api_key, base_url=base_url)
+        captured.append(instance)
+        return instance
+
+    monkeypatch.setattr("app.services.chat.build_provider", _build)
+    user, workspace, model = await _workspace_with_model(db)
+    await _enable_delegation(db, redis_client, workspace_id=workspace.id)
+    _researcher, orchestrator = await _assistant_pair(db, workspace_id=workspace.id, created_by=user)
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None,
+        assistant_id=orchestrator.id,
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db, redis_client, workspace_id=workspace.id, conversation=conversation,
+        content="Hi", idempotency_key=None,
+    )
+    await asyncio.sleep(0.08)  # let the delegate start streaming its paced reply
+    await request_stop(redis_client, generation_id)
+    events = [e async for e in read_events(redis_client, generation_id, block_ms=50)]
+
+    assert events[-1].type == "done"
+    assert events[-1].data["finish_reason"] == "stopped"
+    tool_results = [e for e in events if e.type == "tool_result"]
+    assert tool_results[0].data["ok"] is False
+    assert tool_results[0].data["content"] == "Delegation was stopped."
+    # Exactly two calls: the orchestrator's "ask" turn, and the delegate's one (stopped) turn —
+    # never a third, which is what an unshared stop signal would have let happen.
+    assert captured[0]._stream_calls == 2
+
+
+async def test_delegation_depth_is_one(
+    db: AsyncSession, redis_client: Redis, delegating_provider: list[DelegatingFakeProvider]
+) -> None:
+    """A delegate's own configured delegates are never resolved or offered — depth is always
+    exactly 1, structurally (DelegateSpec never carries a nested delegate list at all)."""
+    user, workspace, model = await _workspace_with_model(db)
+    await _enable_delegation(db, redis_client, workspace_id=workspace.id)
+    grandchild = await create_assistant(
+        db, workspace_id=workspace.id, created_by=user, name="Grandchild", instructions="x",
+        model_id=None, tool_ids=[],
+    )
+    child = await create_assistant(
+        db, workspace_id=workspace.id, created_by=user, name="Researcher", instructions=DELEGATE_INSTRUCTIONS,
+        model_id=None, tool_ids=[], delegate_ids=[grandchild.id],
+    )
+    orchestrator = await create_assistant(
+        db, workspace_id=workspace.id, created_by=user, name="Writer", instructions="x",
+        model_id=None, tool_ids=[], delegate_ids=[child.id],
+    )
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None,
+        assistant_id=orchestrator.id,
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db, redis_client, workspace_id=workspace.id, conversation=conversation,
+        content="Hi", idempotency_key=None,
+    )
+    async for _ in read_events(redis_client, generation_id, block_ms=50):
+        pass
+
+    provider = delegating_provider[0]
+    childs_turn_tools = next(
+        tools for messages, tools in provider.calls if messages[0].content == DELEGATE_INSTRUCTIONS
+    )
+    assert not any(t.name.startswith("ask_") for t in childs_turn_tools)
+
+
+async def test_a_delegate_with_memory_enabled_recalls_its_own_scope(
+    db: AsyncSession,
+    redis_client: Redis,
+    monkeypatch: pytest.MonkeyPatch,
+    delegating_provider: list[DelegatingFakeProvider],
+) -> None:
+    """A memory-enabled delegate recalls its own memories, searched with the task text — not the
+    outer conversation's message — and chatting through a delegation never writes memory."""
+    user, workspace, model = await _workspace_with_model(db)
+    await _enable_delegation(db, redis_client, workspace_id=workspace.id)
+    await _enable_memory(db, redis_client, workspace_id=workspace.id)
+    researcher, orchestrator = await _assistant_pair(db, workspace_id=workspace.id, created_by=user)
+    await update_assistant(
+        db, workspace_id=workspace.id, assistant_id=researcher.id, changes={"memory_enabled": True}
+    )
+    await set_credential(db, workspace_id=workspace.id, created_by=user, api_key="m0-test")
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None,
+        assistant_id=orchestrator.id,
+    )
+    await db.commit()
+
+    search_queries: list[str] = []
+
+    async def fake_search(**kwargs: object) -> list[dict[str, object]]:
+        search_queries.append(str(kwargs.get("query")))
+        return []
+
+    monkeypatch.setattr(mem0, "search", fake_search)
+    add_calls: list[dict[str, object]] = []
+
+    async def fake_add(**kwargs: object) -> bool:
+        add_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(mem0, "add", fake_add)
+
+    generation_id = await send_message(
+        db, redis_client, workspace_id=workspace.id, conversation=conversation,
+        content="Hi", idempotency_key=None,
+    )
+    async for _ in read_events(redis_client, generation_id, block_ms=50):
+        pass
+    await asyncio.sleep(0.05)  # let the outer conversation's own fire-and-forget record_turn run
+
+    assert search_queries == ["Find X"]  # the delegated task, not the outer user message "Hi"
+    # The orchestrator has no memory_enabled of its own, so no personal memory is ever written.
+    assert add_calls == []

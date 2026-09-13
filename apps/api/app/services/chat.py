@@ -8,10 +8,12 @@ keeps writing to Redis (and, at the end, the database) whether or not anyone is 
 """
 
 import asyncio
+import re
 import time
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -53,10 +55,11 @@ from app.providers.base import (
     TextDelta,
     ToolCall,
     ToolCallRequest,
+    ToolDefinition,
     Usage,
 )
 from app.providers.registry import build_provider
-from app.services.assistants import get_assistant, list_assistant_tools
+from app.services.assistants import get_assistant, list_assistant_delegates, list_assistant_tools
 from app.services.attachments import attach_to_message, read_attachment_bytes
 from app.services.credentials import decrypt_credential_key, get_credential
 from app.services.flags import evaluate_flag
@@ -69,7 +72,7 @@ from app.services.generations import (
 from app.services.memory import record_turn, retrieve_for_turn
 from app.services.tools import list_enabled_tools, to_tool_definition
 from app.services.usage import record_usage_event
-from app.tools.execute import execute_tool
+from app.tools.execute import MAX_RESULT_CHARS, execute_tool
 
 tracer = get_tracer(__name__)
 
@@ -79,6 +82,10 @@ TITLE_MAX_LENGTH = 60
 # A model that keeps calling tools forever is a billing runaway, not a feature — this bounds one
 # generation to at most this many round trips through the provider before it's forced to a stop.
 MAX_TOOL_ITERATIONS = 5
+
+# A delegate run is a whole LLM tool-calling loop of its own (up to MAX_TOOL_ITERATIONS provider
+# round trips), so it needs far more headroom than execute_tool's own 15s per-call timeout.
+DELEGATION_TIMEOUT_SECONDS = 120.0
 
 # Bounds the raw image bytes carried across one request's assembled history. Unlike text, images
 # live in `history` as actual bytes for the life of the background generation task (up to the
@@ -481,6 +488,28 @@ async def send_message(
     api_key = decrypt_credential_key(credential)
     provider = build_provider(credential.provider, api_key=api_key, base_url=credential.base_url)
 
+    # A delegate is only ever offered alongside an assistant — there's no "workspace-wide"
+    # delegation the way there's a workspace-wide tool set, same reasoning memory follows above.
+    delegates: list[DelegateSpec] = []
+    if assistant is not None:
+        delegation_enabled = await evaluate_flag(
+            db, redis, key="delegation", workspace_id=workspace_id, user_id=conversation.user_id
+        )
+        if delegation_enabled:
+            delegates = await _build_delegate_specs(
+                db,
+                redis,
+                workspace_id=workspace_id,
+                user_id=conversation.user_id,
+                orchestrator=assistant,
+                default_adapter=provider,
+                default_provider=credential.provider,
+                default_model=model,
+                tools_enabled=tools_enabled,
+                memory_flag_enabled=memory_flag_enabled,
+                reserved_names={t.name for t in tools},
+            )
+
     await set_active_generation(redis, conversation.id, generation_id)
 
     task = asyncio.create_task(
@@ -497,6 +526,7 @@ async def send_message(
             tools=tools,
             user_content=content,
             memory_assistant_id=memory_assistant_id,
+            delegates=delegates,
         )
     )
     _background_tasks.add(task)
@@ -506,9 +536,26 @@ async def send_message(
 
 
 @dataclass
+class _DelegateUsage:
+    """What a delegate run spent — priced and recorded as its own UsageEvent once the outer
+    generation is persisted, since it ran on its own model and possibly its own credential."""
+
+    model_id: uuid.UUID
+    provider: Provider
+    tokens_in: int
+    tokens_out: int
+    latency_ms: int
+
+
+@dataclass
 class _ToolInvocationRecord:
     """One tool call from this generation, held in memory until the final assistant message
-    exists to attach it to — see the persistence step at the end of _run_generation."""
+    exists to attach it to — see the persistence step at the end of _run_generation.
+
+    `children` and `usage` are only ever set on a delegation record: a delegate's own tool calls
+    (recorded under it so the transcript shows what it actually did) and what its own LLM usage
+    cost, billed separately from the outer turn. A regular tool call's record never has either.
+    """
 
     tool_id: uuid.UUID | None
     name: str
@@ -517,21 +564,209 @@ class _ToolInvocationRecord:
     status: ToolInvocationStatus
     error: str | None
     latency_ms: int
+    children: list["_ToolInvocationRecord"] = field(default_factory=list)
+    usage: _DelegateUsage | None = None
 
 
-async def _execute_tool_call(
-    redis: Redis, generation_id: str, call: ToolCall, tools_by_name: dict[str, Tool]
-) -> _ToolInvocationRecord:
-    """Run one requested call, emitting the SSE events either side of it, and return a record
-    ready to persist once the generation finishes."""
-    await append_event(redis, generation_id, "tool_call", {"name": call.name, "arguments": call.arguments})
-    tool = tools_by_name.get(call.name)
-    if tool is None:
-        # The model asked for a tool that isn't (or is no longer) enabled — a stale definition
-        # from earlier in a long conversation, not a reason to fail the whole generation.
-        content = f"Tool '{call.name}' is not available."
+@dataclass(frozen=True)
+class DelegateSpec:
+    """One assistant this conversation's assistant may hand a task to — everything needed to run
+    its own tool-calling loop, resolved once per send (see _build_delegate_specs) so the loop
+    itself never has to touch the database. `tool_name` is what the model actually sees and
+    calls; `definition` is the synthesized ToolDefinition offered alongside the real tools."""
+
+    assistant_id: uuid.UUID
+    tool_name: str
+    definition: ToolDefinition
+    instructions: str
+    adapter: LLMProvider
+    provider: Provider
+    model_id: uuid.UUID
+    provider_model_id: str
+    tools: list[Tool]
+    memory_active: bool
+
+
+_DELEGATE_NAME_SANITIZER = re.compile(r"[^a-zA-Z0-9_-]+")
+
+
+def delegate_tool_name(name: str, taken: set[str]) -> str:
+    """Turn an assistant's display name into a legal, collision-free tool name to offer the
+    model — assistant names aren't unique per workspace, but a tool name must be (and must match
+    ^[a-zA-Z0-9_-]+$, capped at 64 chars, same as a real tool's — see schemas/tool.py).
+
+    `taken` starts as the orchestrator's own real tool names and grows by one with every delegate
+    named — the caller does that, not this function — which is what guarantees an `ask_*` name
+    can never collide with a real tool, letting _execute_tool_call check delegates first safely.
+    """
+    slug = _DELEGATE_NAME_SANITIZER.sub("_", name.strip()).strip("_").lower() or "assistant"
+    base = ("ask_" + slug)[:64]
+    if base not in taken:
+        return base
+    suffix = 2
+    while True:
+        tag = f"_{suffix}"
+        candidate = base[: 64 - len(tag)] + tag
+        if candidate not in taken:
+            return candidate
+        suffix += 1
+
+
+async def _build_delegate_specs(
+    db: AsyncSession,
+    redis: Redis,
+    *,
+    workspace_id: uuid.UUID,
+    user_id: uuid.UUID,
+    orchestrator: Assistant,
+    default_adapter: LLMProvider,
+    default_provider: Provider,
+    default_model: LLMModel,
+    tools_enabled: bool,
+    memory_flag_enabled: bool,
+    reserved_names: set[str],
+) -> list[DelegateSpec]:
+    """Resolve every assistant `orchestrator` may delegate to into a ready-to-run DelegateSpec —
+    its own model/credential/adapter if it has one (falling back to the conversation's), its own
+    tools, and whether memory recall applies to it.
+
+    A delegate whose own model's provider has been disabled is skipped outright rather than
+    silently run on a different model its author never chose — the same posture ProviderDisabled
+    already takes for the conversation's own model. Depth is always 1: this never recurses into a
+    delegate's own delegates (list_assistant_delegates is only ever called from here, on
+    `orchestrator`, never on a delegate).
+    """
+    delegates = await list_assistant_delegates(db, assistant_id=orchestrator.id)
+    taken = set(reserved_names)
+    adapters_by_credential: dict[uuid.UUID, LLMProvider] = {}
+    specs: list[DelegateSpec] = []
+    for delegate in delegates:
+        if delegate.model_id is not None:
+            model = await db.get(LLMModel, delegate.model_id)
+            if model is None:
+                continue
+            credential = await get_credential(
+                db, workspace_id=workspace_id, credential_id=model.credential_id
+            )
+            provider_enabled = await evaluate_flag(
+                db,
+                redis,
+                key=f"provider.{credential.provider.value}",
+                workspace_id=workspace_id,
+                user_id=user_id,
+            )
+            if not provider_enabled:
+                continue
+            adapter = adapters_by_credential.get(credential.id)
+            if adapter is None:
+                adapter = build_provider(
+                    credential.provider,
+                    api_key=decrypt_credential_key(credential),
+                    base_url=credential.base_url,
+                )
+                adapters_by_credential[credential.id] = adapter
+            provider, provider_model_id, model_id = credential.provider, model.provider_model_id, model.id
+        else:
+            adapter, provider = default_adapter, default_provider
+            provider_model_id, model_id = default_model.provider_model_id, default_model.id
+
+        tools = await list_assistant_tools(db, assistant_id=delegate.id) if tools_enabled else []
+        tool_name = delegate_tool_name(delegate.name, taken)
+        taken.add(tool_name)
+        specs.append(
+            DelegateSpec(
+                assistant_id=delegate.id,
+                tool_name=tool_name,
+                definition=ToolDefinition(
+                    name=tool_name,
+                    description=(
+                        f'Delegate a task to the "{delegate.name}" assistant and get its answer '
+                        "back. Write a complete, self-contained task — it cannot see this "
+                        "conversation."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {"task": {"type": "string"}},
+                        "required": ["task"],
+                    },
+                ),
+                instructions=delegate.instructions,
+                adapter=adapter,
+                provider=provider,
+                model_id=model_id,
+                provider_model_id=provider_model_id,
+                tools=tools,
+                memory_active=memory_flag_enabled and delegate.memory_enabled,
+            )
+        )
+    return specs
+
+
+class _StopSignal:
+    """A sticky wrapper over one generation's `gen:{id}:stop` pubsub.
+
+    Reading a pubsub message is destructive — if the outer loop and a delegate's own inner loop
+    each polled the raw pubsub directly, whichever one happened to poll first would consume the
+    stop request and the other would never see it, letting the outer loop carry on to another
+    provider call after the user asked to stop. Sharing one `_StopSignal` between them means
+    whichever loop is actually running when the stop arrives observes it, and it latches `stopped`
+    for both from then on.
+    """
+
+    def __init__(self, pubsub: Any) -> None:
+        self._pubsub = pubsub
+        self.stopped = False
+
+    async def check(self) -> bool:
+        if not self.stopped:
+            message = await self._pubsub.get_message(ignore_subscribe_messages=True, timeout=0.01)
+            if message is not None:
+                self.stopped = True
+        return self.stopped
+
+
+@dataclass(frozen=True)
+class _LoopContext:
+    """Everything the tool-calling loop needs that doesn't change between provider round trips,
+    outer turn or delegate run alike — bundled so _run_tool_loop's signature doesn't grow every
+    time the loop needs one more ambient thing from its caller."""
+
+    redis: Redis
+    generation_id: str
+    stop: _StopSignal
+    workspace_id: uuid.UUID
+    user_id: uuid.UUID
+
+
+@dataclass
+class _LoopResult:
+    """What one run through the tool-calling loop produced — shaped identically whether it was
+    the outer generation's own turn or a delegate's."""
+
+    text: str
+    input_tokens: int | None
+    output_tokens: int | None
+    finish_reason: str
+    error_message: str | None
+    stopped: bool
+    invocations: list[_ToolInvocationRecord]
+
+
+async def _run_delegation(ctx: _LoopContext, call: ToolCall, spec: DelegateSpec) -> _ToolInvocationRecord:
+    """Run one delegate end to end: recall its own memory if it has any, run its own tool-calling
+    loop on the task alone — it never sees the outer conversation — and turn the result into the
+    same shape a regular tool call produces, including its own nested ToolInvocation children and
+    the usage it billed, both surfaced to _run_generation's persistence step via the return value.
+    """
+    await append_event(
+        ctx.redis, ctx.generation_id, "tool_call", {"name": call.name, "arguments": call.arguments}
+    )
+
+    task = call.arguments.get("task")
+    if not isinstance(task, str) or not task.strip():
+        content = f"Delegating to '{call.name}' needs a non-empty \"task\" argument."
         await append_event(
-            redis, generation_id, "tool_result", {"name": call.name, "ok": False, "content": content}
+            ctx.redis, ctx.generation_id, "tool_result", {"name": call.name, "ok": False, "content": content}
         )
         return _ToolInvocationRecord(
             tool_id=None,
@@ -542,18 +777,264 @@ async def _execute_tool_call(
             error=content,
             latency_ms=0,
         )
+
+    system_prompt = spec.instructions
+    if spec.memory_active:
+        # A short-lived session, opened and closed before the (possibly long) delegate LLM loop
+        # below runs — not held for the duration of it, the same reasoning _run_generation's own
+        # persistence session only opens after the stream finishes.
+        async with async_session_factory() as memory_db:
+            await set_workspace_scope(memory_db, ctx.workspace_id)
+            memory_block = await retrieve_for_turn(
+                memory_db,
+                workspace_id=ctx.workspace_id,
+                assistant_id=spec.assistant_id,
+                user_id=ctx.user_id,
+                query=task,
+            )
+        if memory_block:
+            system_prompt = f"{system_prompt}\n\n{memory_block}"
+
+    history = [ChatMessage(role="system", content=system_prompt), ChatMessage(role="user", content=task)]
+    started_at = time.monotonic()
+
+    with tracer.start_as_current_span(
+        "llm.delegate",
+        attributes={
+            "generation_id": ctx.generation_id,
+            "assistant_id": str(spec.assistant_id),
+            "tool_name": call.name,
+        },
+    ):
+        try:
+            async with asyncio.timeout(DELEGATION_TIMEOUT_SECONDS):
+                inner = await _run_tool_loop(
+                    ctx,
+                    adapter=spec.adapter,
+                    provider_model_id=spec.provider_model_id,
+                    history=history,
+                    tool_definitions=[to_tool_definition(t) for t in spec.tools],
+                    tools_by_name={t.name: t for t in spec.tools},
+                    delegates_by_name={},  # depth is always 1 — a delegate's own delegates never run
+                    emit_deltas=False,
+                    name_prefix=f"{call.name}/",
+                )
+        except TimeoutError:
+            # The inner stream is cancelled along with it — its partial usage and any tool calls
+            # it had already made are lost, a stated v1 limitation rather than a bug to chase.
+            content = "Delegate timed out."
+            await append_event(
+                ctx.redis,
+                ctx.generation_id,
+                "tool_result",
+                {"name": call.name, "ok": False, "content": content},
+            )
+            return _ToolInvocationRecord(
+                tool_id=None,
+                name=call.name,
+                arguments=call.arguments,
+                result=content,
+                status=ToolInvocationStatus.ERROR,
+                error=content,
+                latency_ms=int((time.monotonic() - started_at) * 1000),
+            )
+
+    latency_ms = int((time.monotonic() - started_at) * 1000)
+    usage = _DelegateUsage(
+        model_id=spec.model_id,
+        provider=spec.provider,
+        tokens_in=inner.input_tokens or 0,
+        tokens_out=inner.output_tokens or 0,
+        latency_ms=latency_ms,
+    )
+    if inner.error_message:
+        content = f"Delegate '{call.name}' failed: {inner.error_message}"
+        status, error, billed_usage = ToolInvocationStatus.ERROR, content, None
+    elif inner.stopped:
+        content = "Delegation was stopped."
+        status, error, billed_usage = ToolInvocationStatus.ERROR, content, usage
+    else:
+        content = inner.text
+        if len(content) > MAX_RESULT_CHARS:
+            content = content[:MAX_RESULT_CHARS] + "\n\n[...truncated]"
+        status, error, billed_usage = ToolInvocationStatus.SUCCESS, None, usage
+
+    await append_event(
+        ctx.redis,
+        ctx.generation_id,
+        "tool_result",
+        {"name": call.name, "ok": status == ToolInvocationStatus.SUCCESS, "content": content},
+    )
+    return _ToolInvocationRecord(
+        tool_id=None,
+        name=call.name,
+        arguments=call.arguments,
+        result=content,
+        status=status,
+        error=error,
+        latency_ms=latency_ms,
+        children=inner.invocations,
+        usage=billed_usage,
+    )
+
+
+async def _execute_tool_call(
+    ctx: _LoopContext,
+    call: ToolCall,
+    tools_by_name: dict[str, Tool],
+    delegates_by_name: dict[str, DelegateSpec],
+    name_prefix: str,
+) -> _ToolInvocationRecord:
+    """Run one requested call, emitting the SSE events either side of it, and return a record
+    ready to persist once the generation finishes.
+
+    A name found in `delegates_by_name` runs another assistant's own loop instead of a real tool
+    — checked first, since delegate tool names are constructed (see delegate_tool_name) to never
+    collide with a real one, so this check can never accidentally shadow an actual tool.
+    """
+    spec = delegates_by_name.get(call.name)
+    if spec is not None:
+        return await _run_delegation(ctx, call, spec)
+
+    display_name = name_prefix + call.name
+    await append_event(
+        ctx.redis, ctx.generation_id, "tool_call", {"name": display_name, "arguments": call.arguments}
+    )
+    tool = tools_by_name.get(call.name)
+    if tool is None:
+        # The model asked for a tool that isn't (or is no longer) enabled — a stale definition
+        # from earlier in a long conversation, not a reason to fail the whole generation.
+        content = f"Tool '{call.name}' is not available."
+        await append_event(
+            ctx.redis,
+            ctx.generation_id,
+            "tool_result",
+            {"name": display_name, "ok": False, "content": content},
+        )
+        return _ToolInvocationRecord(
+            tool_id=None,
+            name=display_name,
+            arguments=call.arguments,
+            result=content,
+            status=ToolInvocationStatus.ERROR,
+            error=content,
+            latency_ms=0,
+        )
     result, latency_ms = await execute_tool(tool, call.arguments)
     await append_event(
-        redis, generation_id, "tool_result", {"name": call.name, "ok": result.ok, "content": result.content}
+        ctx.redis,
+        ctx.generation_id,
+        "tool_result",
+        {"name": display_name, "ok": result.ok, "content": result.content},
     )
     return _ToolInvocationRecord(
         tool_id=tool.id,
-        name=call.name,
+        name=display_name,
         arguments=call.arguments,
         result=result.content,
         status=ToolInvocationStatus.SUCCESS if result.ok else ToolInvocationStatus.ERROR,
         error=None if result.ok else result.content,
         latency_ms=latency_ms,
+    )
+
+
+async def _run_tool_loop(
+    ctx: _LoopContext,
+    *,
+    adapter: LLMProvider,
+    provider_model_id: str,
+    history: list[ChatMessage],
+    tool_definitions: list[ToolDefinition],
+    tools_by_name: dict[str, Tool],
+    delegates_by_name: dict[str, DelegateSpec],
+    emit_deltas: bool,
+    name_prefix: str = "",
+) -> _LoopResult:
+    """Drive the provider round-trip / tool-call cycle to a final answer, up to
+    MAX_TOOL_ITERATIONS times. Used both for the outer generation's own turn (`emit_deltas=True`,
+    `name_prefix=""`) and, one level deep, for a delegate's own turn (`emit_deltas=False` so its
+    partial text never reaches the user directly as if it were the orchestrator talking;
+    `name_prefix="ask_x/"` so any tool calls it makes are visibly nested under the delegation that
+    triggered them). `delegates_by_name` is always empty on that inner call — depth is always 1.
+
+    `history` is mutated in place as the loop appends the assistant's tool requests and their
+    results, same as the original inline loop did.
+    """
+    text_parts: list[str] = []
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    finish_reason = "stop"
+    error_message: str | None = None
+    stopped = False
+    invocations: list[_ToolInvocationRecord] = []
+
+    try:
+        for _ in range(MAX_TOOL_ITERATIONS):
+            # Checked at the top of every iteration too, not just between provider chunks — tool
+            # (or delegate) execution itself can take a while, and a stop request shouldn't have
+            # to wait for the *next* round trip to the provider to take effect.
+            if await ctx.stop.check():
+                finish_reason = "stopped"
+                stopped = True
+                break
+
+            requested_calls: tuple[ToolCall, ...] = ()
+            iteration_text: list[str] = []
+            stream = adapter.stream(
+                model=provider_model_id, messages=history, max_tokens=MAX_TOKENS, tools=tool_definitions
+            )
+            async for chunk in stream:
+                if await ctx.stop.check():
+                    finish_reason = "stopped"
+                    stopped = True
+                    break
+                if isinstance(chunk, TextDelta):
+                    iteration_text.append(chunk.text)
+                    text_parts.append(chunk.text)
+                    if emit_deltas:
+                        await append_event(ctx.redis, ctx.generation_id, "delta", {"text": chunk.text})
+                elif isinstance(chunk, ToolCallRequest):
+                    requested_calls = chunk.calls
+                elif isinstance(chunk, Usage):
+                    input_tokens = (input_tokens or 0) + chunk.input_tokens
+                    output_tokens = (output_tokens or 0) + chunk.output_tokens
+                elif isinstance(chunk, Done):
+                    finish_reason = chunk.finish_reason
+                elif isinstance(chunk, StreamError):
+                    error_message = chunk.message
+                    break
+
+            if error_message or stopped:
+                break
+            if not requested_calls:
+                break  # a normal final answer — nothing more to do
+
+            history.append(
+                ChatMessage(role="assistant", content="".join(iteration_text), tool_calls=requested_calls)
+            )
+            for call in requested_calls:
+                record = await _execute_tool_call(ctx, call, tools_by_name, delegates_by_name, name_prefix)
+                invocations.append(record)
+                history.append(
+                    ChatMessage(role="tool", content=record.result, tool_call_id=call.id, tool_name=call.name)
+                )
+            # Loop again: the provider hasn't given a final answer yet, only asked for tools.
+        else:
+            # Exhausted every iteration without a break — the model never stopped calling tools
+            # for a final answer. Doesn't override a real error or an explicit stop.
+            if not error_message and not stopped:
+                error_message = "The model kept calling tools without finishing an answer."
+    except Exception as exc:  # noqa: BLE001 — any transport failure still needs a terminal result
+        error_message = f"Streaming failed: {exc}"
+
+    return _LoopResult(
+        text="".join(text_parts),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        finish_reason=finish_reason,
+        error_message=error_message,
+        stopped=stopped,
+        invocations=invocations,
     )
 
 
@@ -571,13 +1052,12 @@ async def _run_generation(
     tools: list[Tool],
     user_content: str,
     memory_assistant_id: uuid.UUID | None = None,
+    delegates: Sequence[DelegateSpec] = (),
 ) -> None:
     """Stream a reply from the provider, appending each chunk to Redis, then persist the result.
 
-    When the model calls a tool, this doesn't return — it executes the call, appends the
-    assistant's request and the tool's result to the working history, and calls the provider
-    again, up to MAX_TOOL_ITERATIONS times. Every iteration's usage adds to the same running
-    total, and everything is still one generation, one Redis stream, one persisted reply.
+    When the model calls a tool (or a delegate, offered exactly like one — see DelegateSpec),
+    this doesn't return — see _run_tool_loop, which this drives once for the outer turn.
 
     `memory_assistant_id`, when set, means this turn should be taught to mem0 once it finishes
     successfully — always into that assistant's *personal* scope for `user_id` (see
@@ -590,17 +1070,15 @@ async def _run_generation(
     redis = new_redis_client()
     pubsub = redis.pubsub()
     await pubsub.subscribe(f"gen:{generation_id}:stop")
+    ctx = _LoopContext(
+        redis=redis, generation_id=generation_id, stop=_StopSignal(pubsub),
+        workspace_id=workspace_id, user_id=user_id,
+    )
 
-    tool_definitions = [to_tool_definition(t) for t in tools]
     tools_by_name = {t.name: t for t in tools}
+    delegates_by_name = {d.tool_name: d for d in delegates}
+    tool_definitions = [to_tool_definition(t) for t in tools] + [d.definition for d in delegates]
 
-    text_parts: list[str] = []
-    input_tokens: int | None = None
-    output_tokens: int | None = None
-    finish_reason = "stop"
-    error_message: str | None = None
-    stopped = False
-    invocations: list[_ToolInvocationRecord] = []
     started_at = time.monotonic()
 
     with tracer.start_as_current_span(
@@ -613,74 +1091,22 @@ async def _run_generation(
             "provider_model_id": provider_model_id,
         },
     ) as span:
-        try:
-            for _ in range(MAX_TOOL_ITERATIONS):
-                # Checked at the top of every iteration too, not just between provider chunks —
-                # tool execution itself can take several seconds, and a stop request shouldn't
-                # have to wait for the *next* round trip to the provider to take effect.
-                stop_signal = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.01)
-                if stop_signal is not None:
-                    finish_reason = "stopped"
-                    stopped = True
-                    break
-
-                requested_calls: tuple[ToolCall, ...] = ()
-                iteration_text: list[str] = []
-                stream = adapter.stream(
-                    model=provider_model_id, messages=history, max_tokens=MAX_TOKENS, tools=tool_definitions
-                )
-                async for chunk in stream:
-                    stop_signal = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.01)
-                    if stop_signal is not None:
-                        finish_reason = "stopped"
-                        stopped = True
-                        break
-                    if isinstance(chunk, TextDelta):
-                        iteration_text.append(chunk.text)
-                        text_parts.append(chunk.text)
-                        await append_event(redis, generation_id, "delta", {"text": chunk.text})
-                    elif isinstance(chunk, ToolCallRequest):
-                        requested_calls = chunk.calls
-                    elif isinstance(chunk, Usage):
-                        input_tokens = (input_tokens or 0) + chunk.input_tokens
-                        output_tokens = (output_tokens or 0) + chunk.output_tokens
-                    elif isinstance(chunk, Done):
-                        finish_reason = chunk.finish_reason
-                    elif isinstance(chunk, StreamError):
-                        error_message = chunk.message
-                        break
-
-                if error_message or stopped:
-                    break
-                if not requested_calls:
-                    break  # a normal final answer — nothing more to do
-
-                history.append(
-                    ChatMessage(role="assistant", content="".join(iteration_text), tool_calls=requested_calls)
-                )
-                for call in requested_calls:
-                    record = await _execute_tool_call(redis, generation_id, call, tools_by_name)
-                    invocations.append(record)
-                    history.append(
-                        ChatMessage(
-                            role="tool", content=record.result, tool_call_id=call.id, tool_name=call.name
-                        )
-                    )
-                # Loop again: the provider hasn't given a final answer yet, only asked for tools.
-            else:
-                # Exhausted every iteration without a break — the model never stopped calling
-                # tools for a final answer. Doesn't override a real error or an explicit stop.
-                if not error_message and not stopped:
-                    error_message = "The model kept calling tools without finishing an answer."
-        except Exception as exc:  # noqa: BLE001 — any transport failure still needs a terminal event
-            error_message = f"Streaming failed: {exc}"
-
-        span.set_attribute("finish_reason", finish_reason)
-        span.set_attribute("tokens_in", input_tokens or 0)
-        span.set_attribute("tokens_out", output_tokens or 0)
-        span.set_attribute("tool_calls", len(invocations))
-        if error_message:
-            span.set_attribute("error", error_message)
+        result = await _run_tool_loop(
+            ctx,
+            adapter=adapter,
+            provider_model_id=provider_model_id,
+            history=history,
+            tool_definitions=tool_definitions,
+            tools_by_name=tools_by_name,
+            delegates_by_name=delegates_by_name,
+            emit_deltas=True,
+        )
+        span.set_attribute("finish_reason", result.finish_reason)
+        span.set_attribute("tokens_in", result.input_tokens or 0)
+        span.set_attribute("tokens_out", result.output_tokens or 0)
+        span.set_attribute("tool_calls", len(result.invocations))
+        if result.error_message:
+            span.set_attribute("error", result.error_message)
 
     latency_ms = int((time.monotonic() - started_at) * 1000)
 
@@ -689,21 +1115,21 @@ async def _run_generation(
         # request) — row-level security would otherwise block its own reads below.
         await set_workspace_scope(db, workspace_id)
         model = await db.get(LLMModel, model_id)
-        cost_usd = None
+        own_cost_usd = None
         if model is not None and model.cost_per_mtok_in is not None and model.cost_per_mtok_out is not None:
-            cost_usd = (
-                (input_tokens or 0) / 1_000_000 * model.cost_per_mtok_in
-                + (output_tokens or 0) / 1_000_000 * model.cost_per_mtok_out
+            own_cost_usd = (
+                (result.input_tokens or 0) / 1_000_000 * model.cost_per_mtok_in
+                + (result.output_tokens or 0) / 1_000_000 * model.cost_per_mtok_out
             )
         assistant_message = Message(
             conversation_id=conversation_id,
             role=MessageRole.ASSISTANT,
-            content="".join(text_parts),
-            tokens_in=input_tokens,
-            tokens_out=output_tokens,
-            cost_usd=cost_usd,
-            finish_reason=None if error_message else finish_reason,
-            error=error_message,
+            content=result.text,
+            tokens_in=result.input_tokens,
+            tokens_out=result.output_tokens,
+            cost_usd=own_cost_usd,
+            finish_reason=None if result.error_message else result.finish_reason,
+            error=result.error_message,
         )
         db.add(assistant_message)
         conversation = await db.get(Conversation, conversation_id)
@@ -713,21 +1139,63 @@ async def _run_generation(
         # a generation that failed on, say, its third round trip may still have two real tool
         # calls worth recording.
         await db.flush()
-        for record in invocations:
-            db.add(
-                ToolInvocation(
-                    workspace_id=workspace_id,
-                    message_id=assistant_message.id,
-                    tool_id=record.tool_id,
-                    name=record.name,
-                    arguments=record.arguments,
-                    result=record.result,
-                    status=record.status,
-                    error=record.error,
-                    latency_ms=record.latency_ms,
+
+        # A delegate's model is very often not this generation's own — cached by id so a
+        # generation with several delegate calls on the same model doesn't reload it each time.
+        models_by_id: dict[uuid.UUID, LLMModel] = {model.id: model} if model is not None else {}
+        total_cost_usd = own_cost_usd
+        for record in result.invocations:
+            for row in (record, *record.children):
+                db.add(
+                    ToolInvocation(
+                        workspace_id=workspace_id,
+                        message_id=assistant_message.id,
+                        tool_id=row.tool_id,
+                        name=row.name,
+                        arguments=row.arguments,
+                        result=row.result,
+                        status=row.status,
+                        error=row.error,
+                        latency_ms=row.latency_ms,
+                    )
                 )
+            if record.usage is None:
+                continue
+            usage = record.usage
+            delegate_model = models_by_id.get(usage.model_id)
+            if delegate_model is None:
+                delegate_model = await db.get(LLMModel, usage.model_id)
+                if delegate_model is not None:
+                    models_by_id[usage.model_id] = delegate_model
+            delegate_cost = 0.0
+            if (
+                delegate_model is not None
+                and delegate_model.cost_per_mtok_in is not None
+                and delegate_model.cost_per_mtok_out is not None
+            ):
+                delegate_cost = (
+                    usage.tokens_in / 1_000_000 * delegate_model.cost_per_mtok_in
+                    + usage.tokens_out / 1_000_000 * delegate_model.cost_per_mtok_out
+                )
+            total_cost_usd = (total_cost_usd or 0) + delegate_cost
+            # A delegate's tokens were genuinely spent even if the outer turn later errored —
+            # unlike the outer generation's own usage event below, this one is never skipped.
+            await record_usage_event(
+                db,
+                workspace_id=workspace_id,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                message_id=assistant_message.id,
+                model_id=usage.model_id,
+                provider=usage.provider,
+                tokens_in=usage.tokens_in,
+                tokens_out=usage.tokens_out,
+                cost_usd=delegate_cost,
+                latency_ms=usage.latency_ms,
             )
-        if not error_message:
+        assistant_message.cost_usd = total_cost_usd
+
+        if not result.error_message:
             # A stopped-but-partial reply still used real tokens and is still billable; only an
             # outright failure (never reaching a "done") produces nothing worth metering.
             await record_usage_event(
@@ -738,23 +1206,23 @@ async def _run_generation(
                 message_id=assistant_message.id,
                 model_id=model_id,
                 provider=provider,
-                tokens_in=input_tokens or 0,
-                tokens_out=output_tokens or 0,
-                cost_usd=cost_usd or 0,
+                tokens_in=result.input_tokens or 0,
+                tokens_out=result.output_tokens or 0,
+                cost_usd=own_cost_usd or 0,
                 latency_ms=latency_ms,
             )
         await db.commit()
 
-    if error_message:
-        await append_event(redis, generation_id, "error", {"message": error_message})
+    if result.error_message:
+        await append_event(redis, generation_id, "error", {"message": result.error_message})
     else:
-        await append_event(redis, generation_id, "done", {"finish_reason": finish_reason})
+        await append_event(redis, generation_id, "done", {"finish_reason": result.finish_reason})
     await clear_active_generation(redis, conversation_id)
 
-    if not error_message and memory_assistant_id is not None:
+    if not result.error_message and memory_assistant_id is not None:
         # Fire-and-forget, after the reply is already visible to its reader — a slow or
         # unreachable mem0 must never be the reason a reply takes longer to arrive. A failed
-        # generation has nothing worth teaching mem0, hence the `not error_message` guard.
+        # generation has nothing worth teaching mem0, hence the `not result.error_message` guard.
         memory_task = asyncio.create_task(
             record_turn(
                 workspace_id=workspace_id,

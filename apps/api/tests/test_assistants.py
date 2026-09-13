@@ -9,7 +9,7 @@ from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.errors import AssistantNotFound, ModelNotFound, ToolNotFound
+from app.core.errors import AssistantNotFound, ModelNotFound, SelfDelegation, ToolNotFound
 from app.models import (
     Assistant,
     AuditLog,
@@ -26,6 +26,8 @@ from app.services.assistants import (
     create_assistant,
     delete_assistant,
     get_assistant,
+    list_assistant_delegate_ids,
+    list_assistant_delegates,
     list_assistant_tool_ids,
     list_assistant_tools,
     list_assistants,
@@ -124,6 +126,7 @@ async def test_creating_an_assistant_needs_no_model_or_tools(client: AsyncClient
     assert body["instructions"] == "Be helpful and concise."
     assert body["model_id"] is None
     assert body["tool_ids"] == []
+    assert body["delegate_ids"] == []
 
 
 async def test_creating_an_assistant_with_a_model_and_tools(
@@ -168,6 +171,31 @@ async def test_creating_an_assistant_rejects_a_model_from_another_workspace(
     )
 
     assert response.status_code == 404
+
+
+async def test_creating_an_assistant_that_delegates_to_another(
+    client: AsyncClient, db: AsyncSession
+) -> None:
+    """delegate_ids round-trips through the API — the create body, and back out in AssistantOut."""
+    workspace_id = await _owner_with_workspace(client)
+    researcher = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/assistants",
+        json={"name": "Researcher", "instructions": "Research things."},
+    )
+    assert researcher.status_code == 201
+    researcher_id = researcher.json()["id"]
+
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/assistants",
+        json={
+            "name": "Writer",
+            "instructions": "Write things.",
+            "delegate_ids": [researcher_id],
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["delegate_ids"] == [researcher_id]
 
 
 async def test_creating_an_assistant_rejects_a_tool_from_another_workspace(
@@ -431,3 +459,86 @@ async def test_list_assistants_orders_oldest_first(db: AsyncSession) -> None:
     assistants = await list_assistants(db, workspace_id=workspace.id)
 
     assert [a.id for a in assistants] == [first.id, second.id]
+
+
+async def test_update_assistant_rejects_delegating_to_itself(db: AsyncSession) -> None:
+    """An assistant can't be told to ask itself for help. Only reachable via update, not create —
+    an assistant's id doesn't exist yet for a caller to name at creation time."""
+    user, workspace = await _user_with_workspace(db, email="svc8@example.com", slug="svc-ws8")
+    assistant = await create_assistant(
+        db, workspace_id=workspace.id, created_by=user, name="Bot", instructions="x",
+        model_id=None, tool_ids=[],
+    )
+    await db.commit()
+
+    with pytest.raises(SelfDelegation):
+        await update_assistant(
+            db, workspace_id=workspace.id, assistant_id=assistant.id,
+            changes={"delegate_ids": [assistant.id]},
+        )
+
+
+async def test_create_assistant_rejects_a_delegate_from_another_workspace(db: AsyncSession) -> None:
+    user, workspace = await _user_with_workspace(db, email="svc9@example.com", slug="svc-ws9")
+    other_user, other_workspace = await _user_with_workspace(db, email="svc9b@example.com", slug="svc-ws9b")
+    other_assistant = await create_assistant(
+        db, workspace_id=other_workspace.id, created_by=other_user, name="Other", instructions="x",
+        model_id=None, tool_ids=[],
+    )
+    await db.commit()
+
+    with pytest.raises(AssistantNotFound):
+        await create_assistant(
+            db, workspace_id=workspace.id, created_by=user, name="Bot", instructions="x",
+            model_id=None, tool_ids=[], delegate_ids=[other_assistant.id],
+        )
+
+
+async def test_assistant_can_delegate_to_another_in_the_same_workspace(db: AsyncSession) -> None:
+    user, workspace = await _user_with_workspace(db, email="svc10@example.com", slug="svc-ws10")
+    researcher = await create_assistant(
+        db, workspace_id=workspace.id, created_by=user, name="Researcher", instructions="Research things.",
+        model_id=None, tool_ids=[],
+    )
+    orchestrator = await create_assistant(
+        db, workspace_id=workspace.id, created_by=user, name="Writer", instructions="Write things.",
+        model_id=None, tool_ids=[], delegate_ids=[researcher.id],
+    )
+    await db.commit()
+
+    delegate_ids = await list_assistant_delegate_ids(db, assistant_id=orchestrator.id)
+    delegates = await list_assistant_delegates(db, assistant_id=orchestrator.id)
+
+    assert delegate_ids == [researcher.id]
+    assert [d.id for d in delegates] == [researcher.id]
+
+
+async def test_update_assistant_replaces_the_whole_delegate_assignment(db: AsyncSession) -> None:
+    """Sending delegate_ids always replaces the full set — not an incremental add, same shape
+    tool_ids already follows."""
+    user, workspace = await _user_with_workspace(db, email="svc11@example.com", slug="svc-ws11")
+    a = await create_assistant(
+        db, workspace_id=workspace.id, created_by=user, name="A", instructions="x",
+        model_id=None, tool_ids=[],
+    )
+    b = await create_assistant(
+        db, workspace_id=workspace.id, created_by=user, name="B", instructions="x",
+        model_id=None, tool_ids=[],
+    )
+    orchestrator = await create_assistant(
+        db, workspace_id=workspace.id, created_by=user, name="Orchestrator", instructions="x",
+        model_id=None, tool_ids=[], delegate_ids=[a.id],
+    )
+    await db.commit()
+
+    await update_assistant(
+        db, workspace_id=workspace.id, assistant_id=orchestrator.id, changes={"delegate_ids": [b.id]}
+    )
+
+    delegate_ids = await list_assistant_delegate_ids(db, assistant_id=orchestrator.id)
+    assert delegate_ids == [b.id]
+
+    await update_assistant(
+        db, workspace_id=workspace.id, assistant_id=orchestrator.id, changes={"delegate_ids": []}
+    )
+    assert await list_assistant_delegate_ids(db, assistant_id=orchestrator.id) == []
