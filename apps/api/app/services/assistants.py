@@ -11,8 +11,8 @@ from typing import Any
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.errors import AssistantNotFound, ModelNotFound, ToolNotFound
-from app.models import Assistant, AssistantTool, LLMModel, Tool, User
+from app.core.errors import AssistantNotFound, ModelNotFound, SelfDelegation, ToolNotFound
+from app.models import Assistant, AssistantDelegate, AssistantTool, LLMModel, Tool, User
 
 
 async def _assert_model_in_workspace(
@@ -46,6 +46,31 @@ async def _set_assistant_tools(
         db.add(AssistantTool(assistant_id=assistant_id, tool_id=tool_id))
 
 
+async def _assert_delegates_in_workspace(
+    db: AsyncSession, *, workspace_id: uuid.UUID, assistant_id: uuid.UUID, delegate_ids: list[uuid.UUID]
+) -> None:
+    """Every delegate id must be a real assistant in this workspace, and none may be
+    `assistant_id` itself — an assistant can't be told to ask itself for help."""
+    if not delegate_ids:
+        return
+    if assistant_id in delegate_ids:
+        raise SelfDelegation()
+    stmt = select(Assistant.id).where(Assistant.id.in_(delegate_ids), Assistant.workspace_id == workspace_id)
+    found = set((await db.scalars(stmt)).all())
+    if set(delegate_ids) - found:
+        raise AssistantNotFound()
+
+
+async def _set_assistant_delegates(
+    db: AsyncSession, *, assistant_id: uuid.UUID, delegate_ids: list[uuid.UUID]
+) -> None:
+    """Replace an assistant's entire delegate assignment with `delegate_ids` — same full-set-
+    replace shape as `_set_assistant_tools`."""
+    await db.execute(delete(AssistantDelegate).where(AssistantDelegate.assistant_id == assistant_id))
+    for delegate_id in delegate_ids:
+        db.add(AssistantDelegate(assistant_id=assistant_id, delegate_id=delegate_id))
+
+
 async def create_assistant(
     db: AsyncSession,
     *,
@@ -56,9 +81,12 @@ async def create_assistant(
     model_id: uuid.UUID | None,
     tool_ids: list[uuid.UUID],
     memory_enabled: bool = False,
+    delegate_ids: list[uuid.UUID] | None = None,
 ) -> Assistant:
-    """Save a new assistant. `model_id` and every id in `tool_ids` must already belong to this
-    workspace — the same 404 a stale or cross-workspace id gets anywhere else in this codebase."""
+    """Save a new assistant. `model_id` and every id in `tool_ids`/`delegate_ids` must already
+    belong to this workspace — the same 404 a stale or cross-workspace id gets anywhere else in
+    this codebase. `delegate_ids` defaults to none: most assistants delegate to nothing."""
+    delegate_ids = delegate_ids or []
     if model_id is not None:
         await _assert_model_in_workspace(db, workspace_id=workspace_id, model_id=model_id)
     await _assert_tools_in_workspace(db, workspace_id=workspace_id, tool_ids=tool_ids)
@@ -72,8 +100,12 @@ async def create_assistant(
         memory_enabled=memory_enabled,
     )
     db.add(assistant)
-    await db.flush()
+    await db.flush()  # materializes assistant.id — needed below to reject self-delegation
+    await _assert_delegates_in_workspace(
+        db, workspace_id=workspace_id, assistant_id=assistant.id, delegate_ids=delegate_ids
+    )
     await _set_assistant_tools(db, assistant_id=assistant.id, tool_ids=tool_ids)
+    await _set_assistant_delegates(db, assistant_id=assistant.id, delegate_ids=delegate_ids)
     await db.flush()
     return assistant
 
@@ -115,6 +147,26 @@ async def list_assistant_tools(db: AsyncSession, *, assistant_id: uuid.UUID) -> 
     return list((await db.scalars(stmt)).all())
 
 
+async def list_assistant_delegate_ids(db: AsyncSession, *, assistant_id: uuid.UUID) -> list[uuid.UUID]:
+    """The delegate ids assigned to one assistant — what AssistantOut reports back to a settings
+    page so its checkboxes can show the current assignment."""
+    stmt = select(AssistantDelegate.delegate_id).where(AssistantDelegate.assistant_id == assistant_id)
+    return list((await db.scalars(stmt)).all())
+
+
+async def list_assistant_delegates(db: AsyncSession, *, assistant_id: uuid.UUID) -> list[Assistant]:
+    """The assistants this one may delegate a task to, in the order they were assigned — what
+    chat.py offers as synthesized `ask_*` tools, resolved fresh on every send. Depth is always 1:
+    a delegate's own delegates are never looked up here."""
+    stmt = (
+        select(Assistant)
+        .join(AssistantDelegate, AssistantDelegate.delegate_id == Assistant.id)
+        .where(AssistantDelegate.assistant_id == assistant_id)
+        .order_by(AssistantDelegate.created_at)
+    )
+    return list((await db.scalars(stmt)).all())
+
+
 async def update_assistant(
     db: AsyncSession, *, workspace_id: uuid.UUID, assistant_id: uuid.UUID, changes: dict[str, Any]
 ) -> Assistant:
@@ -134,6 +186,12 @@ async def update_assistant(
         tool_ids = changes["tool_ids"] or []
         await _assert_tools_in_workspace(db, workspace_id=workspace_id, tool_ids=tool_ids)
         await _set_assistant_tools(db, assistant_id=assistant.id, tool_ids=tool_ids)
+    if "delegate_ids" in changes:
+        delegate_ids = changes["delegate_ids"] or []
+        await _assert_delegates_in_workspace(
+            db, workspace_id=workspace_id, assistant_id=assistant.id, delegate_ids=delegate_ids
+        )
+        await _set_assistant_delegates(db, assistant_id=assistant.id, delegate_ids=delegate_ids)
     if "memory_enabled" in changes:
         assistant.memory_enabled = bool(changes["memory_enabled"])
     await db.flush()

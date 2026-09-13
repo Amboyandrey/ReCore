@@ -220,6 +220,13 @@ class AssistantNotFound(AppError):
     detail = "Assistant not found."
 
 
+class SelfDelegation(AppError):
+    """Raised when an assistant's own id appears in its `delegate_ids` — it can't ask itself."""
+
+    status_code = 422
+    detail = "An assistant can't delegate to itself."
+
+
 class MemoryNotConfigured(AppError):
     """Raised when a memory route is used before the workspace has set a mem0 API key."""
 

@@ -17,6 +17,7 @@ class AssistantCreate(BaseModel):
     model_id: uuid.UUID | None = None
     tool_ids: list[uuid.UUID] = Field(default_factory=list)
     memory_enabled: bool = False
+    delegate_ids: list[uuid.UUID] = Field(default_factory=list)
 
 
 class AssistantUpdate(BaseModel):
@@ -29,6 +30,7 @@ class AssistantUpdate(BaseModel):
     model_id: uuid.UUID | None = None
     tool_ids: list[uuid.UUID] | None = None
     memory_enabled: bool | None = None
+    delegate_ids: list[uuid.UUID] | None = None
 
 
 class AssistantOut(BaseModel):
@@ -47,5 +49,6 @@ class AssistantOut(BaseModel):
     model_id: uuid.UUID | None
     tool_ids: list[uuid.UUID]
     memory_enabled: bool
+    delegate_ids: list[uuid.UUID]
     created_by: uuid.UUID
     created_at: datetime
