@@ -25,6 +25,15 @@ function pickDefaultModel(workspaceId: string, models: EnabledModel[]): EnabledM
   return last || models.find((m) => m.provider_enabled) || models[0];
 }
 
+// A few starting points shown on the otherwise-empty draft composer — not connected to anything
+// beyond filling the textarea, purely so the big blank canvas isn't a dead end.
+const SUGGESTIONS = [
+  "Explain a concept simply",
+  "Draft an email",
+  "Brainstorm some ideas",
+  "Help me write some code",
+];
+
 // A brand-new chat's composer. Nothing is saved to the database just by landing here — no
 // conversation row exists until either a file is attached or the first message is sent, unlike
 // the old flow where clicking "+ New chat" created (and usually immediately abandoned) one right
@@ -59,6 +68,7 @@ export function NewChat({ slug }: { slug: string }) {
   // without waiting for a re-render.
   const conversationIdRef = useRef<string | null>(null);
   const creatingRef = useRef<Promise<string> | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const modelSupportsVision = models.find((m) => m.id === modelId)?.supports_vision ?? false;
 
@@ -193,6 +203,11 @@ export function NewChat({ slug }: { slug: string }) {
     setPendingAttachments((prev) => prev.filter((a) => a.id !== id));
   }
 
+  function handleSuggestionClick(text: string) {
+    setInput(text);
+    textareaRef.current?.focus();
+  }
+
   async function handleDeleteConversation(id: string) {
     if (!workspace) return;
     try {
@@ -227,20 +242,20 @@ export function NewChat({ slug }: { slug: string }) {
       />
 
       <div className="flex min-h-screen min-w-0 flex-1 flex-col">
-        <div className="sticky top-0 z-40 border-b border-border bg-surface px-6 py-4">
-          <div className="mx-auto max-w-3xl">
+        <div className="sticky top-0 z-40 flex h-16 items-center border-b border-border bg-surface px-6">
+          <div className="mx-auto w-full max-w-3xl">
             <h1 className="text-lg font-semibold text-text">New chat</h1>
           </div>
         </div>
 
-        <div className="mx-auto w-full max-w-3xl flex-1 px-6">
+        <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col px-6">
           {error && (
             <p className="mt-3 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger">
               {error}
             </p>
           )}
 
-          {models.length === 0 && (
+          {models.length === 0 ? (
             <p className="mt-6 text-sm text-text-soft">
               No models are enabled yet.{" "}
               <Link href={`/w/${slug}/settings/providers`} className="text-accent">
@@ -248,6 +263,29 @@ export function NewChat({ slug }: { slug: string }) {
               </Link>{" "}
               first.
             </p>
+          ) : (
+            !error && (
+              <div className="flex flex-1 flex-col items-center justify-center gap-6 text-center">
+                <div>
+                  <h2 className="text-xl font-semibold text-text">Start a new conversation</h2>
+                  <p className="mt-1 text-sm text-text-muted">
+                    Ask anything, or try one of these to get going.
+                  </p>
+                </div>
+                <div className="flex flex-wrap justify-center gap-2">
+                  {SUGGESTIONS.map((s) => (
+                    <button
+                      key={s}
+                      type="button"
+                      onClick={() => handleSuggestionClick(s)}
+                      className="rounded-full border border-border px-3 py-1.5 text-sm text-text-soft hover:border-border-strong hover:text-text"
+                    >
+                      {s}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )
           )}
         </div>
 
@@ -309,6 +347,7 @@ export function NewChat({ slug }: { slug: string }) {
                 </label>
               )}
               <textarea
+                ref={textareaRef}
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}

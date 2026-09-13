@@ -207,7 +207,7 @@ export function ConversationSidebar({
 
   return (
     <aside className="sticky top-0 hidden h-screen w-64 shrink-0 flex-col border-r border-border sm:flex">
-      <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-3">
+      <div className="flex h-16 shrink-0 items-center gap-2 border-b border-border px-3">
         <Link href={`/w/${slug}`} className="text-sm font-semibold tracking-tight text-text">
           ReCore
         </Link>

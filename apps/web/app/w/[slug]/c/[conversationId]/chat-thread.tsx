@@ -411,8 +411,8 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
       />
 
       <div className="flex min-h-screen min-w-0 flex-1 flex-col">
-        <div className="sticky top-0 z-40 border-b border-border bg-surface px-6 py-4">
-        <div className="mx-auto flex max-w-3xl items-center justify-between gap-3">
+        <div className="sticky top-0 z-40 flex h-16 items-center border-b border-border bg-surface px-6">
+        <div className="mx-auto flex w-full max-w-3xl items-center justify-between gap-3">
           <h1 className="truncate text-lg font-semibold text-text">{conversation.title}</h1>
           <div className="flex shrink-0 items-center gap-2">
             {isOwner ? (
