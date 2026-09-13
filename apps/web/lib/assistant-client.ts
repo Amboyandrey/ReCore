@@ -7,6 +7,10 @@ export type Assistant = {
   model_id: string | null;
   tool_ids: string[];
   memory_enabled: boolean;
+  // Other assistants this one may hand a task to during chat, offered to its model as
+  // `ask_<name>` tools (see the `delegation` flag) — resolved fresh on every send, one level
+  // deep only (a delegate's own delegate_ids are never followed).
+  delegate_ids: string[];
   created_by: string;
   created_at: string;
 };
@@ -17,6 +21,7 @@ export type AssistantCreateInput = {
   model_id?: string;
   tool_ids?: string[];
   memory_enabled?: boolean;
+  delegate_ids?: string[];
 };
 
 // Only the fields present change (see AssistantUpdate's `exclude_unset` on the API side) —
@@ -28,6 +33,7 @@ export type AssistantUpdateInput = {
   model_id?: string | null;
   tool_ids?: string[];
   memory_enabled?: boolean;
+  delegate_ids?: string[];
 };
 
 export class AssistantError extends Error {}

@@ -28,6 +28,7 @@ type AssistantFormState = {
   modelId: string; // "" means "workspace default"
   toolIds: Set<string>;
   memoryEnabled: boolean;
+  delegateIds: Set<string>;
 };
 
 const EMPTY_FORM: AssistantFormState = {
@@ -36,6 +37,7 @@ const EMPTY_FORM: AssistantFormState = {
   modelId: "",
   toolIds: new Set(),
   memoryEnabled: false,
+  delegateIds: new Set(),
 };
 
 // The assistants settings page: save a name + required instructions + an optional preferred
@@ -48,6 +50,7 @@ export function AssistantsSettings({ slug }: { slug: string }) {
   const { workspace, loading: wsLoading } = useWorkspaceBySlug(slug);
   const { flags, loading: flagsLoading } = useWorkspaceFlags(workspace?.id);
   const memoryFeatureEnabled = flags.memory === true;
+  const delegationFeatureEnabled = flags.delegation === true;
   const isAdmin = workspace?.role === "admin" || workspace?.role === "owner";
   const isOwner = workspace?.role === "owner";
 
@@ -103,6 +106,7 @@ export function AssistantsSettings({ slug }: { slug: string }) {
       modelId: assistant.model_id ?? "",
       toolIds: new Set(assistant.tool_ids),
       memoryEnabled: assistant.memory_enabled,
+      delegateIds: new Set(assistant.delegate_ids),
     });
   }
 
@@ -117,6 +121,15 @@ export function AssistantsSettings({ slug }: { slug: string }) {
       if (checked) toolIds.add(toolId);
       else toolIds.delete(toolId);
       return { ...f, toolIds };
+    });
+  }
+
+  function toggleDelegate(assistantId: string, checked: boolean) {
+    setForm((f) => {
+      const delegateIds = new Set(f.delegateIds);
+      if (checked) delegateIds.add(assistantId);
+      else delegateIds.delete(assistantId);
+      return { ...f, delegateIds };
     });
   }
 
@@ -159,6 +172,7 @@ export function AssistantsSettings({ slug }: { slug: string }) {
           model_id: form.modelId || null,
           tool_ids: [...form.toolIds],
           memory_enabled: form.memoryEnabled,
+          delegate_ids: [...form.delegateIds],
         });
         setAssistants((prev) => prev.map((a) => (a.id === updated.id ? updated : a)));
       } else {
@@ -168,6 +182,7 @@ export function AssistantsSettings({ slug }: { slug: string }) {
           model_id: form.modelId || undefined,
           tool_ids: [...form.toolIds],
           memory_enabled: form.memoryEnabled,
+          delegate_ids: [...form.delegateIds],
         });
         setAssistants((prev) => [...prev, created]);
       }
@@ -286,6 +301,11 @@ export function AssistantsSettings({ slug }: { slug: string }) {
                           Memory on
                         </span>
                       )}
+                      {a.delegate_ids.length > 0 && (
+                        <span className="rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-xs text-accent">
+                          Delegates to {a.delegate_ids.length}
+                        </span>
+                      )}
                     </div>
                     <p className="mt-0.5 truncate text-xs text-text-muted">{a.instructions}</p>
                   </div>
@@ -389,6 +409,32 @@ export function AssistantsSettings({ slug }: { slug: string }) {
             </div>
           )}
         </div>
+
+        {delegationFeatureEnabled && (
+          <div className="flex flex-col gap-1.5 text-sm">
+            <span className="text-text-soft">Can delegate to (optional)</span>
+            {assistants.filter((a) => a.id !== editingId).length === 0 ? (
+              <p className="text-xs text-text-muted">
+                No other assistants in this workspace yet to delegate to.
+              </p>
+            ) : (
+              <div className="flex flex-col gap-1.5">
+                {assistants
+                  .filter((a) => a.id !== editingId)
+                  .map((a) => (
+                    <label key={a.id} className="flex items-center gap-2 text-xs text-text-soft">
+                      <input
+                        type="checkbox"
+                        checked={form.delegateIds.has(a.id)}
+                        onChange={(e) => toggleDelegate(a.id, e.target.checked)}
+                      />
+                      <span className="text-text">{a.name}</span>
+                    </label>
+                  ))}
+              </div>
+            )}
+          </div>
+        )}
 
         {memoryFeatureEnabled && (
           <label className="flex items-center gap-2 text-sm text-text-soft">
