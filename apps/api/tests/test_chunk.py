@@ -17,7 +17,7 @@ def test_paragraphs_are_packed_up_to_the_target_size() -> None:
     paragraphs = ["A" * 40, "B" * 40, "C" * 40]
     text = "\n\n".join(paragraphs)
 
-    chunks = chunk_text(text, target=90, overlap=0)
+    chunks = chunk_text(text, target=90, overlap=0, single_chunk_max=0)
 
     # "A"*40 + "\n\n" + "B"*40 = 82 chars (<=90); adding "C"*40 would push past 90.
     assert chunks == ["A" * 40 + "\n\n" + "B" * 40, "C" * 40]
@@ -28,7 +28,7 @@ def test_a_paragraph_longer_than_target_is_split_at_whitespace() -> None:
     never mid-word."""
     long_paragraph = " ".join(["word"] * 100)  # 100 * 5 - 1 = 499 chars
 
-    chunks = chunk_text(long_paragraph, target=50, overlap=0)
+    chunks = chunk_text(long_paragraph, target=50, overlap=0, single_chunk_max=0)
 
     assert len(chunks) > 1
     assert all(len(c) <= 50 for c in chunks)
@@ -41,7 +41,7 @@ def test_each_chunk_after_the_first_is_prefixed_with_the_previous_overlap() -> N
     paragraphs = ["A" * 40, "B" * 40, "C" * 40]
     text = "\n\n".join(paragraphs)
 
-    chunks = chunk_text(text, target=45, overlap=10)
+    chunks = chunk_text(text, target=45, overlap=10, single_chunk_max=0)
 
     assert len(chunks) == 3
     assert chunks[0] == "A" * 40
@@ -49,9 +49,21 @@ def test_each_chunk_after_the_first_is_prefixed_with_the_previous_overlap() -> N
     assert chunks[2] == ("B" * 40)[-10:] + "\n\n" + "C" * 40
 
 
+def test_a_document_under_single_chunk_max_is_never_split() -> None:
+    """A short multi-paragraph document that would otherwise be packed into several chunks stays
+    a single chunk instead, once its whole length fits under single_chunk_max — the guard against
+    retrieval keeping the wrong (boilerplate) chunk over the one that answers the query."""
+    paragraphs = ["A" * 100, "B" * 100, "C" * 100]
+    text = "\n\n".join(paragraphs)
+
+    chunks = chunk_text(text, target=90, overlap=20, single_chunk_max=1000)
+
+    assert chunks == [text]
+
+
 def test_zero_overlap_returns_the_packed_chunks_unmodified() -> None:
     # Each paragraph (17 and 18 chars) fits target=20 on its own, but not combined (37 chars) —
     # so they land in separate chunks, neither one split internally.
     text = "First paragraph.\n\nSecond paragraph."
-    chunks = chunk_text(text, target=20, overlap=0)
+    chunks = chunk_text(text, target=20, overlap=0, single_chunk_max=0)
     assert chunks == ["First paragraph.", "Second paragraph."]

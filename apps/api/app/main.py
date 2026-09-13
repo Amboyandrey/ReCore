@@ -23,6 +23,7 @@ from app.routers.v1 import (
     members,
     memory,
     models,
+    sources,
     tool_invocations,
     tools,
     usage,
@@ -66,6 +67,7 @@ app.include_router(memory.credential_router, prefix="/api/v1")
 app.include_router(memory.memories_router, prefix="/api/v1")
 app.include_router(knowledge.settings_router, prefix="/api/v1")
 app.include_router(knowledge.connectors_router, prefix="/api/v1")
+app.include_router(sources.router, prefix="/api/v1")
 app.include_router(usage.router, prefix="/api/v1")
 app.include_router(audit.router, prefix="/api/v1")
 

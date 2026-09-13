@@ -9,10 +9,13 @@ from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.errors import AssistantNotFound, ModelNotFound, SelfDelegation, ToolNotFound
+from app.core.errors import AssistantNotFound, ConnectorNotFound, ModelNotFound, SelfDelegation, ToolNotFound
 from app.models import (
     Assistant,
     AuditLog,
+    Connector,
+    ConnectorKind,
+    ConnectorStatus,
     Conversation,
     LLMModel,
     Provider,
@@ -26,6 +29,7 @@ from app.services.assistants import (
     create_assistant,
     delete_assistant,
     get_assistant,
+    list_assistant_connector_ids,
     list_assistant_delegate_ids,
     list_assistant_delegates,
     list_assistant_tool_ids,
@@ -96,6 +100,21 @@ async def _tool_in_workspace(
     db.add(tool)
     await db.flush()
     return tool
+
+
+async def _connector_in_workspace(
+    db: AsyncSession, *, workspace_id: uuid.UUID, created_by: uuid.UUID, name: str
+) -> Connector:
+    connector = Connector(
+        workspace_id=workspace_id,
+        kind=ConnectorKind.WEBSITE,
+        name=name,
+        status=ConnectorStatus.READY,
+        created_by=created_by,
+    )
+    db.add(connector)
+    await db.flush()
+    return connector
 
 
 # ---------- Router ----------
@@ -196,6 +215,43 @@ async def test_creating_an_assistant_that_delegates_to_another(
 
     assert response.status_code == 201
     assert response.json()["delegate_ids"] == [researcher_id]
+
+
+async def test_creating_an_assistant_with_a_connector(client: AsyncClient, db: AsyncSession) -> None:
+    """connector_ids round-trips through the API — the create body, and back out in AssistantOut."""
+    workspace_id = await _owner_with_workspace(client)
+    owner = await db.scalar(select(User).where(User.email == OWNER["email"]))
+    assert owner is not None
+    connector = await _connector_in_workspace(
+        db, workspace_id=uuid.UUID(workspace_id), created_by=owner.id, name="Docs"
+    )
+    await db.commit()
+
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/assistants",
+        json={"name": "Support", "instructions": "x", "connector_ids": [str(connector.id)]},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["connector_ids"] == [str(connector.id)]
+
+
+async def test_creating_an_assistant_rejects_a_connector_from_another_workspace(
+    client: AsyncClient, db: AsyncSession
+) -> None:
+    workspace_id = await _owner_with_workspace(client)
+    other_user, other_workspace = await _user_with_workspace(db, email="other3@example.com", slug="other-ws3")
+    other_connector = await _connector_in_workspace(
+        db, workspace_id=other_workspace.id, created_by=other_user.id, name="Docs"
+    )
+    await db.commit()
+
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/assistants",
+        json={"name": "Bot", "instructions": "x", "connector_ids": [str(other_connector.id)]},
+    )
+
+    assert response.status_code == 404
 
 
 async def test_creating_an_assistant_rejects_a_tool_from_another_workspace(
@@ -542,3 +598,41 @@ async def test_update_assistant_replaces_the_whole_delegate_assignment(db: Async
         db, workspace_id=workspace.id, assistant_id=orchestrator.id, changes={"delegate_ids": []}
     )
     assert await list_assistant_delegate_ids(db, assistant_id=orchestrator.id) == []
+
+
+async def test_create_assistant_rejects_a_connector_from_another_workspace(db: AsyncSession) -> None:
+    user, workspace = await _user_with_workspace(db, email="svc12@example.com", slug="svc-ws12")
+    other_user, other_workspace = await _user_with_workspace(db, email="svc12b@example.com", slug="svc-ws12b")
+    other_connector = await _connector_in_workspace(
+        db, workspace_id=other_workspace.id, created_by=other_user.id, name="Docs"
+    )
+    await db.commit()
+
+    with pytest.raises(ConnectorNotFound):
+        await create_assistant(
+            db, workspace_id=workspace.id, created_by=user, name="Bot", instructions="x",
+            model_id=None, tool_ids=[], connector_ids=[other_connector.id],
+        )
+
+
+async def test_update_assistant_replaces_the_whole_connector_assignment(db: AsyncSession) -> None:
+    """Sending connector_ids always replaces the full set — same shape tool_ids/delegate_ids
+    already follow."""
+    user, workspace = await _user_with_workspace(db, email="svc13@example.com", slug="svc-ws13")
+    first = await _connector_in_workspace(db, workspace_id=workspace.id, created_by=user.id, name="First")
+    second = await _connector_in_workspace(db, workspace_id=workspace.id, created_by=user.id, name="Second")
+    assistant = await create_assistant(
+        db, workspace_id=workspace.id, created_by=user, name="Bot", instructions="x",
+        model_id=None, tool_ids=[], connector_ids=[first.id],
+    )
+    await db.commit()
+
+    await update_assistant(
+        db, workspace_id=workspace.id, assistant_id=assistant.id, changes={"connector_ids": [second.id]}
+    )
+    assert await list_assistant_connector_ids(db, assistant_id=assistant.id) == [second.id]
+
+    await update_assistant(
+        db, workspace_id=workspace.id, assistant_id=assistant.id, changes={"connector_ids": []}
+    )
+    assert await list_assistant_connector_ids(db, assistant_id=assistant.id) == []

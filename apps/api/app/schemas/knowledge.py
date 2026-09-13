@@ -66,3 +66,19 @@ class ConnectorOut(BaseModel):
 
 class ConnectorDetailOut(ConnectorOut):
     documents: list[ConnectorDocumentOut]
+
+
+class MessageSourceOut(BaseModel):
+    """One knowledge chunk that was actually folded into a reply — what the chat UI's sources
+    sidebar renders for that message."""
+
+    id: uuid.UUID
+    message_id: uuid.UUID
+    connector_id: uuid.UUID | None
+    document_id: uuid.UUID | None
+    ordinal: int
+    label: str
+    url: str | None
+    snippet: str
+    score: float
+    created_at: datetime

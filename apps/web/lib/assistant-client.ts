@@ -11,6 +11,9 @@ export type Assistant = {
   // `ask_<name>` tools (see the `delegation` flag) — resolved fresh on every send, one level
   // deep only (a delegate's own delegate_ids are never followed).
   delegate_ids: string[];
+  // Connectors (see the `knowledge` flag) this assistant retrieves from before replying — a
+  // connector must be READY to actually contribute at chat time, but stays assigned regardless.
+  connector_ids: string[];
   created_by: string;
   created_at: string;
 };
@@ -22,6 +25,7 @@ export type AssistantCreateInput = {
   tool_ids?: string[];
   memory_enabled?: boolean;
   delegate_ids?: string[];
+  connector_ids?: string[];
 };
 
 // Only the fields present change (see AssistantUpdate's `exclude_unset` on the API side) —
@@ -34,6 +38,7 @@ export type AssistantUpdateInput = {
   tool_ids?: string[];
   memory_enabled?: boolean;
   delegate_ids?: string[];
+  connector_ids?: string[];
 };
 
 export class AssistantError extends Error {}

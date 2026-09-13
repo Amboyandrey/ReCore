@@ -27,10 +27,25 @@ export type Message = {
   created_at: string;
 };
 
+// The knowledge sources folded into a reply, as the `sources` SSE event carries them — emitted
+// before the reply is persisted, so it has no id/message_id/created_at yet (see MessageSource in
+// knowledge-client.ts for the persisted shape a reloaded thread fetches back instead).
+export type LiveSource = {
+  ordinal: number;
+  connector_id: string;
+  connector_name: string;
+  document_id: string;
+  label: string;
+  url: string | null;
+  snippet: string;
+  score: number;
+};
+
 export type SSEEvent =
   | { event: "delta"; data: { text: string } }
   | { event: "tool_call"; data: { name: string; arguments: Record<string, unknown> } }
   | { event: "tool_result"; data: { name: string; ok: boolean; content: string } }
+  | { event: "sources"; data: { sources: LiveSource[] } }
   | { event: "done"; data: { finish_reason: string } }
   | { event: "error"; data: { message: string } };
 

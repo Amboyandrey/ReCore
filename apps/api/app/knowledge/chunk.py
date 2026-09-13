@@ -10,6 +10,18 @@ import re
 
 DEFAULT_TARGET_CHARS = 1500
 DEFAULT_OVERLAP_CHARS = 200
+# A document short enough to fit under this stays a single, unsplit chunk rather than being
+# packed into several ~target-sized pieces. Without this, a short document (a one-page letter,
+# quitclaim, or form) still gets split into 2-3 chunks, and retrieval keeps only the single
+# nearest chunk per document — so a near-tie in embedding similarity between two chunks of the
+# *same* short document can silently exclude the one that actually answers the query in favor of
+# a boilerplate paragraph a few hundredths of a cosine-distance point "closer". Observed live: a
+# 3654-char one-page quitclaim split into 3 chunks, where the chunk stating the settlement amount
+# (dist 0.4900) narrowly lost to a generic release-of-liability chunk (dist 0.4706). Independent
+# of `target` (not a multiple of it) — it answers "is this whole document short", not "would this
+# take few packed chunks" — so tests exercising packing with a tiny `target` pass `single_chunk_max=0`
+# to disable this shortcut rather than tripping over it by coincidence.
+DEFAULT_SINGLE_CHUNK_MAX_CHARS = 4 * DEFAULT_TARGET_CHARS
 
 _PARAGRAPH_SPLIT = re.compile(r"\n\s*\n")
 
@@ -39,23 +51,38 @@ def _split_oversize_paragraph(paragraph: str, *, target: int) -> list[str]:
 
 
 def chunk_text(
-    text: str, *, target: int = DEFAULT_TARGET_CHARS, overlap: int = DEFAULT_OVERLAP_CHARS
+    text: str,
+    *,
+    target: int = DEFAULT_TARGET_CHARS,
+    overlap: int = DEFAULT_OVERLAP_CHARS,
+    single_chunk_max: int = DEFAULT_SINGLE_CHUNK_MAX_CHARS,
 ) -> list[str]:
     """Pack `text`'s paragraphs into chunks of roughly `target` characters, each chunk after the
     first prefixed with the previous chunk's last `overlap` characters. Empty or whitespace-only
-    text yields an empty list — nothing to index, not an error.
+    text yields an empty list — nothing to index, not an error. A document short enough to fit
+    under `single_chunk_max` is returned as a single chunk instead, however many paragraphs it
+    has — see DEFAULT_SINGLE_CHUNK_MAX_CHARS for why.
     """
     paragraphs: list[str] = []
     for raw in _PARAGRAPH_SPLIT.split(text):
         paragraph = raw.strip()
         if not paragraph:
             continue
-        if len(paragraph) > target:
-            paragraphs.extend(_split_oversize_paragraph(paragraph, target=target))
-        else:
-            paragraphs.append(paragraph)
+        paragraphs.append(paragraph)
     if not paragraphs:
         return []
+
+    whole = "\n\n".join(paragraphs)
+    if len(whole) <= single_chunk_max:
+        return [whole]
+
+    sized_paragraphs: list[str] = []
+    for paragraph in paragraphs:
+        if len(paragraph) > target:
+            sized_paragraphs.extend(_split_oversize_paragraph(paragraph, target=target))
+        else:
+            sized_paragraphs.append(paragraph)
+    paragraphs = sized_paragraphs
 
     packed: list[str] = []
     current_parts: list[str] = []

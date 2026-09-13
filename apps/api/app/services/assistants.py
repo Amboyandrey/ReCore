@@ -11,8 +11,18 @@ from typing import Any
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.errors import AssistantNotFound, ModelNotFound, SelfDelegation, ToolNotFound
-from app.models import Assistant, AssistantDelegate, AssistantTool, LLMModel, Tool, User
+from app.core.errors import AssistantNotFound, ConnectorNotFound, ModelNotFound, SelfDelegation, ToolNotFound
+from app.models import (
+    Assistant,
+    AssistantConnector,
+    AssistantDelegate,
+    AssistantTool,
+    Connector,
+    ConnectorStatus,
+    LLMModel,
+    Tool,
+    User,
+)
 
 
 async def _assert_model_in_workspace(
@@ -71,6 +81,27 @@ async def _set_assistant_delegates(
         db.add(AssistantDelegate(assistant_id=assistant_id, delegate_id=delegate_id))
 
 
+async def _assert_connectors_in_workspace(
+    db: AsyncSession, *, workspace_id: uuid.UUID, connector_ids: list[uuid.UUID]
+) -> None:
+    if not connector_ids:
+        return
+    stmt = select(Connector.id).where(Connector.id.in_(connector_ids), Connector.workspace_id == workspace_id)
+    found = set((await db.scalars(stmt)).all())
+    if set(connector_ids) - found:
+        raise ConnectorNotFound()
+
+
+async def _set_assistant_connectors(
+    db: AsyncSession, *, assistant_id: uuid.UUID, connector_ids: list[uuid.UUID]
+) -> None:
+    """Replace an assistant's entire connector assignment with `connector_ids` — same full-set-
+    replace shape as `_set_assistant_tools`."""
+    await db.execute(delete(AssistantConnector).where(AssistantConnector.assistant_id == assistant_id))
+    for connector_id in connector_ids:
+        db.add(AssistantConnector(assistant_id=assistant_id, connector_id=connector_id))
+
+
 async def create_assistant(
     db: AsyncSession,
     *,
@@ -82,14 +113,17 @@ async def create_assistant(
     tool_ids: list[uuid.UUID],
     memory_enabled: bool = False,
     delegate_ids: list[uuid.UUID] | None = None,
+    connector_ids: list[uuid.UUID] | None = None,
 ) -> Assistant:
-    """Save a new assistant. `model_id` and every id in `tool_ids`/`delegate_ids` must already
-    belong to this workspace — the same 404 a stale or cross-workspace id gets anywhere else in
-    this codebase. `delegate_ids` defaults to none: most assistants delegate to nothing."""
+    """Save a new assistant. `model_id` and every id in `tool_ids`/`delegate_ids`/`connector_ids`
+    must already belong to this workspace — the same 404 a stale or cross-workspace id gets
+    anywhere else in this codebase. `delegate_ids`/`connector_ids` default to none."""
     delegate_ids = delegate_ids or []
+    connector_ids = connector_ids or []
     if model_id is not None:
         await _assert_model_in_workspace(db, workspace_id=workspace_id, model_id=model_id)
     await _assert_tools_in_workspace(db, workspace_id=workspace_id, tool_ids=tool_ids)
+    await _assert_connectors_in_workspace(db, workspace_id=workspace_id, connector_ids=connector_ids)
 
     assistant = Assistant(
         workspace_id=workspace_id,
@@ -106,6 +140,7 @@ async def create_assistant(
     )
     await _set_assistant_tools(db, assistant_id=assistant.id, tool_ids=tool_ids)
     await _set_assistant_delegates(db, assistant_id=assistant.id, delegate_ids=delegate_ids)
+    await _set_assistant_connectors(db, assistant_id=assistant.id, connector_ids=connector_ids)
     await db.flush()
     return assistant
 
@@ -167,6 +202,25 @@ async def list_assistant_delegates(db: AsyncSession, *, assistant_id: uuid.UUID)
     return list((await db.scalars(stmt)).all())
 
 
+async def list_assistant_connector_ids(db: AsyncSession, *, assistant_id: uuid.UUID) -> list[uuid.UUID]:
+    """The connector ids assigned to one assistant — what AssistantOut reports back to a settings
+    page so its checkboxes can show the current assignment."""
+    stmt = select(AssistantConnector.connector_id).where(AssistantConnector.assistant_id == assistant_id)
+    return list((await db.scalars(stmt)).all())
+
+
+async def list_assistant_connectors(db: AsyncSession, *, assistant_id: uuid.UUID) -> list[Connector]:
+    """The assistant's assigned connectors that are ready to search — what a chat using this
+    assistant actually retrieves from, resolved fresh on every send. A connector still indexing,
+    failed, or since deleted just drops out here, without its assignment needing cleanup."""
+    stmt = (
+        select(Connector)
+        .join(AssistantConnector, AssistantConnector.connector_id == Connector.id)
+        .where(AssistantConnector.assistant_id == assistant_id, Connector.status == ConnectorStatus.READY)
+    )
+    return list((await db.scalars(stmt)).all())
+
+
 async def update_assistant(
     db: AsyncSession, *, workspace_id: uuid.UUID, assistant_id: uuid.UUID, changes: dict[str, Any]
 ) -> Assistant:
@@ -192,6 +246,10 @@ async def update_assistant(
             db, workspace_id=workspace_id, assistant_id=assistant.id, delegate_ids=delegate_ids
         )
         await _set_assistant_delegates(db, assistant_id=assistant.id, delegate_ids=delegate_ids)
+    if "connector_ids" in changes:
+        connector_ids = changes["connector_ids"] or []
+        await _assert_connectors_in_workspace(db, workspace_id=workspace_id, connector_ids=connector_ids)
+        await _set_assistant_connectors(db, assistant_id=assistant.id, connector_ids=connector_ids)
     if "memory_enabled" in changes:
         assistant.memory_enabled = bool(changes["memory_enabled"])
     await db.flush()

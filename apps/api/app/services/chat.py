@@ -40,6 +40,7 @@ from app.models import (
     LLMModel,
     Message,
     MessageRole,
+    MessageSource,
     ModelKind,
     Provider,
     Tool,
@@ -70,7 +71,10 @@ from app.services.generations import (
     get_or_create_generation_id,
     set_active_generation,
 )
-from app.services.memory import record_turn, retrieve_for_turn
+from app.services.knowledge import SourceHit
+from app.services.knowledge import retrieve_for_turn as retrieve_knowledge_for_turn
+from app.services.memory import record_turn
+from app.services.memory import retrieve_for_turn as retrieve_memory_for_turn
 from app.services.tools import list_enabled_tools, to_tool_definition
 from app.services.usage import record_usage_event
 from app.tools.execute import MAX_RESULT_CHARS, execute_tool
@@ -465,7 +469,7 @@ async def send_message(
     memory_assistant_id: uuid.UUID | None = None
     if memory_active and assistant is not None:
         memory_assistant_id = assistant.id
-        memory_block = await retrieve_for_turn(
+        memory_block = await retrieve_memory_for_turn(
             db,
             workspace_id=workspace_id,
             assistant_id=assistant.id,
@@ -474,6 +478,28 @@ async def send_message(
         )
         if memory_block:
             system_prompt = f"{system_prompt}\n\n{memory_block}" if system_prompt else memory_block
+
+    # Knowledge, like memory, only ever applies to an assistant-backed conversation — a connector
+    # is attached to an assistant, never to a workspace at large. Unlike memory, there's nothing
+    # to write back after the turn; retrieve_knowledge_for_turn's own cheap early-outs (no
+    # settings row, no attached-and-ready connectors) mean this costs nothing beyond one query for
+    # every assistant that doesn't use it.
+    knowledge_sources: list[SourceHit] = []
+    if assistant is not None:
+        knowledge_flag_enabled = await evaluate_flag(
+            db, redis, key="knowledge", workspace_id=workspace_id, user_id=conversation.user_id
+        )
+        if knowledge_flag_enabled:
+            knowledge_result = await retrieve_knowledge_for_turn(
+                db, workspace_id=workspace_id, assistant_id=assistant.id, query=content
+            )
+            if knowledge_result:
+                system_prompt = (
+                    f"{system_prompt}\n\n{knowledge_result.block}"
+                    if system_prompt
+                    else knowledge_result.block
+                )
+                knowledge_sources = knowledge_result.sources
 
     history = await _to_chat_history(db, [*existing_messages], system_prompt=system_prompt)
     text, images = _augment_with_attachments(content, attachments)
@@ -532,6 +558,7 @@ async def send_message(
             user_content=content,
             memory_assistant_id=memory_assistant_id,
             delegates=delegates,
+            sources=knowledge_sources,
         )
     )
     _background_tasks.add(task)
@@ -790,7 +817,7 @@ async def _run_delegation(ctx: _LoopContext, call: ToolCall, spec: DelegateSpec)
         # persistence session only opens after the stream finishes.
         async with async_session_factory() as memory_db:
             await set_workspace_scope(memory_db, ctx.workspace_id)
-            memory_block = await retrieve_for_turn(
+            memory_block = await retrieve_memory_for_turn(
                 memory_db,
                 workspace_id=ctx.workspace_id,
                 assistant_id=spec.assistant_id,
@@ -1058,6 +1085,7 @@ async def _run_generation(
     user_content: str,
     memory_assistant_id: uuid.UUID | None = None,
     delegates: Sequence[DelegateSpec] = (),
+    sources: Sequence[SourceHit] = (),
 ) -> None:
     """Stream a reply from the provider, appending each chunk to Redis, then persist the result.
 
@@ -1069,6 +1097,12 @@ async def _run_generation(
     services/memory.py's record_turn), fired off after the reply is already visible so a slow or
     unreachable mem0 can never delay it.
 
+    `sources`, when non-empty, are the knowledge chunks already folded into this turn's system
+    prompt (see send_message) — emitted as their own SSE event right away, before the first
+    provider token, so the sources sidebar fills in while the reply is still streaming rather than
+    waiting for the whole turn to finish, and persisted as `MessageSource` rows once the message
+    exists, same as ToolInvocation rows are, regardless of whether the turn itself errored.
+
     Owns its own database session and Redis client — it must keep running, and keep those
     connections, independent of whatever HTTP request (if any) is currently watching.
     """
@@ -1079,6 +1113,27 @@ async def _run_generation(
         redis=redis, generation_id=generation_id, stop=_StopSignal(pubsub),
         workspace_id=workspace_id, user_id=user_id,
     )
+    if sources:
+        await append_event(
+            redis,
+            generation_id,
+            "sources",
+            {
+                "sources": [
+                    {
+                        "ordinal": s.ordinal,
+                        "connector_id": str(s.connector_id),
+                        "connector_name": s.connector_name,
+                        "document_id": str(s.document_id),
+                        "label": s.label,
+                        "url": s.url,
+                        "snippet": s.snippet,
+                        "score": s.score,
+                    }
+                    for s in sources
+                ]
+            },
+        )
 
     tools_by_name = {t.name: t for t in tools}
     delegates_by_name = {d.tool_name: d for d in delegates}
@@ -1144,6 +1199,21 @@ async def _run_generation(
         # a generation that failed on, say, its third round trip may still have two real tool
         # calls worth recording.
         await db.flush()
+
+        for source in sources:
+            db.add(
+                MessageSource(
+                    workspace_id=workspace_id,
+                    message_id=assistant_message.id,
+                    connector_id=source.connector_id,
+                    document_id=source.document_id,
+                    ordinal=source.ordinal,
+                    label=source.label,
+                    url=source.url,
+                    snippet=source.snippet,
+                    score=source.score,
+                )
+            )
 
         # A delegate's model is very often not this generation's own — cached by id so a
         # generation with several delegate calls on the same model doesn't reload it each time.

@@ -46,6 +46,20 @@ export type ConnectorDocument = {
 
 export type ConnectorDetail = Connector & { documents: ConnectorDocument[] };
 
+// One knowledge chunk folded into a reply — what the chat page's sources sidebar renders.
+export type MessageSource = {
+  id: string;
+  message_id: string;
+  connector_id: string | null;
+  document_id: string | null;
+  ordinal: number;
+  label: string;
+  url: string | null;
+  snippet: string;
+  score: number;
+  created_at: string;
+};
+
 export class KnowledgeError extends Error {}
 
 async function api(path: string, init: RequestInit = {}): Promise<Response> {
@@ -168,4 +182,15 @@ export async function deleteConnector(workspaceId: string, connectorId: string):
     method: "DELETE",
   });
   await throwIfNotOk(res);
+}
+
+// Every knowledge source folded into any reply in a conversation — what lets a reloaded chat
+// thread show a reply's sources, not just live while they stream in via the `sources` SSE event.
+export async function listMessageSources(
+  workspaceId: string,
+  conversationId: string
+): Promise<MessageSource[]> {
+  const res = await api(`/api/v1/workspaces/${workspaceId}/conversations/${conversationId}/sources`);
+  await throwIfNotOk(res);
+  return (await res.json()) as MessageSource[];
 }
