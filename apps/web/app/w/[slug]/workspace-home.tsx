@@ -5,17 +5,31 @@ import { useEffect, useState } from "react";
 import { useRequireAuth } from "@/lib/auth-context";
 import { listConversations, type Conversation } from "@/lib/chat-client";
 import { useWorkspaceBySlug } from "@/lib/workspace-context";
+import { listWorkflows, type Workflow } from "@/lib/workflow-client";
 
-// The workspace landing page: jump into a recent conversation, start a new one, or manage settings.
+// The workspace landing page: jump into a recent conversation, start a new one, run an existing
+// workflow, or manage settings.
 export function WorkspaceHome({ slug }: { slug: string }) {
   const { loading: authLoading } = useRequireAuth();
   const { workspace, loading } = useWorkspaceBySlug(slug);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [loadingConversations, setLoadingConversations] = useState(true);
+  const [workflows, setWorkflows] = useState<Workflow[]>([]);
+  const [loadingWorkflows, setLoadingWorkflows] = useState(true);
 
   useEffect(() => {
     const task = workspace ? listConversations(workspace.id) : Promise.resolve<Conversation[]>([]);
     task.then(setConversations).finally(() => setLoadingConversations(false));
+  }, [workspace]);
+
+  useEffect(() => {
+    // Caught rather than left to propagate: listWorkflows 404s while the `workflows` flag is off
+    // for this workspace, which should just mean "nothing to show here", not a console error.
+    const task = workspace ? listWorkflows(workspace.id) : Promise.resolve<Workflow[]>([]);
+    task
+      .then(setWorkflows)
+      .catch(() => setWorkflows([]))
+      .finally(() => setLoadingWorkflows(false));
   }, [workspace]);
 
   if (authLoading || loading) {
@@ -68,6 +82,34 @@ export function WorkspaceHome({ slug }: { slug: string }) {
           </ul>
         )}
       </div>
+
+      {(loadingWorkflows || workflows.length > 0) && (
+        <div className="mt-6 rounded-lg border border-border bg-surface p-6">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-text">Workflows</h2>
+            <Link href={`/w/${workspace.slug}/settings/workflows`} className="text-sm text-accent">
+              Manage →
+            </Link>
+          </div>
+
+          {loadingWorkflows ? (
+            <p className="mt-3 text-sm text-text-muted">Loading…</p>
+          ) : (
+            <ul className="mt-3 flex flex-col gap-1">
+              {workflows.slice(0, 5).map((w) => (
+                <li key={w.id}>
+                  <Link
+                    href={`/w/${workspace.slug}/settings/workflows/${w.id}/runs`}
+                    className="block truncate rounded-md px-2 py-1.5 text-sm text-text-soft hover:bg-surface-sunk hover:text-text"
+                  >
+                    {w.name}
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
 
       <div className="mt-6 rounded-lg border border-border bg-surface-sunk p-6">
         <p className="text-sm text-text-soft">Manage the workspace:</p>
