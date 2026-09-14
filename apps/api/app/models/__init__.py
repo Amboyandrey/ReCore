@@ -35,6 +35,13 @@ from app.models.tool_invocation_status import ToolInvocationStatus
 from app.models.tool_kind import ToolKind
 from app.models.usage_event import UsageEvent
 from app.models.user import User
+from app.models.workflow import Workflow
+from app.models.workflow_run import WorkflowRun
+from app.models.workflow_run_status import WorkflowRunStatus
+from app.models.workflow_step import WorkflowStep
+from app.models.workflow_step_run import WorkflowStepRun
+from app.models.workflow_step_status import WorkflowStepStatus
+from app.models.workflow_trigger import WorkflowTrigger
 from app.models.workspace import Workspace, WorkspaceMember
 
 __all__ = [
@@ -73,6 +80,13 @@ __all__ = [
     "ToolKind",
     "UsageEvent",
     "User",
+    "Workflow",
+    "WorkflowRun",
+    "WorkflowRunStatus",
+    "WorkflowStep",
+    "WorkflowStepRun",
+    "WorkflowStepStatus",
+    "WorkflowTrigger",
     "Workspace",
     "WorkspaceMember",
 ]

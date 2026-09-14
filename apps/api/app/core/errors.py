@@ -286,3 +286,42 @@ class MemoryNotFound(AppError):
 
     status_code = 404
     detail = "Memory not found."
+
+
+class WorkflowNotFound(AppError):
+    """Raised for a workflow id that doesn't exist in the workspace it was looked up under."""
+
+    status_code = 404
+    detail = "Workflow not found."
+
+
+class WorkflowRunNotFound(AppError):
+    """Raised for a workflow run id that doesn't exist in the workspace it was looked up under."""
+
+    status_code = 404
+    detail = "Workflow run not found."
+
+
+class WorkflowInvalid(AppError):
+    """Raised when a workflow's steps don't actually resolve to a runnable chain — a duplicate or
+    malformed step key, a template referencing a step that isn't strictly earlier, a step whose
+    assistant belongs to another workspace, or a step with no model to run on (neither its own
+    assistant's nor the workflow's own default). Caught at save time, not run time."""
+
+    status_code = 400
+    detail = "This workflow isn't valid."
+
+
+class WorkflowRunActive(AppError):
+    """Raised when starting a run for a workflow that already has one queued, running, or
+    awaiting approval — a workflow runs at most one at a time (see services/workflows.py)."""
+
+    status_code = 409
+    detail = "This workflow already has an active run."
+
+
+class WorkflowRunNotWaiting(AppError):
+    """Raised when approving or rejecting a run that isn't currently WAITING_APPROVAL."""
+
+    status_code = 409
+    detail = "This run isn't waiting for approval."

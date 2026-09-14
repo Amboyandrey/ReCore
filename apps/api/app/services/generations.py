@@ -11,7 +11,7 @@ import json
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Literal, cast, get_args
 
 from redis.asyncio import Redis
 
@@ -40,8 +40,33 @@ def _active_key(conversation_id: uuid.UUID) -> str:
     return f"conv:{conversation_id}:active_generation"
 
 
-_EventType = Literal["delta", "tool_call", "tool_result", "sources", "done", "error"]
-_TERMINAL_EVENT_TYPES = ("done", "error")
+_EventType = Literal[
+    "delta",
+    "tool_call",
+    "tool_result",
+    "sources",
+    "done",
+    "error",
+    # A workflow run's own events (see workers/run_workflow.py), sharing this exact same
+    # stream/SSE/resume machinery — a run's stream id is just "run:{run_id}" rather than a chat
+    # generation id (see chat.py's run_assistant_task).
+    "run_started",
+    "step_started",
+    "step_done",
+    "step_failed",
+    "run_waiting",
+    "run_done",
+    "run_failed",
+    "run_canceled",
+]
+# Derived from _EventType itself, not retyped by hand — the two used to drift (read_events' own
+# allow-list once omitted "sources" entirely, silently dropping every sources event before it
+# ever reached a consumer), so there is now exactly one place that lists the valid event types.
+EVENT_TYPES: tuple[_EventType, ...] = get_args(_EventType)
+# Once one of these is read, nothing more is coming (for now) — a waiting run's job has already
+# exited to park for approval, so a caller watching one must reconnect with `after=` once it
+# resumes, the same way a page reload resumes a chat generation.
+_TERMINAL_EVENT_TYPES = ("done", "error", "run_done", "run_failed", "run_canceled", "run_waiting")
 
 
 @dataclass(frozen=True)
@@ -78,10 +103,9 @@ async def read_events(
         for entry_id, fields in entries:
             last_id = entry_id
             raw_type = fields["type"]
-            if raw_type not in ("delta", "tool_call", "tool_result", "sources", "done", "error"):
+            if raw_type not in EVENT_TYPES:
                 continue  # ignore anything unexpected rather than crash a long-lived stream reader
-            event_type = cast(_EventType, raw_type)
-            event = StreamEvent(id=entry_id, type=event_type, data=json.loads(fields["data"]))
+            event = StreamEvent(id=entry_id, type=raw_type, data=json.loads(fields["data"]))
             yield event
             if event.type in _TERMINAL_EVENT_TYPES:
                 return

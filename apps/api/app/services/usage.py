@@ -19,8 +19,9 @@ async def record_usage_event(
     *,
     workspace_id: uuid.UUID,
     user_id: uuid.UUID,
-    conversation_id: uuid.UUID,
-    message_id: uuid.UUID,
+    conversation_id: uuid.UUID | None = None,
+    message_id: uuid.UUID | None = None,
+    workflow_run_id: uuid.UUID | None = None,
     model_id: uuid.UUID,
     provider: Provider,
     tokens_in: int,
@@ -28,12 +29,15 @@ async def record_usage_event(
     cost_usd: float,
     latency_ms: int,
 ) -> UsageEvent:
-    """Append one priced generation to the ledger — called once, right after the reply lands."""
+    """Append one priced generation to the ledger — called once, right after the reply (or
+    workflow step) lands. Exactly one of `conversation_id`/`message_id` (a chat reply) or
+    `workflow_run_id` (a workflow step) is expected — see UsageEvent's own docstring."""
     event = UsageEvent(
         workspace_id=workspace_id,
         user_id=user_id,
         conversation_id=conversation_id,
         message_id=message_id,
+        workflow_run_id=workflow_run_id,
         model_id=model_id,
         provider=provider,
         tokens_in=tokens_in,

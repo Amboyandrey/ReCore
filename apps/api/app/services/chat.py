@@ -8,7 +8,6 @@ keeps writing to Redis (and, at the end, the database) whether or not anyone is 
 """
 
 import asyncio
-import re
 import time
 import uuid
 from collections import defaultdict
@@ -61,7 +60,8 @@ from app.providers.base import (
     Usage,
 )
 from app.providers.registry import build_provider
-from app.services.assistants import get_assistant, list_assistant_delegates, list_assistant_tools
+from app.services.assistant_runtime import AssistantTurn, DelegateSpec, prepare_assistant_turn
+from app.services.assistants import get_assistant
 from app.services.attachments import attach_to_message, read_attachment_bytes
 from app.services.credentials import decrypt_credential_key, get_credential
 from app.services.flags import evaluate_flag
@@ -72,7 +72,6 @@ from app.services.generations import (
     set_active_generation,
 )
 from app.services.knowledge import SourceHit
-from app.services.knowledge import retrieve_for_turn as retrieve_knowledge_for_turn
 from app.services.memory import record_turn
 from app.services.memory import retrieve_for_turn as retrieve_memory_for_turn
 from app.services.tools import list_enabled_tools, to_tool_definition
@@ -455,91 +454,45 @@ async def send_message(
     # workspace's own assistants (enforced at create/update time), and ON DELETE SET NULL means
     # a since-deleted assistant already shows up here as None, not a dangling reference.
     assistant = await db.get(Assistant, conversation.assistant_id) if conversation.assistant_id else None
-    system_prompt = assistant.instructions if assistant is not None else conversation.system_prompt
 
-    # Memory only ever applies to an assistant-backed conversation — there's no "workspace-wide"
-    # memory the way there's a workspace-wide tool set, since a memory is meaningless without an
-    # assistant to scope it to. `memory_active` gates both directions (recall below, and the
-    # post-generation write in _run_generation) on the same two conditions, independent of
-    # whether mem0 itself is actually reachable this turn.
-    memory_flag_enabled = await evaluate_flag(
-        db, redis, key="memory", workspace_id=workspace_id, user_id=conversation.user_id
-    )
-    memory_active = memory_flag_enabled and assistant is not None and assistant.memory_enabled
+    api_key = decrypt_credential_key(credential)
+    provider = build_provider(credential.provider, api_key=api_key, base_url=credential.base_url)
+
+    system_prompt = conversation.system_prompt
     memory_assistant_id: uuid.UUID | None = None
-    if memory_active and assistant is not None:
-        memory_assistant_id = assistant.id
-        memory_block = await retrieve_memory_for_turn(
+    knowledge_sources: list[SourceHit] = []
+    delegates: list[DelegateSpec] = []
+    if assistant is not None:
+        # Memory, knowledge, and delegation only ever apply to an assistant-backed conversation —
+        # there's no "workspace-wide" version of any of them the way there's a workspace-wide
+        # tool set, since each is meaningless without an assistant to scope it to. Shared with
+        # workers/run_workflow.py's own per-step turn, which resolves all three the same way.
+        turn = await prepare_assistant_turn(
             db,
+            redis,
             workspace_id=workspace_id,
-            assistant_id=assistant.id,
             user_id=conversation.user_id,
+            assistant=assistant,
+            model=model,
+            credential=credential,
+            adapter=provider,
             query=content,
         )
-        if memory_block:
-            system_prompt = f"{system_prompt}\n\n{memory_block}" if system_prompt else memory_block
-
-    # Knowledge, like memory, only ever applies to an assistant-backed conversation — a connector
-    # is attached to an assistant, never to a workspace at large. Unlike memory, there's nothing
-    # to write back after the turn; retrieve_knowledge_for_turn's own cheap early-outs (no
-    # settings row, no attached-and-ready connectors) mean this costs nothing beyond one query for
-    # every assistant that doesn't use it.
-    knowledge_sources: list[SourceHit] = []
-    if assistant is not None:
-        knowledge_flag_enabled = await evaluate_flag(
-            db, redis, key="knowledge", workspace_id=workspace_id, user_id=conversation.user_id
+        system_prompt = turn.system_prompt
+        memory_assistant_id = turn.memory_assistant_id
+        knowledge_sources = turn.sources
+        delegates = turn.delegates
+        tools = turn.tools
+    else:
+        tools_enabled = await evaluate_flag(
+            db, redis, key="tools", workspace_id=workspace_id, user_id=conversation.user_id
         )
-        if knowledge_flag_enabled:
-            knowledge_result = await retrieve_knowledge_for_turn(
-                db, workspace_id=workspace_id, assistant_id=assistant.id, query=content
-            )
-            if knowledge_result:
-                system_prompt = (
-                    f"{system_prompt}\n\n{knowledge_result.block}"
-                    if system_prompt
-                    else knowledge_result.block
-                )
-                knowledge_sources = knowledge_result.sources
+        tools = await list_enabled_tools(db, workspace_id=workspace_id) if tools_enabled else []
 
     history = await _to_chat_history(db, [*existing_messages], system_prompt=system_prompt)
     text, images = _augment_with_attachments(content, attachments)
     history.append(ChatMessage(role="user", content=text, images=images))
     history = _apply_image_budget(history)
-
-    tools_enabled = await evaluate_flag(
-        db, redis, key="tools", workspace_id=workspace_id, user_id=conversation.user_id
-    )
-    if not tools_enabled:
-        tools: list[Tool] = []
-    elif assistant is not None:
-        tools = await list_assistant_tools(db, assistant_id=assistant.id)
-    else:
-        tools = await list_enabled_tools(db, workspace_id=workspace_id)
-
-    api_key = decrypt_credential_key(credential)
-    provider = build_provider(credential.provider, api_key=api_key, base_url=credential.base_url)
-
-    # A delegate is only ever offered alongside an assistant — there's no "workspace-wide"
-    # delegation the way there's a workspace-wide tool set, same reasoning memory follows above.
-    delegates: list[DelegateSpec] = []
-    if assistant is not None:
-        delegation_enabled = await evaluate_flag(
-            db, redis, key="delegation", workspace_id=workspace_id, user_id=conversation.user_id
-        )
-        if delegation_enabled:
-            delegates = await _build_delegate_specs(
-                db,
-                redis,
-                workspace_id=workspace_id,
-                user_id=conversation.user_id,
-                orchestrator=assistant,
-                default_adapter=provider,
-                default_provider=credential.provider,
-                default_model=model,
-                tools_enabled=tools_enabled,
-                memory_flag_enabled=memory_flag_enabled,
-                reserved_names={t.name for t in tools},
-            )
 
     await set_active_generation(redis, conversation.id, generation_id)
 
@@ -598,140 +551,6 @@ class _ToolInvocationRecord:
     latency_ms: int
     children: list["_ToolInvocationRecord"] = field(default_factory=list)
     usage: _DelegateUsage | None = None
-
-
-@dataclass(frozen=True)
-class DelegateSpec:
-    """One assistant this conversation's assistant may hand a task to — everything needed to run
-    its own tool-calling loop, resolved once per send (see _build_delegate_specs) so the loop
-    itself never has to touch the database. `tool_name` is what the model actually sees and
-    calls; `definition` is the synthesized ToolDefinition offered alongside the real tools."""
-
-    assistant_id: uuid.UUID
-    tool_name: str
-    definition: ToolDefinition
-    instructions: str
-    adapter: LLMProvider
-    provider: Provider
-    model_id: uuid.UUID
-    provider_model_id: str
-    tools: list[Tool]
-    memory_active: bool
-
-
-_DELEGATE_NAME_SANITIZER = re.compile(r"[^a-zA-Z0-9_-]+")
-
-
-def delegate_tool_name(name: str, taken: set[str]) -> str:
-    """Turn an assistant's display name into a legal, collision-free tool name to offer the
-    model — assistant names aren't unique per workspace, but a tool name must be (and must match
-    ^[a-zA-Z0-9_-]+$, capped at 64 chars, same as a real tool's — see schemas/tool.py).
-
-    `taken` starts as the orchestrator's own real tool names and grows by one with every delegate
-    named — the caller does that, not this function — which is what guarantees an `ask_*` name
-    can never collide with a real tool, letting _execute_tool_call check delegates first safely.
-    """
-    slug = _DELEGATE_NAME_SANITIZER.sub("_", name.strip()).strip("_").lower() or "assistant"
-    base = ("ask_" + slug)[:64]
-    if base not in taken:
-        return base
-    suffix = 2
-    while True:
-        tag = f"_{suffix}"
-        candidate = base[: 64 - len(tag)] + tag
-        if candidate not in taken:
-            return candidate
-        suffix += 1
-
-
-async def _build_delegate_specs(
-    db: AsyncSession,
-    redis: Redis,
-    *,
-    workspace_id: uuid.UUID,
-    user_id: uuid.UUID,
-    orchestrator: Assistant,
-    default_adapter: LLMProvider,
-    default_provider: Provider,
-    default_model: LLMModel,
-    tools_enabled: bool,
-    memory_flag_enabled: bool,
-    reserved_names: set[str],
-) -> list[DelegateSpec]:
-    """Resolve every assistant `orchestrator` may delegate to into a ready-to-run DelegateSpec —
-    its own model/credential/adapter if it has one (falling back to the conversation's), its own
-    tools, and whether memory recall applies to it.
-
-    A delegate whose own model's provider has been disabled is skipped outright rather than
-    silently run on a different model its author never chose — the same posture ProviderDisabled
-    already takes for the conversation's own model. Depth is always 1: this never recurses into a
-    delegate's own delegates (list_assistant_delegates is only ever called from here, on
-    `orchestrator`, never on a delegate).
-    """
-    delegates = await list_assistant_delegates(db, assistant_id=orchestrator.id)
-    taken = set(reserved_names)
-    adapters_by_credential: dict[uuid.UUID, LLMProvider] = {}
-    specs: list[DelegateSpec] = []
-    for delegate in delegates:
-        if delegate.model_id is not None:
-            model = await db.get(LLMModel, delegate.model_id)
-            if model is None:
-                continue
-            credential = await get_credential(
-                db, workspace_id=workspace_id, credential_id=model.credential_id
-            )
-            provider_enabled = await evaluate_flag(
-                db,
-                redis,
-                key=f"provider.{credential.provider.value}",
-                workspace_id=workspace_id,
-                user_id=user_id,
-            )
-            if not provider_enabled:
-                continue
-            adapter = adapters_by_credential.get(credential.id)
-            if adapter is None:
-                adapter = build_provider(
-                    credential.provider,
-                    api_key=decrypt_credential_key(credential),
-                    base_url=credential.base_url,
-                )
-                adapters_by_credential[credential.id] = adapter
-            provider, provider_model_id, model_id = credential.provider, model.provider_model_id, model.id
-        else:
-            adapter, provider = default_adapter, default_provider
-            provider_model_id, model_id = default_model.provider_model_id, default_model.id
-
-        tools = await list_assistant_tools(db, assistant_id=delegate.id) if tools_enabled else []
-        tool_name = delegate_tool_name(delegate.name, taken)
-        taken.add(tool_name)
-        specs.append(
-            DelegateSpec(
-                assistant_id=delegate.id,
-                tool_name=tool_name,
-                definition=ToolDefinition(
-                    name=tool_name,
-                    description=(
-                        f'Delegate a task to the "{delegate.name}" assistant and get its answer '
-                        "back. Write a complete, self-contained task — it cannot see this "
-                        "conversation."
-                    ),
-                    parameters={
-                        "type": "object",
-                        "properties": {"task": {"type": "string"}},
-                        "required": ["task"],
-                    },
-                ),
-                instructions=delegate.instructions,
-                adapter=adapter,
-                provider=provider,
-                model_id=model_id,
-                provider_model_id=provider_model_id,
-                tools=tools,
-                memory_active=memory_flag_enabled and delegate.memory_enabled,
-            )
-        )
-    return specs
 
 
 class _StopSignal:
@@ -1068,6 +887,60 @@ async def _run_tool_loop(
         stopped=stopped,
         invocations=invocations,
     )
+
+
+async def run_assistant_task(
+    *,
+    redis: Redis,
+    stream_id: str,
+    workspace_id: uuid.UUID,
+    user_id: uuid.UUID,
+    turn: AssistantTurn,
+    task: str,
+    emit_deltas: bool,
+) -> _LoopResult:
+    """Run one assistant turn to a final answer outside of chat entirely — what
+    workers/run_workflow.py calls once per step, on an AssistantTurn already resolved by
+    prepare_assistant_turn. The public seam a caller outside this module goes through instead of
+    reaching into _LoopContext/_StopSignal/_run_tool_loop directly.
+
+    `stream_id` is this caller's own event-stream id, passed straight through to
+    append_event/read_events/request_stop (see generations.py) exactly as a chat generation id
+    would be — a workflow run uses `f"run:{run_id}"`. `emit_deltas` controls whether partial text
+    streams live as it's generated; chat's own outer turn always does, a delegate's inner turn
+    never does (see _run_delegation, which this doesn't replace — it has its own timeout and
+    error shaping for the one-level-deep delegation case).
+    """
+    pubsub = redis.pubsub()
+    await pubsub.subscribe(f"gen:{stream_id}:stop")
+    try:
+        ctx = _LoopContext(
+            redis=redis, generation_id=stream_id, stop=_StopSignal(pubsub),
+            workspace_id=workspace_id, user_id=user_id,
+        )
+        history = [
+            ChatMessage(role="system", content=turn.system_prompt),
+            ChatMessage(role="user", content=task),
+        ]
+        return await _run_tool_loop(
+            ctx,
+            adapter=turn.adapter,
+            provider_model_id=turn.model.provider_model_id,
+            history=history,
+            tool_definitions=(
+                [to_tool_definition(t) for t in turn.tools] + [d.definition for d in turn.delegates]
+            ),
+            tools_by_name={t.name: t for t in turn.tools},
+            delegates_by_name={d.tool_name: d for d in turn.delegates},
+            emit_deltas=emit_deltas,
+        )
+    finally:
+        # Unlike _run_generation (whose task, and everything it opened, is garbage-collected the
+        # moment one chat reply finishes), a workflow's worker process calls this once per step
+        # across a long-running job — leaving a pubsub subscription open per call would leak a
+        # connection for every step of every run for as long as the worker stays up.
+        await pubsub.unsubscribe(f"gen:{stream_id}:stop")
+        await pubsub.aclose()  # type: ignore[no-untyped-call]  # redis-py's stubs omit this method's types
 
 
 async def _run_generation(

@@ -38,3 +38,15 @@ async def enqueue_index_connector(connector_id: uuid.UUID, workspace_id: uuid.UU
     await pool.enqueue_job(
         "index_connector", str(connector_id), str(workspace_id), _job_id=f"index:{connector_id}"
     )
+
+
+async def enqueue_run_workflow(run_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+    """Queue (or resume) one workflow run.
+
+    `_job_id` is the run's own id — safe for the same reason enqueue_index_connector's is: a
+    second enqueue for a run already QUEUED/RUNNING (a double-click, or PR 2's approve endpoint
+    re-enqueuing a run whose original job already exited to park at WAITING_APPROVAL) coalesces
+    into one job rather than two workers racing the same run.
+    """
+    pool = await _get_pool()
+    await pool.enqueue_job("run_workflow", str(run_id), str(workspace_id), _job_id=f"run:{run_id}")
