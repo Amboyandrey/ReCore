@@ -83,33 +83,35 @@ export function WorkspaceHome({ slug }: { slug: string }) {
         )}
       </div>
 
-      {(loadingWorkflows || workflows.length > 0) && (
-        <div className="mt-6 rounded-lg border border-border bg-surface p-6">
-          <div className="flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-text">Workflows</h2>
-            <Link href={`/w/${workspace.slug}/settings/workflows`} className="text-sm text-accent">
-              Manage →
-            </Link>
-          </div>
-
-          {loadingWorkflows ? (
-            <p className="mt-3 text-sm text-text-muted">Loading…</p>
-          ) : (
-            <ul className="mt-3 flex flex-col gap-1">
-              {workflows.slice(0, 5).map((w) => (
-                <li key={w.id}>
-                  <Link
-                    href={`/w/${workspace.slug}/settings/workflows/${w.id}/runs`}
-                    className="block truncate rounded-md px-2 py-1.5 text-sm text-text-soft hover:bg-surface-sunk hover:text-text"
-                  >
-                    {w.name}
-                  </Link>
-                </li>
-              ))}
-            </ul>
-          )}
+      <div className="mt-6 rounded-lg border border-border bg-surface p-6">
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-text">Workflows</h2>
+          <Link href={`/w/${workspace.slug}/settings/workflows`} className="text-sm text-accent">
+            Manage →
+          </Link>
         </div>
-      )}
+
+        {loadingWorkflows ? (
+          <p className="mt-3 text-sm text-text-muted">Loading…</p>
+        ) : workflows.length === 0 ? (
+          <p className="mt-3 text-sm text-text-soft">
+            No workflows yet — create one to run assistant steps in the background.
+          </p>
+        ) : (
+          <ul className="mt-3 flex flex-col gap-1">
+            {workflows.slice(0, 5).map((w) => (
+              <li key={w.id}>
+                <Link
+                  href={`/w/${workspace.slug}/settings/workflows/${w.id}/runs`}
+                  className="block truncate rounded-md px-2 py-1.5 text-sm text-text-soft hover:bg-surface-sunk hover:text-text"
+                >
+                  {w.name}
+                </Link>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
 
       <div className="mt-6 rounded-lg border border-border bg-surface-sunk p-6">
         <p className="text-sm text-text-soft">Manage the workspace:</p>
@@ -128,9 +130,6 @@ export function WorkspaceHome({ slug }: { slug: string }) {
           </Link>
           <Link href={`/w/${workspace.slug}/settings/knowledge`} className="text-sm text-accent">
             Knowledge →
-          </Link>
-          <Link href={`/w/${workspace.slug}/settings/workflows`} className="text-sm text-accent">
-            Workflows →
           </Link>
           <Link href={`/w/${workspace.slug}/settings/usage`} className="text-sm text-accent">
             Usage →
