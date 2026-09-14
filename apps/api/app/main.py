@@ -27,6 +27,7 @@ from app.routers.v1 import (
     tool_invocations,
     tools,
     usage,
+    workflows,
     workspaces,
 )
 
@@ -68,6 +69,8 @@ app.include_router(memory.memories_router, prefix="/api/v1")
 app.include_router(knowledge.settings_router, prefix="/api/v1")
 app.include_router(knowledge.connectors_router, prefix="/api/v1")
 app.include_router(sources.router, prefix="/api/v1")
+app.include_router(workflows.workflows_router, prefix="/api/v1")
+app.include_router(workflows.runs_router, prefix="/api/v1")
 app.include_router(usage.router, prefix="/api/v1")
 app.include_router(audit.router, prefix="/api/v1")
 

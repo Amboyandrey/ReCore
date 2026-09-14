@@ -55,12 +55,12 @@ from app.providers.base import (
     Usage,
 )
 from app.providers.fake import FAKE_REPLY, VALID_KEY, FakeProvider
+from app.services.assistant_runtime import delegate_tool_name
 from app.services.assistants import create_assistant, delete_assistant, update_assistant
 from app.services.attachments import save_attachment
 from app.services.chat import (
     MAX_TOOL_ITERATIONS,
     create_conversation,
-    delegate_tool_name,
     delete_conversation,
     get_conversation,
     list_conversations,
@@ -1745,6 +1745,9 @@ def delegating_provider(monkeypatch: pytest.MonkeyPatch) -> list[DelegatingFakeP
         return instance
 
     monkeypatch.setattr("app.services.chat.build_provider", _build)
+    # A delegate resolving its own model/credential builds its adapter in assistant_runtime.py,
+    # not chat.py (see build_delegate_specs) — patched separately so that path is faked too.
+    monkeypatch.setattr("app.services.assistant_runtime.build_provider", _build)
     return captured
 
 
