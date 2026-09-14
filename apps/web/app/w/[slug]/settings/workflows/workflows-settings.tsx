@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { listAssistants, type Assistant } from "@/lib/assistant-client";
 import { useRequireAuth } from "@/lib/auth-context";
 import { listModels, type EnabledModel } from "@/lib/provider-client";
@@ -105,6 +105,26 @@ export function WorkflowsSettingsPage({ slug }: { slug: string }) {
       ...f,
       steps: f.steps.map((s, i) => (i === index ? { ...s, ...changes } : s)),
     }));
+  }
+
+  // One textarea per step, keyed by index — lets insertPlaceholder below reach into whichever
+  // one was clicked from without hijacking Tab (which would otherwise break normal
+  // tab-to-next-field navigation) for a keyboard-driven insert.
+  const promptRefs = useRef<Record<number, HTMLTextAreaElement | null>>({});
+
+  function insertPlaceholder(index: number, placeholder: string) {
+    const el = promptRefs.current[index];
+    const current = form.steps[index]?.prompt_template ?? "";
+    const start = el?.selectionStart ?? current.length;
+    const end = el?.selectionEnd ?? current.length;
+    updateStep(index, { prompt_template: current.slice(0, start) + placeholder + current.slice(end) });
+    const cursor = start + placeholder.length;
+    // The textarea's value only reflects this after React re-renders it — deferred a frame so
+    // the cursor lands where the inserted text actually ends up, not where it was before.
+    requestAnimationFrame(() => {
+      el?.focus();
+      el?.setSelectionRange(cursor, cursor);
+    });
   }
 
   function addStep() {
@@ -381,6 +401,9 @@ export function WorkflowsSettingsPage({ slug }: { slug: string }) {
               <label className="flex flex-col gap-1.5 text-sm">
                 <span className="text-text-soft">Prompt template</span>
                 <textarea
+                  ref={(el) => {
+                    promptRefs.current[index] = el;
+                  }}
                   required
                   rows={2}
                   value={step.prompt_template}
@@ -393,15 +416,27 @@ export function WorkflowsSettingsPage({ slug }: { slug: string }) {
                   className="rounded-md border border-border bg-surface px-3 py-2 text-sm text-text outline-none focus:border-accent"
                 />
               </label>
-              <p className="text-xs text-text-muted">
-                Available here: <code>{"{{input}}"}</code>
-                {form.steps.slice(0, index).map((s) => (
-                  <span key={s.key || `step-${index}`}>
-                    {", "}
-                    <code>{`{{steps.${s.key || "?"}.output}}`}</code>
-                  </span>
+              <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                <span className="text-text-muted">Insert:</span>
+                <button
+                  type="button"
+                  onClick={() => insertPlaceholder(index, "{{input}}")}
+                  className="rounded border border-border-strong px-1.5 py-0.5 font-mono text-text-soft hover:border-accent hover:text-accent"
+                >
+                  {"{{input}}"}
+                </button>
+                {form.steps.slice(0, index).map((s, i) => (
+                  <button
+                    key={s.key || `step-${i}`}
+                    type="button"
+                    disabled={!s.key.trim()}
+                    onClick={() => insertPlaceholder(index, `{{steps.${s.key}.output}}`)}
+                    className="rounded border border-border-strong px-1.5 py-0.5 font-mono text-text-soft hover:border-accent hover:text-accent disabled:opacity-40"
+                  >
+                    {`{{steps.${s.key || "?"}.output}}`}
+                  </button>
                 ))}
-              </p>
+              </div>
               <label className="flex items-center gap-2 text-xs text-text-soft">
                 <input
                   type="checkbox"
