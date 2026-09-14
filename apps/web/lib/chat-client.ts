@@ -67,8 +67,10 @@ async function throwIfNotOk(res: Response): Promise<void> {
 
 // Parses a fetch Response's body as Server-Sent Events — used for both sending (POST, so the
 // browser's native EventSource can't be used at all) and resuming (GET, kept on the same parser
-// for one consistent code path rather than switching mechanisms per endpoint).
-async function* consumeSSE(response: Response): AsyncGenerator<SSEEvent> {
+// for one consistent code path rather than switching mechanisms per endpoint). Exported (and
+// generic over the event union) so workflow-client.ts's own run-events stream can reuse this
+// exact parser rather than duplicating it for a differently-shaped event type.
+export async function* consumeSSE<T = SSEEvent>(response: Response): AsyncGenerator<T> {
   const reader = response.body?.getReader();
   if (!reader) return;
   const decoder = new TextDecoder();
@@ -89,7 +91,7 @@ async function* consumeSSE(response: Response): AsyncGenerator<SSEEvent> {
       }
       if (!eventType || !data) continue;
       try {
-        yield { event: eventType, data: JSON.parse(data) } as SSEEvent;
+        yield { event: eventType, data: JSON.parse(data) } as T;
       } catch {
         continue; // a malformed block is dropped rather than crashing the whole stream
       }
