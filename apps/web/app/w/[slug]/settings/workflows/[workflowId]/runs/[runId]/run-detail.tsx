@@ -151,7 +151,20 @@ export function WorkflowRunDetailPage({
           </button>
         )}
       </div>
-      <p className="mt-1 whitespace-pre-wrap text-sm text-text-muted">{run.input}</p>
+      {run.input && <p className="mt-1 whitespace-pre-wrap text-sm text-text-muted">{run.input}</p>}
+      {run.attachments.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-2">
+          {run.attachments.map((a) => (
+            <span
+              key={a.id}
+              title={`${a.mime} · ${(a.size / 1024).toFixed(1)} KB`}
+              className="rounded-full border border-border px-2 py-0.5 text-xs text-text-muted"
+            >
+              {a.original_filename}
+            </span>
+          ))}
+        </div>
+      )}
       {run.error && (
         <p className="mt-3 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger">
           {run.error}

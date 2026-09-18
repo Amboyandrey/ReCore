@@ -1,9 +1,12 @@
 import { apiPublicUrl } from "./config";
 
+// Exactly one of conversation_id / workflow_id is set — a file belongs to a chat or to a workflow.
 export type Attachment = {
   id: string;
-  conversation_id: string;
+  conversation_id: string | null;
   message_id: string | null;
+  workflow_id: string | null;
+  workflow_run_id: string | null;
   original_filename: string;
   mime: string;
   size: number;
