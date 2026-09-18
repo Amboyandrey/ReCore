@@ -32,8 +32,9 @@ that were deliberately left out.
   assistant with connectors attached retrieves relevant chunks into its prompt and cites them in a
   live sources sidebar, persisted per reply.
 - **ReFlow workflows** — a saved, ordered chain of assistant steps that runs in the background with
-  no chat turn: each step's prompt is built from the run's own input and earlier steps' completed
-  outputs, watchable live and replayable from a run history page.
+  no chat turn: each step's prompt is built from the run's own input (typed text, uploaded files,
+  or both) and earlier steps' completed outputs, watchable live and replayable from a run history
+  page. Each workflow can expose a webhook URL that external systems POST to in order to start a run.
 - **Workspaces, roles, and invitations** — viewer/member/admin/owner, enforced by one dependency
   chain and backstopped by Postgres row-level security.
 - **Feature flags** — user → workspace → percentage rollout → default resolution, cached in Redis
