@@ -325,3 +325,19 @@ class WorkflowRunNotWaiting(AppError):
 
     status_code = 409
     detail = "This run isn't waiting for approval."
+
+
+class WorkflowDisabled(AppError):
+    """Raised when an inbound webhook hits a workflow whose `enabled` switch is off — the hook
+    URL is still valid, the workflow just isn't accepting runs right now."""
+
+    status_code = 409
+    detail = "This workflow is disabled."
+
+
+class WorkflowWebhookInvalid(AppError):
+    """Raised for a hook URL whose secret matches no workflow in the workspace it names — a
+    rotated or revoked secret, or a guess. Deliberately the same shape as a missing workflow."""
+
+    status_code = 404
+    detail = "Webhook not found."

@@ -4,9 +4,9 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
-from app.models import WorkflowRunStatus, WorkflowStepStatus, WorkflowTrigger
+from app.models import ExtractStatus, WorkflowRunStatus, WorkflowStepStatus, WorkflowTrigger
 
 
 class WorkflowStepIn(BaseModel):
@@ -54,14 +54,43 @@ class WorkflowOut(BaseModel):
     enabled: bool
     default_model_id: uuid.UUID | None
     steps: list[WorkflowStepOut]
+    # None means the inbound webhook is off. The secret is the credential — it's what the hook
+    # URL embeds (see routers/v1/hooks.py) — so it's only ever shown to workspace members.
+    webhook_secret: str | None
     created_by: uuid.UUID
     created_at: datetime
 
 
-class RunCreate(BaseModel):
-    """What starting a run needs — the text every step's `{{input}}` placeholder resolves to."""
+class WebhookOut(BaseModel):
+    """What enabling (or rotating) a workflow's webhook returns — the fresh secret its URL embeds."""
 
-    input: str = Field(min_length=1)
+    webhook_secret: str
+
+
+class RunCreate(BaseModel):
+    """What starting a run needs — the text every step's `{{input}}` placeholder resolves to,
+    and/or files already uploaded into the workflow. At least one of the two must be given."""
+
+    input: str = ""
+    attachment_ids: list[uuid.UUID] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def _text_or_files(self) -> "RunCreate":
+        """A run has to start from *something* — empty text with no files is a no-op, not a run."""
+        if not self.input.strip() and not self.attachment_ids:
+            raise ValueError("Give the run some input text, at least one attachment, or both.")
+        return self
+
+
+class RunAttachmentOut(BaseModel):
+    """One file a run was started with — just enough to list it; the text is inside the step's
+    prompt already."""
+
+    id: uuid.UUID
+    original_filename: str
+    mime: str
+    size: int
+    extract_status: ExtractStatus
 
 
 class WorkflowStepRunOut(BaseModel):
@@ -93,6 +122,7 @@ class WorkflowRunOut(BaseModel):
     trigger: WorkflowTrigger
     status: WorkflowRunStatus
     input: str
+    attachments: list[RunAttachmentOut]
     output: str | None
     error: str | None
     started_by: uuid.UUID | None

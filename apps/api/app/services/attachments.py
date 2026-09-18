@@ -1,4 +1,5 @@
-"""Uploading a file into a conversation, extracting whatever text it holds, and reading it back.
+"""Uploading a file into a conversation or a workflow, extracting whatever text it holds, and
+reading it back.
 
 Extraction is synchronous, on the request path, and covers what people actually attach: plain
 text/markdown/JSON/CSV decoded directly, real parsing for the modern (XML-based) Office formats —
@@ -201,14 +202,17 @@ async def save_attachment(
     db: AsyncSession,
     *,
     workspace_id: uuid.UUID,
-    conversation_id: uuid.UUID,
+    conversation_id: uuid.UUID | None = None,
+    workflow_id: uuid.UUID | None = None,
     uploaded_by: uuid.UUID,
     filename: str,
     mime: str,
     data: bytes,
 ) -> Attachment:
     """Write an uploaded file to disk under the workspace, extract its text (or, for an image,
-    normalize it for the model), and record both."""
+    normalize it for the model), and record both. Exactly one of `conversation_id` /
+    `workflow_id` owns the file — the database's CHECK constraint enforces the same."""
+    assert (conversation_id is None) != (workflow_id is None)  # mirrors attachments_one_parent
     extracted_text: str | None
     if _is_image(mime):
         data, mime, extract_status, extract_error = await asyncio.to_thread(
@@ -234,6 +238,7 @@ async def save_attachment(
         id=attachment_id,
         workspace_id=workspace_id,
         conversation_id=conversation_id,
+        workflow_id=workflow_id,
         uploaded_by=uploaded_by,
         original_filename=filename,
         mime=mime,
@@ -297,3 +302,57 @@ async def attach_to_message(
         attachments.append(attachment)
     await db.flush()
     return attachments
+
+
+async def attach_to_run(
+    db: AsyncSession,
+    *,
+    workflow_id: uuid.UUID,
+    attachment_ids: list[uuid.UUID],
+    run_id: uuid.UUID,
+) -> list[Attachment]:
+    """Link files uploaded into a workflow to the run that's starting with them — each must belong
+    to this workflow and not already be spoken for by an earlier run."""
+    attachments = []
+    for attachment_id in attachment_ids:
+        attachment = await db.scalar(
+            select(Attachment).where(
+                Attachment.id == attachment_id,
+                Attachment.workflow_id == workflow_id,
+                Attachment.workflow_run_id.is_(None),
+            )
+        )
+        if attachment is None:
+            raise AttachmentNotFound()
+        attachment.workflow_run_id = run_id
+        attachments.append(attachment)
+    await db.flush()
+    return attachments
+
+
+async def list_run_attachments(db: AsyncSession, *, run_id: uuid.UUID) -> list[Attachment]:
+    """Every file a workflow run was started with, oldest first."""
+    stmt = (
+        select(Attachment)
+        .where(Attachment.workflow_run_id == run_id)
+        .order_by(Attachment.created_at)
+    )
+    return list((await db.scalars(stmt)).all())
+
+
+async def attachments_by_run_id(
+    db: AsyncSession, run_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, list[Attachment]]:
+    """The files behind each of several runs, grouped by run id — one query for a whole run list."""
+    if not run_ids:
+        return {}
+    stmt = (
+        select(Attachment)
+        .where(Attachment.workflow_run_id.in_(run_ids))
+        .order_by(Attachment.created_at)
+    )
+    grouped: dict[uuid.UUID, list[Attachment]] = {}
+    for attachment in (await db.scalars(stmt)).all():
+        assert attachment.workflow_run_id is not None  # the query above filtered on exactly that
+        grouped.setdefault(attachment.workflow_run_id, []).append(attachment)
+    return grouped

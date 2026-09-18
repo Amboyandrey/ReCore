@@ -38,6 +38,7 @@ def _noop_enqueue(monkeypatch: pytest.MonkeyPatch) -> None:
         del run_id, workspace_id
 
     monkeypatch.setattr("app.routers.v1.workflows.enqueue_run_workflow", _noop)
+    monkeypatch.setattr("app.routers.v1.hooks.enqueue_run_workflow", _noop)
 
 
 async def _enable_workflows_flag(db: AsyncSession, redis: Redis, *, workspace_id: str) -> None:
@@ -243,3 +244,161 @@ async def test_starting_a_second_run_while_one_is_active_returns_409(
         f"/api/v1/workspaces/{workspace_id}/workflows/{workflow_id}/runs", json={"input": "hi again"}
     )
     assert second.status_code == 409
+
+
+async def _saved_workflow(client: AsyncClient, db: AsyncSession, redis_client: Redis) -> tuple[str, str]:
+    """A workspace with the flag on and one saved single-step workflow — (workspace_id, workflow_id)."""
+    workspace_id, assistant_id = await _workspace_with_assistant(client)
+    await _enable_workflows_flag(db, redis_client, workspace_id=workspace_id)
+    workflow_id = (
+        await client.post(f"/api/v1/workspaces/{workspace_id}/workflows", json=_one_step_body(assistant_id))
+    ).json()["id"]
+    return workspace_id, workflow_id
+
+
+async def test_a_run_can_start_from_uploaded_files_alone(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    workspace_id, workflow_id = await _saved_workflow(client, db, redis_client)
+    base = f"/api/v1/workspaces/{workspace_id}/workflows/{workflow_id}"
+
+    uploaded = await client.post(
+        f"{base}/attachments", files={"file": ("notes.txt", b"quarterly numbers", "text/plain")}
+    )
+    assert uploaded.status_code == 201
+    attachment = uploaded.json()
+    assert attachment["workflow_id"] == workflow_id
+    assert attachment["conversation_id"] is None
+    assert attachment["workflow_run_id"] is None
+    assert attachment["extracted_text"] == "quarterly numbers"
+
+    started = await client.post(f"{base}/runs", json={"attachment_ids": [attachment["id"]]})
+    assert started.status_code == 202
+    run = started.json()
+    assert run["input"] == ""
+    assert [a["original_filename"] for a in run["attachments"]] == ["notes.txt"]
+
+    listed = await client.get(f"{base}/runs")
+    assert [a["id"] for a in listed.json()[0]["attachments"]] == [attachment["id"]]
+    detail = await client.get(f"/api/v1/workspaces/{workspace_id}/runs/{run['id']}")
+    assert [a["id"] for a in detail.json()["attachments"]] == [attachment["id"]]
+
+
+async def test_a_run_with_neither_text_nor_files_is_rejected(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    workspace_id, workflow_id = await _saved_workflow(client, db, redis_client)
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/workflows/{workflow_id}/runs", json={"input": "   "}
+    )
+    assert response.status_code == 422
+
+
+async def test_a_file_uploaded_to_another_workflow_cannot_start_this_run(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    workspace_id, workflow_id = await _saved_workflow(client, db, redis_client)
+    assistant_id = (await client.get(f"/api/v1/workspaces/{workspace_id}/workflows/{workflow_id}")).json()[
+        "steps"
+    ][0]["assistant_id"]
+    other_id = (
+        await client.post(f"/api/v1/workspaces/{workspace_id}/workflows", json=_one_step_body(assistant_id))
+    ).json()["id"]
+    attachment_id = (
+        await client.post(
+            f"/api/v1/workspaces/{workspace_id}/workflows/{other_id}/attachments",
+            files={"file": ("notes.txt", b"x", "text/plain")},
+        )
+    ).json()["id"]
+
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/workflows/{workflow_id}/runs",
+        json={"attachment_ids": [attachment_id]},
+    )
+    assert response.status_code == 404
+
+
+async def test_enabling_rotating_and_disabling_the_webhook(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    workspace_id, workflow_id = await _saved_workflow(client, db, redis_client)
+    base = f"/api/v1/workspaces/{workspace_id}/workflows/{workflow_id}"
+    assert (await client.get(base)).json()["webhook_secret"] is None
+
+    enabled = await client.post(f"{base}/webhook")
+    assert enabled.status_code == 200
+    first_secret = enabled.json()["webhook_secret"]
+    assert (await client.get(base)).json()["webhook_secret"] == first_secret
+
+    rotated = (await client.post(f"{base}/webhook")).json()["webhook_secret"]
+    assert rotated != first_secret
+    old_url = f"/api/v1/hooks/workflows/{workspace_id}/{first_secret}"
+    assert (await client.post(old_url, json={"input": "hi"})).status_code == 404
+
+    disabled = await client.delete(f"{base}/webhook")
+    assert disabled.status_code == 204
+    assert (await client.get(base)).json()["webhook_secret"] is None
+    new_url = f"/api/v1/hooks/workflows/{workspace_id}/{rotated}"
+    assert (await client.post(new_url, json={"input": "hi"})).status_code == 404
+
+
+async def test_the_webhook_starts_a_run_without_a_session(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    workspace_id, workflow_id = await _saved_workflow(client, db, redis_client)
+    base = f"/api/v1/workspaces/{workspace_id}/workflows/{workflow_id}"
+    secret = (await client.post(f"{base}/webhook")).json()["webhook_secret"]
+    await client.post("/api/v1/auth/logout")
+
+    hook_url = f"/api/v1/hooks/workflows/{workspace_id}/{secret}"
+    triggered = await client.post(hook_url, json={"input": "from outside"})
+    assert triggered.status_code == 202
+    assert triggered.json()["status"] == "queued"
+
+    # A second call while the first run is still active is refused, same as in the app.
+    assert (await client.post(hook_url, json={"input": "again"})).status_code == 409
+
+    await client.post("/api/v1/auth/login", json=OWNER)
+    runs = (await client.get(f"{base}/runs")).json()
+    assert len(runs) == 1
+    assert runs[0]["trigger"] == "webhook"
+    assert runs[0]["input"] == "from outside"
+    assert runs[0]["started_by"] is None
+
+
+async def test_the_webhook_accepts_multipart_files(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    workspace_id, workflow_id = await _saved_workflow(client, db, redis_client)
+    base = f"/api/v1/workspaces/{workspace_id}/workflows/{workflow_id}"
+    secret = (await client.post(f"{base}/webhook")).json()["webhook_secret"]
+    await client.post("/api/v1/auth/logout")
+
+    triggered = await client.post(
+        f"/api/v1/hooks/workflows/{workspace_id}/{secret}",
+        files=[
+            ("files", ("a.txt", b"first", "text/plain")),
+            ("files", ("b.txt", b"second", "text/plain")),
+        ],
+    )
+    assert triggered.status_code == 202
+
+    await client.post("/api/v1/auth/login", json=OWNER)
+    run = (await client.get(f"{base}/runs")).json()[0]
+    assert run["input"] == ""
+    assert [a["original_filename"] for a in run["attachments"]] == ["a.txt", "b.txt"]
+
+
+async def test_the_webhook_refuses_an_empty_body_and_a_disabled_workflow(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    workspace_id, workflow_id = await _saved_workflow(client, db, redis_client)
+    base = f"/api/v1/workspaces/{workspace_id}/workflows/{workflow_id}"
+    secret = (await client.post(f"{base}/webhook")).json()["webhook_secret"]
+    hook_url = f"/api/v1/hooks/workflows/{workspace_id}/{secret}"
+
+    assert (await client.post(hook_url, json={})).status_code == 400
+    assert (await client.post(hook_url, data={"input": ""})).status_code == 400
+
+    await client.put(base, json={"enabled": False})
+    assert (await client.post(hook_url, json={"input": "hi"})).status_code == 409

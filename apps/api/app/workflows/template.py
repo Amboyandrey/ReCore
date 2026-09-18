@@ -24,6 +24,12 @@ def referenced_step_keys(template: str) -> set[str]:
     return {match.group(2) for match in _PLACEHOLDER.finditer(template) if match.group(2)}
 
 
+def references_input(template: str) -> bool:
+    """Whether a template reads `{{input}}` at all — the steps that do are the ones the run's
+    attached files are handed to as well, since the files are part of the run's input."""
+    return any(match.group(2) is None for match in _PLACEHOLDER.finditer(template))
+
+
 def render(template: str, *, run_input: str, outputs: dict[str, str]) -> str:
     """Substitute every placeholder in `template` — `run_input` for `{{input}}`, `outputs[key]`
     for `{{steps.<key>.output}}`. Raises TemplateError if a referenced key isn't in `outputs`."""

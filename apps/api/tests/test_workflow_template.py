@@ -2,7 +2,7 @@
 
 import pytest
 
-from app.workflows.template import TemplateError, referenced_step_keys, render
+from app.workflows.template import TemplateError, referenced_step_keys, references_input, render
 
 
 def test_input_placeholder_is_substituted() -> None:
@@ -50,3 +50,9 @@ def test_a_template_with_no_placeholders_passes_through_unchanged() -> None:
     assert render("fixed instructions, no placeholders", run_input="x", outputs={}) == (
         "fixed instructions, no placeholders"
     )
+
+
+def test_references_input_spots_the_placeholder_and_nothing_else() -> None:
+    assert references_input("Summarize: {{ input }}")
+    assert not references_input("From: {{steps.a.output}}")
+    assert not references_input("plain text mentioning input")
