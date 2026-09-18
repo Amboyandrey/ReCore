@@ -898,6 +898,7 @@ async def run_assistant_task(
     turn: AssistantTurn,
     task: str,
     emit_deltas: bool,
+    attachments: Sequence[Attachment] = (),
 ) -> _LoopResult:
     """Run one assistant turn to a final answer outside of chat entirely — what
     workers/run_workflow.py calls once per step, on an AssistantTurn already resolved by
@@ -909,7 +910,9 @@ async def run_assistant_task(
     would be — a workflow run uses `f"run:{run_id}"`. `emit_deltas` controls whether partial text
     streams live as it's generated; chat's own outer turn always does, a delegate's inner turn
     never does (see _run_delegation, which this doesn't replace — it has its own timeout and
-    error shaping for the one-level-deep delegation case).
+    error shaping for the one-level-deep delegation case). `attachments` reach the model exactly
+    as a chat message's own would (see _augment_with_attachments): extracted text folded into the
+    task, images as native image parts — the caller has already checked the model can see them.
     """
     pubsub = redis.pubsub()
     await pubsub.subscribe(f"gen:{stream_id}:stop")
@@ -918,10 +921,13 @@ async def run_assistant_task(
             redis=redis, generation_id=stream_id, stop=_StopSignal(pubsub),
             workspace_id=workspace_id, user_id=user_id,
         )
-        history = [
-            ChatMessage(role="system", content=turn.system_prompt),
-            ChatMessage(role="user", content=task),
-        ]
+        text, images = _augment_with_attachments(task, list(attachments))
+        history = _apply_image_budget(
+            [
+                ChatMessage(role="system", content=turn.system_prompt),
+                ChatMessage(role="user", content=text, images=images),
+            ]
+        )
         return await _run_tool_loop(
             ctx,
             adapter=turn.adapter,

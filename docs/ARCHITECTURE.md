@@ -126,7 +126,7 @@ through a join, because derivable means forgettable.
 | models | Enabled models per workspace | credential_id, provider_model_id, cost_per_mtok in/out, supports_vision, kind (chat/embedding) |
 | conversations | Chat threads | user_id, model_id, assistant_id, system_prompt, shared |
 | messages | Turns | role, content, tokens_in/out, cost_usd, finish_reason, error |
-| attachments | Uploaded files | mime, size, storage_key, extracted_text, extract_status, message_id |
+| attachments | Uploaded files | conversation_id / workflow_id (exactly one set), message_id, workflow_run_id, mime, size, storage_key, extracted_text, extract_status |
 | tools | What a chat may call | name unique per workspace, kind enum, parameters jsonb, enabled, method/url/secret_header, ciphertext/nonce/wrapped_key |
 | tool_invocations | One row per call actually made | message_id, tool_id (nullable), name, arguments, result, status, latency_ms |
 | assistants | Saved instructions + optional model | name, instructions, model_id (nullable), memory_enabled, created_by |
@@ -139,7 +139,7 @@ through a join, because derivable means forgettable.
 | connector_chunks | One embedded, retrievable piece | connector_id, document_id, ordinal, content, embedding (pgvector, no fixed dimension) |
 | assistant_connectors | Which connectors an assistant may retrieve from | pk(assistant_id, connector_id) |
 | message_sources | Which chunks actually made it into a reply | message_id, connector_id/document_id (nullable), ordinal, label, url, snippet, score |
-| workflows | A saved step chain | name, description, enabled, default_model_id (nullable), schedule_cron/schedule_timezone/next_run_at, webhook_secret (schedule/webhook trigger columns, reserved — see §21), created_by |
+| workflows | A saved step chain | name, description, enabled, default_model_id (nullable), schedule_cron/schedule_timezone/next_run_at (schedule trigger, reserved — see §21), webhook_secret (nullable; set = inbound hook on, see §14), created_by |
 | workflow_steps | One step in the chain | workflow_id, position, key, name, assistant_id (nullable), prompt_template, requires_approval |
 | workflow_runs | One execution of a workflow | workflow_id, trigger enum, status enum, input, output, error, started_by (nullable), current_position, cost_usd, started_at, finished_at |
 | workflow_step_runs | One step's own execution within a run | run_id, step_id (nullable), position, key, name, assistant_id (nullable), prompt_template/requires_approval (snapshot), status, prompt (rendered), output, error, tokens_in/out, cost_usd, latency_ms, invocations jsonb, sources jsonb, approved_by/approved_at |
@@ -507,6 +507,22 @@ code-execution surface.
   Redis-stream-plus-SSE mechanism a chat generation uses for live progress and cancellation — a
   run's own stream id is simply `run:{run_id}`, read and appended to with the exact same functions
   a chat generation's id is.
+- **A run starts from text, files, or both.** Files are uploaded into the workflow ahead of the
+  run (`POST .../workflows/{id}/attachments`, the same upload-then-reference shape the chat
+  composer follows) and claimed by the run that starts with them. They're part of the run's
+  *input*, not a separate placeholder: the worker hands them to every step whose template reads
+  `{{input}}`, through the exact same code path a chat message's own attachments take (§15) —
+  extracted text folded into the prompt, images as native image parts. A step whose model can't
+  see images fails with that reason rather than silently dropping them.
+- **An inbound webhook per workflow.** Enabling it mints a `webhook_secret`; the public URL
+  `POST /hooks/workflows/{workspace_id}/{secret}` starts a run with no session and no CSRF —
+  possession of the URL is the credential, the same model an invitation link follows. The
+  workspace id is in the path for row-level security (every workflow lookup needs a scope to run
+  under; a bare secret gives none), not for authorization — only the secret has to be unguessable.
+  The body is JSON `{"input": "..."}` or a multipart form with `input` and `files` parts; it's rate
+  limited per workspace, refuses a workflow whose `enabled` switch is off (409), and 404s if the
+  workspace's `workflows` flag is off — the feature's back door is never wider than its front.
+  Rotating replaces the secret, disabling clears it; the old URL dies either way.
 - **A step marked `requires_approval`** that succeeds parks the run at `WAITING_APPROVAL` and the
   job simply returns rather than blocking a worker slot on a human. **As shipped, nothing can
   resume it yet** — the toggle and the worker-side pause both exist, but the approve/reject
@@ -520,7 +536,9 @@ usage has somewhere honest to *not* point.
 
 ## 15. Attachments
 
-Upload is synchronous and gated by the `attachments` flag. Text-bearing formats (PDF, DOCX, PPTX,
+Upload is synchronous, into a conversation (gated by the `attachments` flag) or into a workflow as
+a run's input (gated by `workflows`, see §14) — exactly one of `conversation_id`/`workflow_id` is
+set, enforced by a CHECK constraint. Text-bearing formats (PDF, DOCX, PPTX,
 XLSX, plain text) are extracted on upload and folded into the turn's context with a visible
 `[Attached file: name]` marker, so the model's context is never a mystery to the user. Images are
 normalized (HEIC/HEIF included, via pillow-heif) and passed through as native image parts.
@@ -681,11 +699,10 @@ Named here so nobody hunts for them or assumes they're half-finished:
 - **Programmatic API keys.** Sessions are the only credential; there is no `api_keys` table.
 - **Usage rollups.** `usage_events` is aggregated directly on read. A rollup table is the answer
   when that gets slow, and adding one later changes nothing above the service.
-- **Workflow schedule and webhook triggers.** `workflows.schedule_cron`/`schedule_timezone`/
-  `next_run_at`/`webhook_secret` exist in the schema (added ahead of time so enabling them needs no
-  second migration), but nothing reads or writes them yet — `WorkflowTrigger.SCHEDULE` and
-  `.WEBHOOK` are real enum values with no code path that ever produces one. Every run today is
-  `MANUAL`.
+- **Workflow schedule triggers.** `workflows.schedule_cron`/`schedule_timezone`/`next_run_at`
+  exist in the schema (added ahead of time so enabling them needs no second migration), but
+  nothing reads or writes them yet — `WorkflowTrigger.SCHEDULE` is a real enum value with no code
+  path that ever produces one. Runs today are `MANUAL` or `WEBHOOK` (§14).
 - **Approving a waiting workflow run.** A step's `requires_approval` toggle is fully wired on the
   save side and the worker correctly parks a run at `WAITING_APPROVAL` — but no endpoint exists yet
   to approve or reject one and resume the job. Checking that box today produces a run that waits

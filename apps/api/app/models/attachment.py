@@ -11,21 +11,30 @@ from app.models.mixins import TimestampMixin, UUIDPrimaryKeyMixin
 
 
 class Attachment(Base, UUIDPrimaryKeyMixin, TimestampMixin):
-    """A file uploaded into a conversation, gated behind the `attachments` flag.
+    """A file uploaded into a conversation (gated behind the `attachments` flag) or into a
+    workflow as a run's input (gated behind `workflows`) — exactly one of `conversation_id` /
+    `workflow_id` is set, enforced by a CHECK constraint.
 
     `message_id` is null until the attachment is actually sent with a message — a file can be
     uploaded ahead of the send that references it, same as most chat products let you attach
-    before you hit send.
+    before you hit send. `workflow_run_id` plays the same role for a workflow upload: null until
+    the run it was uploaded for starts.
     """
 
     __tablename__ = "attachments"
 
     workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"))
-    conversation_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("conversations.id", ondelete="CASCADE")
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), default=None
     )
     message_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("messages.id", ondelete="SET NULL"), default=None
+    )
+    workflow_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("workflows.id", ondelete="CASCADE"), default=None
+    )
+    workflow_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("workflow_runs.id", ondelete="CASCADE"), default=None
     )
     uploaded_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     original_filename: Mapped[str]

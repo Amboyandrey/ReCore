@@ -6,7 +6,7 @@ import json
 import uuid
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, File, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,9 +16,12 @@ from app.core.redis import get_redis
 from app.core.request_ip import client_ip
 from app.deps.flags import flag_gate
 from app.deps.workspace import WorkspaceCtx
-from app.models import Role, Workflow, WorkflowRun, WorkflowStep, WorkflowTrigger
+from app.models import Attachment, Role, Workflow, WorkflowRun, WorkflowStep, WorkflowTrigger
+from app.schemas.attachment import AttachmentOut
 from app.schemas.workflow import (
+    RunAttachmentOut,
     RunCreate,
+    WebhookOut,
     WorkflowCreate,
     WorkflowOut,
     WorkflowRunDetailOut,
@@ -27,6 +30,7 @@ from app.schemas.workflow import (
     WorkflowStepRunOut,
     WorkflowUpdate,
 )
+from app.services.attachments import attachments_by_run_id, list_run_attachments, save_attachment
 from app.services.audit import record_audit
 from app.services.generations import read_events
 from app.services.jobs import enqueue_run_workflow
@@ -34,6 +38,8 @@ from app.services.workflows import (
     StepInput,
     create_workflow,
     delete_workflow,
+    disable_webhook,
+    enable_webhook,
     get_run,
     get_workflow,
     list_runs,
@@ -71,18 +77,30 @@ async def _to_workflow_out(db: AsyncSession, workflow: Workflow) -> WorkflowOut:
         enabled=workflow.enabled,
         default_model_id=workflow.default_model_id,
         steps=[_to_step_out(s) for s in steps],
+        webhook_secret=workflow.webhook_secret,
         created_by=workflow.created_by,
         created_at=workflow.created_at,
     )
 
 
-def _to_run_out(run: WorkflowRun) -> WorkflowRunOut:
+def _to_run_attachment_out(attachment: Attachment) -> RunAttachmentOut:
+    return RunAttachmentOut(
+        id=attachment.id,
+        original_filename=attachment.original_filename,
+        mime=attachment.mime,
+        size=attachment.size,
+        extract_status=attachment.extract_status,
+    )
+
+
+def _to_run_out(run: WorkflowRun, attachments: list[Attachment]) -> WorkflowRunOut:
     return WorkflowRunOut(
         id=run.id,
         workflow_id=run.workflow_id,
         trigger=run.trigger,
         status=run.status,
         input=run.input,
+        attachments=[_to_run_attachment_out(a) for a in attachments],
         output=run.output,
         error=run.error,
         started_by=run.started_by,
@@ -211,6 +229,73 @@ async def delete_workflow_route(
     )
 
 
+@workflows_router.post("/{workflow_id}/webhook", response_model=WebhookOut)
+async def enable_webhook_route(
+    workflow_id: uuid.UUID,
+    request: Request,
+    ctx: WorkspaceCtx = Depends(flag_gate("workflows", minimum=Role.VIEWER)),
+    db: AsyncSession = Depends(get_db),
+) -> WebhookOut:
+    """Turn the workflow's inbound webhook on — or rotate its secret if it's already on. The
+    returned secret is what the hook URL embeds (see routers/v1/hooks.py)."""
+    workflow = await get_workflow(db, workspace_id=ctx.workspace_id, workflow_id=workflow_id)
+    rotated = workflow.webhook_secret is not None
+    secret = await enable_webhook(db, workflow=workflow)
+    await record_audit(
+        db,
+        actor_id=ctx.user.id,
+        workspace_id=ctx.workspace_id,
+        action="workflow.webhook_rotated" if rotated else "workflow.webhook_enabled",
+        target_type="workflow",
+        target_id=str(workflow.id),
+        ip=client_ip(request),
+    )
+    return WebhookOut(webhook_secret=secret)
+
+
+@workflows_router.delete("/{workflow_id}/webhook", status_code=204)
+async def disable_webhook_route(
+    workflow_id: uuid.UUID,
+    request: Request,
+    ctx: WorkspaceCtx = Depends(flag_gate("workflows", minimum=Role.VIEWER)),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Turn the workflow's inbound webhook off — its URL stops working immediately."""
+    workflow = await get_workflow(db, workspace_id=ctx.workspace_id, workflow_id=workflow_id)
+    await disable_webhook(db, workflow=workflow)
+    await record_audit(
+        db,
+        actor_id=ctx.user.id,
+        workspace_id=ctx.workspace_id,
+        action="workflow.webhook_disabled",
+        target_type="workflow",
+        target_id=str(workflow.id),
+        ip=client_ip(request),
+    )
+
+
+@workflows_router.post("/{workflow_id}/attachments", status_code=201, response_model=AttachmentOut)
+async def upload_run_attachment_route(
+    workflow_id: uuid.UUID,
+    file: UploadFile = File(...),
+    ctx: WorkspaceCtx = Depends(flag_gate("workflows", minimum=Role.VIEWER)),
+    db: AsyncSession = Depends(get_db),
+) -> AttachmentOut:
+    """Upload a file for a run to start from — pass its id in the run's `attachment_ids`."""
+    await get_workflow(db, workspace_id=ctx.workspace_id, workflow_id=workflow_id)  # 404s if not ours
+    data = await file.read()
+    attachment = await save_attachment(
+        db,
+        workspace_id=ctx.workspace_id,
+        workflow_id=workflow_id,
+        uploaded_by=ctx.user.id,
+        filename=file.filename or "upload",
+        mime=file.content_type or "application/octet-stream",
+        data=data,
+    )
+    return AttachmentOut.model_validate(attachment, from_attributes=True)
+
+
 @workflows_router.post("/{workflow_id}/runs", status_code=202, response_model=WorkflowRunOut)
 async def start_run_route(
     workflow_id: uuid.UUID,
@@ -219,7 +304,8 @@ async def start_run_route(
     ctx: WorkspaceCtx = Depends(flag_gate("workflows", minimum=Role.VIEWER)),
     db: AsyncSession = Depends(get_db),
 ) -> WorkflowRunOut:
-    """Start a run — queued on the worker immediately; watch it via GET .../runs/{id}/events."""
+    """Start a run from text, already-uploaded files, or both — queued on the worker immediately;
+    watch it via GET .../runs/{id}/events."""
     workflow = await get_workflow(db, workspace_id=ctx.workspace_id, workflow_id=workflow_id)
     run = await start_run(
         db,
@@ -228,6 +314,7 @@ async def start_run_route(
         trigger=WorkflowTrigger.MANUAL,
         run_input=body.input,
         started_by=ctx.user.id,
+        attachment_ids=body.attachment_ids,
     )
     await record_audit(
         db,
@@ -237,10 +324,10 @@ async def start_run_route(
         target_type="workflow_run",
         target_id=str(run.id),
         ip=client_ip(request),
-        metadata={"workflow_id": str(workflow_id)},
+        metadata={"workflow_id": str(workflow_id), "attachment_count": len(body.attachment_ids)},
     )
     await enqueue_run_workflow(run.id, ctx.workspace_id)
-    return _to_run_out(run)
+    return _to_run_out(run, await list_run_attachments(db, run_id=run.id))
 
 
 @workflows_router.get("/{workflow_id}/runs", response_model=list[WorkflowRunOut])
@@ -254,7 +341,8 @@ async def list_runs_route(
     """List a workflow's runs, most recently started first."""
     await get_workflow(db, workspace_id=ctx.workspace_id, workflow_id=workflow_id)  # 404s if not ours
     runs = await list_runs(db, workflow_id=workflow_id, limit=limit, before=before)
-    return [_to_run_out(r) for r in runs]
+    attachments = await attachments_by_run_id(db, [r.id for r in runs])
+    return [_to_run_out(r, attachments.get(r.id, [])) for r in runs]
 
 
 @runs_router.get("/{run_id}", response_model=WorkflowRunDetailOut)
@@ -266,8 +354,9 @@ async def get_run_route(
     """One run with all of its step runs — what the run detail page reads."""
     run = await get_run(db, workspace_id=ctx.workspace_id, run_id=run_id)
     steps = await list_step_runs(db, run_id=run.id)
+    attachments = await list_run_attachments(db, run_id=run.id)
     return WorkflowRunDetailOut(
-        **_to_run_out(run).model_dump(),
+        **_to_run_out(run, attachments).model_dump(),
         steps=[WorkflowStepRunOut.model_validate(s, from_attributes=True) for s in steps],
     )
 

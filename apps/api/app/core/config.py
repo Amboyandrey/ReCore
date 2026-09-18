@@ -57,6 +57,11 @@ class Settings(BaseSettings):
     auth_rate_limit_max: int = 5
     auth_rate_limit_window_seconds: int = 300
 
+    # Inbound workflow webhook calls allowed per window, per workspace, before a 429 — a run
+    # is at most one per workflow at a time anyway, so this only bounds the request churn
+    webhook_rate_limit_max: int = 60
+    webhook_rate_limit_window_seconds: int = 60
+
     # How long a resolved flag snapshot stays cached in Redis before it's recomputed from Postgres
     flag_cache_ttl_seconds: int = 30
 

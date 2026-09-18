@@ -20,7 +20,9 @@ from app.core.errors import (
     WorkflowNotFound,
     WorkflowRunActive,
     WorkflowRunNotFound,
+    WorkflowWebhookInvalid,
 )
+from app.core.security import generate_token
 from app.models import (
     Assistant,
     LLMModel,
@@ -31,6 +33,7 @@ from app.models import (
     WorkflowStepRun,
     WorkflowTrigger,
 )
+from app.services.attachments import attach_to_run
 from app.services.generations import request_stop
 from app.workflows.template import referenced_step_keys
 
@@ -232,6 +235,35 @@ async def delete_workflow(db: AsyncSession, *, workspace_id: uuid.UUID, workflow
     await db.flush()
 
 
+async def enable_webhook(db: AsyncSession, *, workflow: Workflow) -> str:
+    """Turn the workflow's inbound webhook on with a fresh secret — or, if it's already on,
+    rotate it, so the old URL stops working the moment a new one is issued."""
+    workflow.webhook_secret = generate_token()
+    await db.flush()
+    return workflow.webhook_secret
+
+
+async def disable_webhook(db: AsyncSession, *, workflow: Workflow) -> None:
+    """Turn the workflow's inbound webhook off — its URL 404s from here on."""
+    workflow.webhook_secret = None
+    await db.flush()
+
+
+async def get_workflow_by_webhook_secret(
+    db: AsyncSession, *, workspace_id: uuid.UUID, secret: str
+) -> Workflow:
+    """Resolve a hook URL's secret to its workflow, within the workspace the URL also names —
+    the workspace is what row-level security scopes the lookup to, the secret is the credential."""
+    workflow = await db.scalar(
+        select(Workflow).where(
+            Workflow.workspace_id == workspace_id, Workflow.webhook_secret == secret
+        )
+    )
+    if workflow is None:
+        raise WorkflowWebhookInvalid()
+    return workflow
+
+
 async def _has_active_run(db: AsyncSession, *, workflow_id: uuid.UUID) -> bool:
     exists = await db.scalar(
         select(WorkflowRun.id)
@@ -249,9 +281,11 @@ async def start_run(
     trigger: WorkflowTrigger,
     run_input: str,
     started_by: uuid.UUID | None,
+    attachment_ids: list[uuid.UUID] | None = None,
 ) -> WorkflowRun:
     """Create a run and one PENDING step run per step, snapshotting each step's key/name/assistant
-    so a later edit to the workflow's own steps never rewrites this run's history.
+    so a later edit to the workflow's own steps never rewrites this run's history. Files already
+    uploaded into the workflow (`attachment_ids`) are claimed by this run — see attach_to_run.
 
     Only flushes — same as every other create_* here (see create_website_connector's own
     docstring for why): the caller commits (or, inside a request, `get_db()` does) and then
@@ -268,7 +302,9 @@ async def start_run(
         started_by=started_by,
     )
     db.add(run)
-    await db.flush()  # materializes run.id — needed below to attach its step runs
+    await db.flush()  # materializes run.id — needed below to attach its step runs and files
+    if attachment_ids:
+        await attach_to_run(db, workflow_id=workflow.id, attachment_ids=attachment_ids, run_id=run.id)
     for position, step in enumerate(steps):
         db.add(
             WorkflowStepRun(

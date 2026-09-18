@@ -29,6 +29,7 @@ from app.models import (
     ProviderCredential,
     UsageEvent,
     User,
+    Workflow,
     WorkflowRun,
     WorkflowRunStatus,
     WorkflowStepRun,
@@ -49,6 +50,7 @@ from app.providers.base import (
 )
 from app.providers.fake import FAKE_REPLY, VALID_KEY, FakeProvider
 from app.services.assistants import create_assistant
+from app.services.attachments import save_attachment
 from app.services.flags import set_override
 from app.services.workflows import StepInput, create_workflow, start_run
 from app.workers.run_workflow import run_workflow
@@ -412,3 +414,122 @@ async def test_a_connector_attached_step_folds_knowledge_into_the_prompt(
     assert steps[0].sources
     assert steps[0].sources[0]["label"] == "Doc"
     assert "Relevant knowledge:" in captured[0].last_messages[0].content
+
+
+class _RecordingBuilder:
+    """A build_provider stand-in that keeps every FakeProvider it made, in step order, so a test
+    can read back exactly what each step's model was sent."""
+
+    def __init__(self) -> None:
+        self.built: list[FakeProvider] = []
+
+    def __call__(self, provider: Provider, *, api_key: str, base_url: str | None) -> FakeProvider:
+        fake = FakeProvider(api_key=api_key, base_url=base_url)
+        self.built.append(fake)
+        return fake
+
+
+def _png_bytes() -> bytes:
+    """The smallest real PNG Pillow will both write and read back."""
+    from io import BytesIO
+
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (4, 4), (255, 0, 0)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+async def _two_step_workflow(db: AsyncSession) -> tuple[User, Workspace, LLMModel, Workflow]:
+    """A workflow whose first step reads {{input}} and whose second reads only the first's output."""
+    user, workspace, model = await _workspace_with_model(db)
+    assistant = await create_assistant(
+        db, workspace_id=workspace.id, created_by=user, name="Bot", instructions="Help.",
+        model_id=model.id, tool_ids=[],
+    )
+    workflow = await create_workflow(
+        db, workspace_id=workspace.id, created_by=user.id, name="Files", description="",
+        default_model_id=None,
+        steps=[
+            StepInput(
+                key="read", name="Read", assistant_id=assistant.id, prompt_template="Summarize: {{input}}",
+            ),
+            StepInput(
+                key="polish", name="Polish", assistant_id=assistant.id,
+                prompt_template="Polish: {{steps.read.output}}",
+            ),
+        ],
+    )
+    return user, workspace, model, workflow
+
+
+async def test_run_files_reach_only_the_steps_that_read_input(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    builder = _RecordingBuilder()
+    monkeypatch.setattr("app.workers.run_workflow.build_provider", builder)
+    user, workspace, _model, workflow = await _two_step_workflow(db)
+    attachment = await save_attachment(
+        db, workspace_id=workspace.id, workflow_id=workflow.id, uploaded_by=user.id,
+        filename="notes.txt", mime="text/plain", data=b"quarterly numbers",
+    )
+    run = await start_run(
+        db, workspace_id=workspace.id, workflow=workflow, trigger=WorkflowTrigger.MANUAL,
+        run_input="", started_by=user.id, attachment_ids=[attachment.id],
+    )
+    await db.commit()
+
+    await run_workflow({}, str(run.id), str(workspace.id))
+
+    steps = await _refresh_run_and_steps(db, run)
+    assert run.status == WorkflowRunStatus.SUCCEEDED
+    await db.refresh(attachment)
+    assert attachment.workflow_run_id == run.id
+
+    first_user_turn = next(m for m in builder.built[0].last_messages if m.role == "user")
+    assert first_user_turn.content == "Summarize: \n\n[Attached file: notes.txt]\nquarterly numbers"
+    assert steps[0].prompt == "Summarize: "  # the stored prompt is the rendered template alone
+    second_user_turn = next(m for m in builder.built[1].last_messages if m.role == "user")
+    assert "notes.txt" not in second_user_turn.content
+
+
+async def test_an_image_needs_a_vision_model_to_run(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    builder = _RecordingBuilder()
+    monkeypatch.setattr("app.workers.run_workflow.build_provider", builder)
+    user, workspace, model, workflow = await _two_step_workflow(db)
+    attachment = await save_attachment(
+        db, workspace_id=workspace.id, workflow_id=workflow.id, uploaded_by=user.id,
+        filename="chart.png", mime="image/png", data=_png_bytes(),
+    )
+    run = await start_run(
+        db, workspace_id=workspace.id, workflow=workflow, trigger=WorkflowTrigger.MANUAL,
+        run_input="", started_by=user.id, attachment_ids=[attachment.id],
+    )
+    await db.commit()
+
+    await run_workflow({}, str(run.id), str(workspace.id))
+    steps = await _refresh_run_and_steps(db, run)
+    assert run.status == WorkflowRunStatus.FAILED
+    assert steps[0].error is not None and "can't read images" in steps[0].error
+    assert steps[1].status == WorkflowStepStatus.SKIPPED
+    assert builder.built == []  # refused before any provider call was made
+
+    # The same run on a vision-capable model hands the image to the step as a native part.
+    model.supports_vision = True
+    retry = await save_attachment(
+        db, workspace_id=workspace.id, workflow_id=workflow.id, uploaded_by=user.id,
+        filename="chart.png", mime="image/png", data=_png_bytes(),
+    )
+    run = await start_run(
+        db, workspace_id=workspace.id, workflow=workflow, trigger=WorkflowTrigger.MANUAL,
+        run_input="", started_by=user.id, attachment_ids=[retry.id],
+    )
+    await db.commit()
+
+    await run_workflow({}, str(run.id), str(workspace.id))
+    await db.refresh(run)
+    assert run.status == WorkflowRunStatus.SUCCEEDED
+    first_user_turn = next(m for m in builder.built[0].last_messages if m.role == "user")
+    assert [image.mime for image in first_user_turn.images] == ["image/png"]

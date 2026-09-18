@@ -1,6 +1,7 @@
 """The arq job that runs one workflow end to end, one step at a time — no chat turn, no
-conversation, just an assistant answering a rendered prompt built from the run's own input and
-earlier steps' completed outputs (see app/workflows/template.py).
+conversation, just an assistant answering a rendered prompt built from the run's own input (its
+text, plus any files it was started with) and earlier steps' completed outputs (see
+app/workflows/template.py).
 
 Runs in the worker process (see app/workers/main.py), entirely independent of any HTTP request:
 it opens its own database session and re-establishes row-level-security scope after every commit
@@ -20,16 +21,25 @@ from typing import Any
 
 from app.core.db import async_session_factory, set_workspace_scope
 from app.core.redis import new_redis_client
-from app.models import Assistant, LLMModel, Workflow, WorkflowRun, WorkflowRunStatus, WorkflowStepStatus
+from app.models import (
+    Assistant,
+    ExtractStatus,
+    LLMModel,
+    Workflow,
+    WorkflowRun,
+    WorkflowRunStatus,
+    WorkflowStepStatus,
+)
 from app.providers.registry import build_provider
 from app.services.assistant_runtime import prepare_assistant_turn
+from app.services.attachments import list_run_attachments
 from app.services.chat import run_assistant_task
 from app.services.credentials import decrypt_credential_key, get_credential
 from app.services.flags import evaluate_flag
 from app.services.generations import append_event
 from app.services.usage import record_usage_event
 from app.services.workflows import list_step_runs
-from app.workflows.template import render
+from app.workflows.template import references_input, render
 
 # A step is itself a whole tool-calling loop (up to MAX_TOOL_ITERATIONS provider round trips,
 # possibly including a delegation) — generous relative to a single chat turn's own headroom,
@@ -99,6 +109,12 @@ async def run_workflow(ctx: dict[str, Any], run_id: str, workspace_id: str) -> N
             await append_event(redis, stream_id, "run_started", {})
 
             step_runs = await list_step_runs(db, run_id=rid)
+            # The files this run was started with go to every step that reads {{input}} — they're
+            # part of the run's input, not a separate placeholder (see template.references_input).
+            run_attachments = await list_run_attachments(db, run_id=rid)
+            run_has_images = any(
+                a.extract_status == ExtractStatus.PASSTHROUGH for a in run_attachments
+            )
             outputs: dict[str, str] = {
                 prior.key: prior.output
                 for prior in step_runs[: run.current_position]
@@ -132,6 +148,14 @@ async def run_workflow(ctx: dict[str, Any], run_id: str, workspace_id: str) -> N
                     model = await db.get(LLMModel, model_id) if model_id is not None else None
                     if model is None:
                         raise ValueError("This step has no model to run on.")
+                    step_attachments = (
+                        run_attachments if references_input(step_run.prompt_template) else []
+                    )
+                    if step_attachments and run_has_images and not model.supports_vision:
+                        raise ValueError(
+                            "This step's model can't read images, but the run was started with "
+                            "one — pick a vision-capable model or attach documents instead."
+                        )
 
                     credential = await get_credential(
                         db, workspace_id=wid, credential_id=model.credential_id
@@ -171,6 +195,7 @@ async def run_workflow(ctx: dict[str, Any], run_id: str, workspace_id: str) -> N
                             turn=turn,
                             task=prompt,
                             emit_deltas=False,
+                            attachments=step_attachments,
                         )
                     if result.error_message:
                         raise ValueError(result.error_message)

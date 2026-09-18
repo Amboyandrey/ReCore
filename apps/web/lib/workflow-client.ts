@@ -1,3 +1,4 @@
+import { type Attachment } from "./attachment-client";
 import { consumeSSE } from "./chat-client";
 import { apiPublicUrl } from "./config";
 
@@ -28,6 +29,8 @@ export type Workflow = {
   enabled: boolean;
   default_model_id: string | null;
   steps: WorkflowStep[];
+  // null means the inbound webhook is off; otherwise the secret the hook URL embeds.
+  webhook_secret: string | null;
   created_by: string;
   created_at: string;
 };
@@ -100,12 +103,21 @@ export type WorkflowStepRun = {
   finished_at: string | null;
 };
 
+export type RunAttachment = {
+  id: string;
+  original_filename: string;
+  mime: string;
+  size: number;
+  extract_status: Attachment["extract_status"];
+};
+
 export type WorkflowRun = {
   id: string;
   workflow_id: string;
   trigger: WorkflowTrigger;
   status: WorkflowRunStatus;
   input: string;
+  attachments: RunAttachment[];
   output: string | null;
   error: string | null;
   started_by: string | null;
@@ -184,14 +196,50 @@ export async function deleteWorkflow(workspaceId: string, workflowId: string): P
   await throwIfNotOk(res);
 }
 
-// Starts a run — queued on the worker immediately; watch it via streamRunEvents.
-export async function startRun(workspaceId: string, workflowId: string, input: string): Promise<WorkflowRun> {
+// Uploads a file for a run to start from — pass its id to startRun's attachment_ids.
+export async function uploadRunAttachment(workspaceId: string, workflowId: string, file: File): Promise<Attachment> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch(`${apiPublicUrl}/api/v1/workspaces/${workspaceId}/workflows/${workflowId}/attachments`, {
+    method: "POST",
+    credentials: "include",
+    body: form,
+  });
+  await throwIfNotOk(res);
+  return (await res.json()) as Attachment;
+}
+
+// Starts a run from text, already-uploaded files, or both — queued on the worker immediately;
+// watch it via streamRunEvents.
+export async function startRun(
+  workspaceId: string,
+  workflowId: string,
+  input: { input?: string; attachment_ids?: string[] }
+): Promise<WorkflowRun> {
   const res = await api(`/api/v1/workspaces/${workspaceId}/workflows/${workflowId}/runs`, {
     method: "POST",
-    body: JSON.stringify({ input }),
+    body: JSON.stringify(input),
   });
   await throwIfNotOk(res);
   return (await res.json()) as WorkflowRun;
+}
+
+// Turns the workflow's inbound webhook on, or rotates its secret if it's already on.
+export async function enableWebhook(workspaceId: string, workflowId: string): Promise<string> {
+  const res = await api(`/api/v1/workspaces/${workspaceId}/workflows/${workflowId}/webhook`, { method: "POST" });
+  await throwIfNotOk(res);
+  return ((await res.json()) as { webhook_secret: string }).webhook_secret;
+}
+
+// Turns the workflow's inbound webhook off — its URL stops working immediately.
+export async function disableWebhook(workspaceId: string, workflowId: string): Promise<void> {
+  const res = await api(`/api/v1/workspaces/${workspaceId}/workflows/${workflowId}/webhook`, { method: "DELETE" });
+  await throwIfNotOk(res);
+}
+
+// The public URL an external system POSTs to in order to start a run of this workflow.
+export function webhookUrl(workspaceId: string, secret: string): string {
+  return `${apiPublicUrl}/api/v1/hooks/workflows/${workspaceId}/${secret}`;
 }
 
 export async function listRuns(

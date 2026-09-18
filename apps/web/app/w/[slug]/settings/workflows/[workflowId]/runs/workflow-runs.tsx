@@ -1,13 +1,17 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useRequireAuth } from "@/lib/auth-context";
 import { useWorkspaceFlags } from "@/lib/use-workspace-flags";
 import {
+  disableWebhook,
+  enableWebhook,
   getWorkflow,
   listRuns,
   startRun,
+  uploadRunAttachment,
+  webhookUrl,
   WorkflowError,
   type Workflow,
   type WorkflowRun,
@@ -51,7 +55,12 @@ export function WorkflowRunsPage({ slug, workflowId }: { slug: string; workflowI
   const [error, setError] = useState<string | null>(null);
 
   const [input, setInput] = useState("");
+  const [files, setFiles] = useState<File[]>([]);
   const [starting, setStarting] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const [webhookBusy, setWebhookBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
 
   useEffect(() => {
     if (!workspace || !workflowsEnabled) {
@@ -85,19 +94,69 @@ export function WorkflowRunsPage({ slug, workflowId }: { slug: string; workflowI
     return () => clearInterval(timer);
   }, [workspace, workflowsEnabled, workflowId, runs]);
 
+  // Uploads each chosen file first, then starts the run with their ids — the same
+  // upload-ahead-of-send shape the chat composer follows.
   async function handleStart(e: FormEvent) {
     e.preventDefault();
-    if (!workspace || !input.trim()) return;
+    if (!workspace || (!input.trim() && files.length === 0)) return;
     setStarting(true);
     setError(null);
     try {
-      const run = await startRun(workspace.id, workflowId, input);
+      const uploaded = await Promise.all(files.map((f) => uploadRunAttachment(workspace.id, workflowId, f)));
+      const run = await startRun(workspace.id, workflowId, {
+        input,
+        attachment_ids: uploaded.map((a) => a.id),
+      });
       setRuns((prev) => [run, ...prev]);
       setInput("");
+      setFiles([]);
+      if (fileInputRef.current) fileInputRef.current.value = "";
     } catch (err) {
       setError(err instanceof WorkflowError ? err.message : "Something went wrong.");
     } finally {
       setStarting(false);
+    }
+  }
+
+  // Enables the webhook, or rotates its secret when it's already on.
+  async function handleEnableWebhook() {
+    if (!workspace || !workflow) return;
+    setWebhookBusy(true);
+    setError(null);
+    try {
+      const secret = await enableWebhook(workspace.id, workflowId);
+      setWorkflow({ ...workflow, webhook_secret: secret });
+      setCopied(false);
+    } catch (err) {
+      setError(err instanceof WorkflowError ? err.message : "Something went wrong.");
+    } finally {
+      setWebhookBusy(false);
+    }
+  }
+
+  // Turns the webhook off — the old URL stops working immediately.
+  async function handleDisableWebhook() {
+    if (!workspace || !workflow) return;
+    setWebhookBusy(true);
+    setError(null);
+    try {
+      await disableWebhook(workspace.id, workflowId);
+      setWorkflow({ ...workflow, webhook_secret: null });
+    } catch (err) {
+      setError(err instanceof WorkflowError ? err.message : "Something went wrong.");
+    } finally {
+      setWebhookBusy(false);
+    }
+  }
+
+  // Copies the hook URL; the confirmation clears itself so the button reads "Copy" again.
+  async function handleCopy(url: string) {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setError("Couldn't copy — select the URL and copy it by hand.");
     }
   }
 
@@ -132,21 +191,117 @@ export function WorkflowRunsPage({ slug, workflowId }: { slug: string; workflowI
       >
         <p className="text-xs font-semibold uppercase tracking-wide text-text-muted">Run</p>
         <textarea
-          required
           rows={3}
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="What should this run's first step start from?"
+          placeholder="What should this run's first step start from? Leave empty to run from files alone."
           className="rounded-md border border-border bg-surface px-3 py-2 text-sm text-text outline-none focus:border-accent"
         />
+        <div className="flex flex-wrap items-center gap-2">
+          <label className="cursor-pointer rounded-md border border-border px-3 py-1.5 text-xs text-text-soft hover:border-border-strong">
+            Attach files
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(e) => setFiles((prev) => [...prev, ...Array.from(e.target.files ?? [])])}
+            />
+          </label>
+          {files.map((f, i) => (
+            <span
+              key={`${f.name}-${i}`}
+              className="flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-xs text-text-muted"
+            >
+              {f.name}
+              <button
+                type="button"
+                aria-label={`Remove ${f.name}`}
+                onClick={() => setFiles((prev) => prev.filter((_, j) => j !== i))}
+                className="text-text-soft hover:text-text"
+              >
+                ×
+              </button>
+            </span>
+          ))}
+        </div>
+        <p className="text-xs text-text-soft">
+          Files go to every step that reads <code>{"{{input}}"}</code> — documents as their extracted text,
+          images to vision-capable models.
+        </p>
         <button
           type="submit"
-          disabled={starting}
+          disabled={starting || (!input.trim() && files.length === 0)}
           className="self-start rounded-md bg-accent px-3 py-2 text-sm font-medium text-accent-contrast disabled:opacity-60"
         >
           {starting ? "Starting…" : "Run"}
         </button>
       </form>
+
+      <div className="mt-6 rounded-md border border-border bg-surface p-4">
+        <div className="flex items-center justify-between gap-3">
+          <p className="text-xs font-semibold uppercase tracking-wide text-text-muted">Webhook</p>
+          {workflow.webhook_secret ? (
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={handleEnableWebhook}
+                disabled={webhookBusy}
+                className="rounded-md border border-border px-3 py-1.5 text-xs text-text-soft hover:border-border-strong disabled:opacity-60"
+              >
+                Rotate secret
+              </button>
+              <button
+                type="button"
+                onClick={handleDisableWebhook}
+                disabled={webhookBusy}
+                className="rounded-md border border-danger px-3 py-1.5 text-xs text-danger disabled:opacity-60"
+              >
+                Disable
+              </button>
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={handleEnableWebhook}
+              disabled={webhookBusy}
+              className="rounded-md border border-border px-3 py-1.5 text-xs text-text-soft hover:border-border-strong disabled:opacity-60"
+            >
+              {webhookBusy ? "Enabling…" : "Enable"}
+            </button>
+          )}
+        </div>
+        {workflow.webhook_secret ? (
+          <div className="mt-3 flex flex-col gap-2">
+            <p className="text-xs text-text-muted">
+              Anyone with this URL can start a run — treat it like a password. POST JSON{" "}
+              <code>{'{"input": "..."}'}</code>, or a multipart form with an optional <code>input</code> field and
+              one or more <code>files</code> parts.
+            </p>
+            <div className="flex items-center gap-2">
+              <code className="min-w-0 flex-1 truncate rounded-md bg-surface-sunk px-2 py-1 text-xs text-text">
+                {webhookUrl(workspace.id, workflow.webhook_secret)}
+              </code>
+              <button
+                type="button"
+                onClick={() => handleCopy(webhookUrl(workspace.id, workflow.webhook_secret ?? ""))}
+                className="shrink-0 rounded-md border border-border px-2 py-1 text-xs text-text-soft hover:border-border-strong"
+              >
+                {copied ? "Copied" : "Copy"}
+              </button>
+            </div>
+            <pre className="overflow-x-auto rounded-md bg-surface-sunk p-2 text-xs text-text-muted">
+              {`curl -X POST '${webhookUrl(workspace.id, workflow.webhook_secret)}' \\
+  -H 'Content-Type: application/json' \\
+  -d '{"input": "Hello from outside"}'`}
+            </pre>
+          </div>
+        ) : (
+          <p className="mt-2 text-xs text-text-muted">
+            Off. Enable to get a URL that external systems can POST to in order to start a run.
+          </p>
+        )}
+      </div>
 
       <div className="mt-8">
         <h2 className="text-sm font-semibold text-text">Run history</h2>
@@ -169,7 +324,15 @@ export function WorkflowRunsPage({ slug, workflowId }: { slug: string; workflowI
                         {r.trigger}
                       </span>
                     </div>
-                    <p className="mt-0.5 truncate text-xs text-text-muted">{r.input}</p>
+                    <p className="mt-0.5 truncate text-xs text-text-muted">
+                      {r.input || (r.attachments.length === 0 ? "(no input)" : "")}
+                      {r.attachments.length > 0 && (
+                        <span className="text-text-soft">
+                          {r.input ? " · " : ""}
+                          {r.attachments.map((a) => a.original_filename).join(", ")}
+                        </span>
+                      )}
+                    </p>
                   </div>
                   <div className="shrink-0 text-right text-xs text-text-muted">
                     <p>${r.cost_usd.toFixed(4)}</p>
