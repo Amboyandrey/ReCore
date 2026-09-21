@@ -14,6 +14,7 @@ import {
   type WorkflowStepRunStatus,
 } from "@/lib/workflow-client";
 import { useWorkspaceBySlug } from "@/lib/workspace-context";
+import { MarkdownMessage } from "@/components/markdown-message";
 
 const RUN_STATUS_LABEL: Record<WorkflowRunStatus, string> = {
   queued: "Queued",
@@ -201,7 +202,7 @@ export function WorkflowRunDetailPage({
             )}
 
             {step.output && (
-              <p className="mt-2 whitespace-pre-wrap text-sm text-text">{step.output}</p>
+              <MarkdownMessage content={step.output} className="mt-2 text-sm text-text" />
             )}
             {step.error && <p className="mt-2 text-sm text-danger">{step.error}</p>}
 

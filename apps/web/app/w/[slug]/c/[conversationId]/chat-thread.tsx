@@ -29,6 +29,7 @@ import { useWorkspaceBySlug } from "@/lib/workspace-context";
 import { ConversationSidebar } from "@/components/conversation-sidebar";
 import { SourcesSidebar } from "@/components/sources-sidebar";
 import { PendingAttachmentChips, SentAttachmentChips, hasBlockedImage } from "@/components/attachment-chips";
+import { MarkdownMessage } from "@/components/markdown-message";
 
 // Groups a conversation's attachments by the message they were sent with — what lets a message
 // already sitting in history show it had a file attached, not just the composer at send time.
@@ -559,13 +560,13 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
                 />
               ))}
               <div
-                className={`max-w-[75%] whitespace-pre-wrap rounded-lg px-3 py-2 text-sm ${
+                className={`rounded-lg px-3 py-2 text-sm ${
                   m.role === "user"
-                    ? "bg-accent text-accent-contrast"
-                    : "border border-border bg-surface text-text"
+                    ? "max-w-[75%] whitespace-pre-wrap bg-accent text-accent-contrast"
+                    : "w-full border border-border bg-surface text-text"
                 }`}
               >
-                {m.content}
+                {m.role === "user" ? m.content : <MarkdownMessage content={m.content} />}
                 {m.error && <p className="mt-1 text-xs text-danger">{m.error}</p>}
               </div>
               <SentAttachmentChips attachments={attachmentsByMessageId[m.id] ?? []} />
@@ -577,9 +578,14 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
                 <ToolActivityChip key={index} name={activity.name} ok={activity.ok} />
               ))}
               {streamingText && (
-                <div className="max-w-[75%] whitespace-pre-wrap rounded-lg border border-border bg-surface px-3 py-2 text-sm text-text">
-                  {streamingText}
-                  <span className="ml-0.5 inline-block h-3 w-1.5 animate-pulse bg-text-muted align-middle" />
+                <div className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-text">
+                  {/* The typing caret hangs off the last rendered block rather than sitting in
+                      its own element: Markdown renders paragraphs and lists, so a sibling <span>
+                      would land on a line of its own instead of where the text actually stops. */}
+                  <MarkdownMessage
+                    content={streamingText}
+                    className="[&>:last-child]:after:ml-0.5 [&>:last-child]:after:inline-block [&>:last-child]:after:h-3 [&>:last-child]:after:w-1.5 [&>:last-child]:after:animate-pulse [&>:last-child]:after:bg-text-muted [&>:last-child]:after:align-middle [&>:last-child]:after:content-['']"
+                  />
                 </div>
               )}
             </div>
