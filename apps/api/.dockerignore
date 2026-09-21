@@ -1,0 +1,18 @@
+# The image build copies this directory (infra/Dockerfile.api); local artifacts would otherwise
+# be baked into it. Keep this in step with apps/web/.dockerignore.
+
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+venv
+htmlcov
+.coverage
+
+.env
+.env.*
+.git
+.gitignore
+*.log
