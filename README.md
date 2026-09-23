@@ -6,6 +6,8 @@ Multiple workspaces, multiple people, multiple providers — one platform, one a
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how it's built and why, including the parts
 that were deliberately left out.
 
+![ReCore chat with knowledge retrieval: an answer built from indexed website content, with the cited sources in the sidebar](docs/screenshots/01-chat-knowledge.png)
+
 ## What it does
 
 - **Bring your own key** — register an Anthropic, OpenAI, Google, or any OpenAI-compatible
@@ -45,6 +47,15 @@ that were deliberately left out.
 - **Usage and audit** — every generation's (and workflow step's) tokens and cost land in an
   append-only ledger; every privileged action (who invited whom, whose key got rejected, which flag
   got flipped, who registered a tool) lands in an immutable audit trail.
+
+## Screenshots
+
+| | |
+|---|---|
+| ![Workspace overview](docs/screenshots/02-workspace.png) | ![LLM providers](docs/screenshots/03-providers.png) |
+| **Workspace overview** — conversations, workflows, and every admin surface in one place | **LLM providers** — a workspace's own keys (masked), enabled chat models with per-token pricing, and embedding models for Knowledge |
+| ![ReFlow workflows](docs/screenshots/04-workflows.png) | ![Home](docs/screenshots/05-home.png) |
+| **ReFlow workflows** — ordered assistant steps templated on `{{input}}` and earlier steps' outputs, with optional approval gates | **Home** — live system status and the workspaces you belong to |
 
 ## Architecture
 
