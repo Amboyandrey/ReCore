@@ -69,7 +69,7 @@ Services → auth, sessions, workspaces, members, invitations, credentials, mode
            workflows, jobs, flags, usage, audit, rate_limit
 Adapters → Anthropic, Google, OpenAI-compatible (also serves OpenAI), Fake (tests) — chat streaming
            and, for providers that support it, embeddings
-Executors→ built-in web search (Tavily), third-party HTTP tools
+Executors→ built-in web search (Tavily), third-party HTTP tools, remote MCP server tools
 Worker   → arq — connector indexing (website crawl or files → chunks → embeddings) and workflow
            runs, one step at a time
 External → mem0 (recall/record on a workspace's own key)
@@ -96,7 +96,7 @@ ReCore/
 │   ├── app/routers/v1/         # thin — parse, delegate, serialize
 │   ├── app/scripts/             # seed, load test
 │   ├── migrations/             # Alembic, one revision per schema change
-│   └── tests/                  # pytest, 437 tests against real Postgres/Redis
+│   └── tests/                  # pytest, 469 tests against real Postgres/Redis
 ├── apps/web/                 # Next.js 16 (App Router), React 19, Tailwind 4
 │   ├── app/(auth)/             # login, signup
 │   ├── app/w/[slug]/           # chat + settings, workspace-scoped
@@ -222,7 +222,8 @@ visibly right.
   with actor and IP.
 
 The same envelope-encryption columns and code path hold a workspace's Tavily key, its mem0 key, and
-each HTTP tool's secret header value — one mechanism for every secret the platform stores.
+each HTTP tool's secret header value, and each MCP server's auth header value — one mechanism for
+every secret the platform stores.
 
 ## 6. The LLM layer
 
@@ -320,7 +321,7 @@ truncates any result to 8,000 characters. A tool that times out, throws, or retu
 becomes a normal-shaped error result fed back to the model — one bad tool cannot take a generation
 down.
 
-Two kinds of tool exist behind that one dispatcher:
+Three kinds of tool exist behind that one dispatcher:
 
 - **Built-in web search**, backed by Tavily — chosen because it returns LLM-ready text rather than
   raw HTML to parse. Its key is stored envelope-encrypted on the tool's own row.
@@ -329,8 +330,18 @@ Two kinds of tool exist behind that one dispatcher:
   become the request body (POST/PUT/PATCH) or query string (GET/DELETE); the response is truncated
   before it ever reaches the model, and a non-2xx comes back as a tool error rather than killing
   the generation.
+- **Tools from a remote MCP server** (`mcp_servers`, Streamable HTTP only), connected by any
+  workspace member with a short name, a URL, and an optional auth header. Connecting runs
+  `tools/list` and stores each tool as an ordinary `tools` row of kind `MCP`, named
+  `<server>__<tool>` and carrying copies of the server's URL and encrypted secret, so executing one
+  needs no extra lookup and the agent loop, assistants, delegation and workflows use it unchanged.
+  Rows start **disabled** — a server can offer dozens of tools and a plain chat is offered every
+  enabled one — and only `enabled` can be edited on them. A sync refreshes rows in place (so
+  assistant assignments survive), adds new ones disabled, and disables any the server dropped.
+  Each call opens a fresh session (stateless, so the worker can run it too); text content is
+  passed back, and images or binary resources become a placeholder.
 
-An HTTP tool's URL is checked against the SSRF guard at registration **and again immediately before
+An HTTP tool's or MCP server's URL is checked against the SSRF guard at registration **and again immediately before
 every call** — a DNS answer can change in between, and the second check is the one that runs at the
 moment a request actually goes out.
 
@@ -610,7 +621,7 @@ default, each a 404 at the route level when off, exactly like `attachments`.
 | `/w/[slug]/c/new` · `/w/[slug]/c/[id]` | Chat — model/assistant pickers, streaming, stop, attachments, tool activity, knowledge sources sidebar | viewer |
 | `/w/[slug]/settings/members` | Invite, change role, remove | admin |
 | `/w/[slug]/settings/providers` | Register keys, validate, enable models (chat or embedding), set pricing | admin |
-| `/w/[slug]/settings/tools` | Web search key; register/edit/delete HTTP tools | any member, `tools` flag |
+| `/w/[slug]/settings/tools` | Web search key; register/edit/delete HTTP tools; connect/sync/delete MCP servers and toggle their tools | any member, `tools` flag |
 | `/w/[slug]/settings/assistants` | Create/edit assistants — instructions, model, tools, memory, delegates, connectors | any member |
 | `/w/[slug]/settings/assistants/[id]/memories` | View/add curated memories, view (not edit) personal ones | creator or owner, `memory` flag |
 | `/w/[slug]/settings/knowledge` | Choose the embedding model; register/reindex/delete connectors | any member (model choice: admin), `knowledge` flag |
@@ -664,22 +675,24 @@ Known gaps, stated rather than buried:
   made; closing it fully means pinning the resolved IP for the request that follows. The
   registration-time *and* call-time (and, for a crawl, per-redirect-hop) checks narrow it; they
   don't eliminate it.
-- **Rate limiting covers auth, invites and credential validation — not chat, not a workflow's own
-  webhook trigger** (which doesn't exist yet — see §21, but is worth naming here ahead of it landing
-  since a public inbound endpoint is exactly the kind of thing that needs one from day one). A
-  workspace's own provider bill is the current backpressure on message sending.
+- **Rate limiting covers auth, invites, credential validation and the inbound workflow webhook
+  (per workspace, see §14) — not chat.** A workspace's own provider bill is the current
+  backpressure on message sending.
 - **CI runs lint, type checks and tests**, not dependency or secret scanning.
 - **Logs are structured JSON with no redaction processor.** Secrets stay out of them by discipline
   — nothing logs decrypted material, and credentials are decrypted only at the point of use — but
   there is no filter standing behind that discipline if a future log line gets it wrong.
+- **MCP tool descriptions and results are third-party text.** A connected server controls what
+  the model reads about its tools and what they return, so it can attempt prompt injection — the
+  same trust already extended to an HTTP tool's response, and contained the same way (§20).
 - **Tool results don't survive into later turns.** Within one generation the model sees every tool
   result; on the next user turn it sees only its own final answer. That keeps replay honest across
   providers, which reject orphaned tool-call ids, but it is a real boundary.
 
 ## 20. The trade-off worth naming
 
-Any workspace member can register a tool that sends the model's arguments to a URL of their
-choosing, carrying a stored secret — and, separately, register a website connector that crawls any
+Any workspace member can register a tool (or connect an MCP server) that sends the model's
+arguments to a URL of their choosing, carrying a stored secret — and, separately, register a website connector that crawls any
 same-host-reachable public site, or build a workflow that runs repeatedly on the workspace's own
 provider credentials. None of these were oversights: gating any of them behind admin-only would
 have made the feature useless to the people most likely to want it, for the same reason across all
@@ -714,6 +727,10 @@ Named here so nobody hunts for them or assumes they're half-finished:
   that stops being true.
 - **Knowledge retrieval or memory for a delegate's inner turn.** Both extend only to the
   orchestrating assistant today.
+- **OAuth and stdio for MCP servers.** Only a static auth header is supported, so hosted servers
+  that require the OAuth 2.1 flow can't be connected yet; stdio servers would mean running a
+  user-supplied command on the API host, which a multi-tenant app shouldn't do. MCP resources and
+  prompts aren't used either — only tools.
 - **Circuit breakers per credential**, a command palette, and a shared `packages/` workspace — all
   in earlier plans, none built.
 
@@ -740,7 +757,7 @@ Named here so nobody hunts for them or assumes they're half-finished:
 
 ## 23. Testing
 
-437 pytest tests run against a real Postgres and Redis — never mocks of them. `conftest.py` forces
+469 pytest tests run against a real Postgres and Redis — never mocks of them. `conftest.py` forces
 a separate `_test`-suffixed database and Redis index before any app code loads, so running the
 suite can't touch data a dev stack is using. `FakeProvider` implements both the chat and embedding
 protocols, which is what makes the whole chat pipeline, plus ReStore's indexing/retrieval and
