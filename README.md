@@ -21,7 +21,7 @@ that were deliberately left out.
   optional secret header. Or connect a remote MCP server (Streamable HTTP, optional auth header)
   and enable whichever of its tools a chat should see. The agent loop executes calls, feeds results
   back, and records every one in the transcript — bounded by a timeout, a result-size cap, and a
-  5-iteration ceiling.
+  5-iteration ceiling. Images a tool returns are saved on the reply and shown under its call.
 - **Assistants** — save a name, instructions, an optional preferred model and a set of tools, then
   point a conversation at it. Instructions and tools are resolved live on every send, so editing an
   assistant reaches conversations already using it.
@@ -44,8 +44,8 @@ that were deliberately left out.
 - **Feature flags** — user → workspace → percentage rollout → default resolution, cached in Redis
   and invalidated instantly on edit. A per-provider killswitch is the platform's own admin lever.
 - **Attachments** — PDF, DOCX, PPTX, XLSX and text files extract into the next message's context;
-  images (HEIC included) pass through to vision-capable models, and are refused pre-flight by
-  models that can't read them.
+  images (HEIC included) pass through to vision-capable models, show as thumbnails in the thread,
+  and are refused pre-flight by models that can't read them.
 - **Usage and audit** — every generation's (and workflow step's) tokens and cost land in an
   append-only ledger; every privileged action (who invited whom, whose key got rejected, which flag
   got flipped, who registered a tool) lands in an immutable audit trail.
@@ -149,7 +149,7 @@ apps/api/          FastAPI backend (Python 3.12)
   app/deps/           the auth → workspace → role dependency chain, plus flag gates
   app/scripts/        one-off scripts (demo seed, load test)
   migrations/         Alembic, one revision per schema change
-  tests/              pytest, 469 tests
+  tests/              pytest, 481 tests
 apps/web/           Next.js 16 (App Router), React 19, Tailwind 4
   app/                routes — auth, workspace, chat, settings, admin
   lib/                one typed API client per domain + React context
