@@ -14,6 +14,7 @@ from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.crypto import EncryptedSecret, decrypt_secret, encrypt_secret
 from app.core.errors import ToolNameAlreadyExists, ToolNotFound
 from app.core.ssrf import UnsafeBaseUrlError
@@ -46,7 +47,7 @@ from app.services.tools import (
     update_tool,
 )
 from app.tools import http_tool, web_search
-from app.tools.base import ToolExecutionResult
+from app.tools.base import ToolExecutionResult, ToolImage, accept_image
 from app.tools.execute import MAX_RESULT_CHARS, execute_tool
 
 OWNER = {"email": "owner@example.com", "password": "correct horse battery staple"}
@@ -812,3 +813,35 @@ async def test_execute_tool_times_out_a_hanging_tool(monkeypatch: pytest.MonkeyP
 
     assert result.ok is False
     assert "timed out" in result.content
+
+
+async def test_http_tool_returns_an_image_response_as_an_image(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"\x89PNG", headers={"content-type": "image/png"})
+
+    monkeypatch.setattr(http_tool, "_transport", httpx.MockTransport(handler))
+
+    result = await http_tool.execute(_http_tool(), {})
+
+    assert result.ok is True
+    assert result.images == (ToolImage(mime="image/png", data=b"\x89PNG"),)
+    assert "image" in result.content
+
+
+async def test_http_tool_refuses_an_svg_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"<svg/>", headers={"content-type": "image/svg+xml"})
+
+    monkeypatch.setattr(http_tool, "_transport", httpx.MockTransport(handler))
+
+    result = await http_tool.execute(_http_tool(), {})
+
+    assert result.ok is False
+    assert result.images == ()
+
+
+def test_accept_image_enforces_the_size_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(get_settings(), "max_attachment_size_bytes", 3)
+
+    assert accept_image("image/png; charset=binary", b"abc") == ToolImage(mime="image/png", data=b"abc")
+    assert accept_image("image/png", b"abcd") is None

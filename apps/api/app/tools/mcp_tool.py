@@ -6,6 +6,8 @@ API host, which a multi-tenant app can't allow. A fresh session is opened per ca
 here holds state between requests — the same stateless shape as the HTTP tool executor.
 """
 
+import base64
+import binascii
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -14,12 +16,20 @@ import httpx2
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.mcpserver import MCPServer
-from mcp.types import CallToolResult, EmbeddedResource, ResourceLink, TextContent, TextResourceContents
+from mcp.types import (
+    BlobResourceContents,
+    CallToolResult,
+    EmbeddedResource,
+    ImageContent,
+    ResourceLink,
+    TextContent,
+    TextResourceContents,
+)
 
 from app.core.crypto import EncryptedSecret, decrypt_secret
 from app.core.ssrf import UnsafeBaseUrlError, assert_safe_base_url
 from app.models import Tool
-from app.tools.base import ToolExecutionResult
+from app.tools.base import MAX_IMAGES_PER_RESULT, ToolExecutionResult, ToolImage, accept_image
 
 # Matches execute.py's MCP ceiling, so the HTTP client never gives up before the call does.
 _TIMEOUT = 60.0
@@ -89,21 +99,42 @@ def auth_headers(
     return {header: secret}
 
 
-def _flatten(result: CallToolResult) -> str:
-    """Turn a result's content blocks into the plain text every provider adapter accepts."""
+def _decode_image(mime: str | None, encoded: str) -> ToolImage | None:
+    """Decode a base64 image block, keeping it only if it's an allowed format and size."""
+    try:
+        return accept_image(mime or "", base64.b64decode(encoded, validate=True))
+    except (binascii.Error, ValueError):
+        return None
+
+
+def _flatten(result: CallToolResult) -> tuple[str, tuple[ToolImage, ...]]:
+    """Turn a result's content blocks into the plain text every provider adapter accepts, plus
+    any images it carried — each noted in the text so the model knows the user can see it."""
     parts: list[str] = []
+    images: list[ToolImage] = []
     for block in result.content:
+        image: ToolImage | None = None
         if isinstance(block, TextContent):
             parts.append(block.text)
-        elif isinstance(block, EmbeddedResource) and isinstance(block.resource, TextResourceContents):
+            continue
+        if isinstance(block, EmbeddedResource) and isinstance(block.resource, TextResourceContents):
             parts.append(block.resource.text)
-        elif isinstance(block, ResourceLink):
+            continue
+        if isinstance(block, ResourceLink):
             parts.append(f"[resource: {block.uri}]")
+            continue
+        if isinstance(block, ImageContent):
+            image = _decode_image(block.mime_type, block.data)
+        elif isinstance(block, EmbeddedResource) and isinstance(block.resource, BlobResourceContents):
+            image = _decode_image(block.resource.mime_type, block.resource.blob)
+        if image is not None and len(images) < MAX_IMAGES_PER_RESULT:
+            images.append(image)
+            parts.append(f"[image {len(images)} generated and shown to the user]")
         else:
             parts.append(f"[{block.type} content omitted]")
     if not parts and result.structured_content is not None:
         parts.append(json.dumps(result.structured_content))
-    return "\n".join(parts)
+    return "\n".join(parts), tuple(images)
 
 
 async def execute(tool: Tool, arguments: dict[str, object]) -> ToolExecutionResult:
@@ -126,7 +157,7 @@ async def execute(tool: Tool, arguments: dict[str, object]) -> ToolExecutionResu
     except Exception as exc:  # noqa: BLE001 — an unreachable server is a tool error, not a crash
         return ToolExecutionResult(ok=False, content=f"Could not reach the MCP server: {_root_cause(exc)}")
 
-    content = _flatten(result)
+    content, images = _flatten(result)
     if result.is_error:
         return ToolExecutionResult(ok=False, content=f"The tool returned an error: {content}")
-    return ToolExecutionResult(ok=True, content=content)
+    return ToolExecutionResult(ok=True, content=content, images=images)
