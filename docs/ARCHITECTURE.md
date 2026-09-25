@@ -316,8 +316,9 @@ workflow step, which has no chat message to attach a row to — including when t
 fails, since a run that broke on its third round trip may still have made two real calls worth
 recording.
 
-**Execution is bounded and never fatal.** `execute_tool` runs a call under a 15-second timeout and
-truncates any result to 8,000 characters. A tool that times out, throws, or returns something huge
+**Execution is bounded and never fatal.** `execute_tool` runs a call under a 15-second timeout
+(60 seconds for an MCP tool, since those servers are often AI-backed and slower) and truncates any
+result to 8,000 characters. A tool that times out, throws, or returns something huge
 becomes a normal-shaped error result fed back to the model — one bad tool cannot take a generation
 down.
 

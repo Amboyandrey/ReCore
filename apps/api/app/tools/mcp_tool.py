@@ -21,7 +21,8 @@ from app.core.ssrf import UnsafeBaseUrlError, assert_safe_base_url
 from app.models import Tool
 from app.tools.base import ToolExecutionResult
 
-_TIMEOUT = 15.0
+# Matches execute.py's MCP ceiling, so the HTTP client never gives up before the call does.
+_TIMEOUT = 60.0
 # A server offering more than this is almost certainly not something a model should see in full.
 MAX_TOOLS_PER_SERVER = 100
 

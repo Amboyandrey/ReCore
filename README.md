@@ -216,8 +216,8 @@ CI runs the same API and web checks on every push and pull request.
 - SSRF guard on every user-supplied URL — provider base URLs, tool endpoints, MCP servers, and
   ReStore's website connectors, all re-checked immediately before each call (and every crawl
   redirect hop), not just when the URL was registered
-- Tool execution is bounded: a 15s timeout, an 8,000-character result cap, and a 5-iteration
-  ceiling per generation, so one bad tool degrades a single turn rather than a whole run
+- Tool execution is bounded: a 15s timeout (60s for MCP tools), an 8,000-character result cap,
+  and a 5-iteration ceiling per generation, so one bad tool degrades a single turn rather than a whole run
 - Tenancy enforced by one dependency chain (`current_user → workspace_ctx → require_role`), 404
   (not 403) for non-members, and backstopped by Postgres row-level security under a dedicated
   low-privilege runtime role — see the RLS migration's own docstring for the details worth knowing

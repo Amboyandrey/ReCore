@@ -1,6 +1,7 @@
 """The MCP tool executor — listing a server's tools and calling one — against an in-process MCP
 server, plus the execute_tool() dispatcher routing an MCP row to it."""
 
+import asyncio
 import uuid
 from typing import Any
 
@@ -10,7 +11,7 @@ from mcp.types import ImageContent
 
 from app.core.crypto import encrypt_secret
 from app.models import Tool, ToolKind
-from app.tools import mcp_tool
+from app.tools import execute, mcp_tool
 from app.tools.execute import execute_tool
 
 _server = MCPServer("test")
@@ -152,3 +153,19 @@ async def test_execute_tool_dispatches_an_mcp_tool() -> None:
 
     assert result.ok is True
     assert result.content == "9"
+
+
+async def test_execute_tool_gives_an_mcp_tool_the_longer_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A call slower than the default ceiling but within the MCP one still succeeds."""
+
+    async def slow(tool: Tool, arguments: dict[str, object]) -> mcp_tool.ToolExecutionResult:
+        await asyncio.sleep(0.1)
+        return mcp_tool.ToolExecutionResult(ok=True, content="done")
+
+    monkeypatch.setattr(mcp_tool, "execute", slow)
+    monkeypatch.setattr(execute, "EXECUTION_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(execute, "MCP_EXECUTION_TIMEOUT_SECONDS", 1.0)
+
+    result, _latency_ms = await execute_tool(_mcp_tool(), {})
+
+    assert result.content == "done"

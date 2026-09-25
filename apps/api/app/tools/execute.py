@@ -12,6 +12,8 @@ from app.tools.registry import BUILTIN_TOOLS
 
 MAX_RESULT_CHARS = 8_000
 EXECUTION_TIMEOUT_SECONDS = 15.0
+# MCP servers are often AI-backed themselves (DeepWiki's answers take 13-20s), so they get longer.
+MCP_EXECUTION_TIMEOUT_SECONDS = 60.0
 
 
 async def execute_tool(tool: Tool, arguments: dict[str, object]) -> tuple[ToolExecutionResult, int]:
@@ -22,8 +24,9 @@ async def execute_tool(tool: Tool, arguments: dict[str, object]) -> tuple[ToolEx
     the whole thing over one bad input" contract attachment extraction already follows.
     """
     started = time.monotonic()
+    timeout = MCP_EXECUTION_TIMEOUT_SECONDS if tool.kind == ToolKind.MCP else EXECUTION_TIMEOUT_SECONDS
     try:
-        async with asyncio.timeout(EXECUTION_TIMEOUT_SECONDS):
+        async with asyncio.timeout(timeout):
             result = await _dispatch(tool, arguments)
     except TimeoutError:
         result = ToolExecutionResult(ok=False, content="The tool timed out.")
