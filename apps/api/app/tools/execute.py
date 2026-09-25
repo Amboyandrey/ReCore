@@ -6,7 +6,7 @@ import asyncio
 import time
 
 from app.models import Tool, ToolKind
-from app.tools import http_tool
+from app.tools import http_tool, mcp_tool
 from app.tools.base import ToolExecutionResult
 from app.tools.registry import BUILTIN_TOOLS
 
@@ -45,4 +45,6 @@ async def _dispatch(tool: Tool, arguments: dict[str, object]) -> ToolExecutionRe
         if spec is None:
             return ToolExecutionResult(ok=False, content=f"Unknown built-in tool: {tool.name}")
         return await spec.execute(tool, arguments)
+    if tool.kind == ToolKind.MCP:
+        return await mcp_tool.execute(tool, arguments)
     return await http_tool.execute(tool, arguments)
