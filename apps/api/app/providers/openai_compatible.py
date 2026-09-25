@@ -231,7 +231,9 @@ class OpenAICompatibleProvider:
                             calls=tuple(
                                 ToolCall(
                                     id=fragment["id"],
-                                    name=fragment["name"],
+                                    # gpt-oss on some providers leaks a `<|channel|>...` marker
+                                    # into the name; no real tool name can contain `<`.
+                                    name=fragment["name"].split("<|", 1)[0],
                                     arguments=_parse_tool_arguments(fragment["arguments"]),
                                 )
                                 for fragment in call_fragments.values()
