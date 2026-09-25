@@ -30,6 +30,7 @@ dependencies = [
     "arq>=0.26",
     "pgvector>=0.3",
     "beautifulsoup4>=4.12",
+    "mcp>=1.12",
 ]
 
 [dependency-groups]

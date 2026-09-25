@@ -22,6 +22,7 @@ from app.models.flag_type import FlagType
 from app.models.invitation import Invitation
 from app.models.knowledge_settings import KnowledgeSettings
 from app.models.llm_model import LLMModel
+from app.models.mcp_server import McpServer
 from app.models.memory_credential import MemoryCredential
 from app.models.message import Message
 from app.models.message_role import MessageRole
@@ -66,6 +67,7 @@ __all__ = [
     "Invitation",
     "KnowledgeSettings",
     "LLMModel",
+    "McpServer",
     "MemoryCredential",
     "Message",
     "MessageRole",

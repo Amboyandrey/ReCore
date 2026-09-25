@@ -1,5 +1,5 @@
-"""A function the model can call mid-reply — the built-in web search, or a workspace's own
-third-party HTTP tool (PR2)."""
+"""A function the model can call mid-reply — the built-in web search, a workspace's own
+third-party HTTP tool, or one discovered from a connected MCP server."""
 
 import uuid
 from typing import Any
@@ -24,6 +24,10 @@ class Tool(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     `BUILTIN` row, or an HTTP tool's optional secret header value for an `HTTP` one. `method`,
     `url`, and `secret_header` stay null on a `BUILTIN` row; there's nowhere else to send the
     request.
+
+    An `MCP` row belongs to `mcp_server_id` and is called on it as `remote_name` — `name` is the
+    server-prefixed one the model sees. Its `url`, `secret_header`, and secret are copies of the
+    server's, kept in step by services/mcp_servers.py, so executing it needs no extra lookup.
     """
 
     __tablename__ = "tools"
@@ -41,6 +45,12 @@ class Tool(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     method: Mapped[str | None] = mapped_column(default=None)
     url: Mapped[str | None] = mapped_column(default=None)
     secret_header: Mapped[str | None] = mapped_column(default=None)
+
+    # MCP-tool-only — see class docstring.
+    mcp_server_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("mcp_servers.id", ondelete="CASCADE"), default=None
+    )
+    remote_name: Mapped[str | None] = mapped_column(default=None)
 
     # An optional encrypted secret — the Tavily key for BUILTIN web search, or an HTTP tool's
     # secret header value. Null when a tool has no secret to hold.
