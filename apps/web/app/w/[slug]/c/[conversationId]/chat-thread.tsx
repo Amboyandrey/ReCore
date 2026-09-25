@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import { useRequireAuth } from "@/lib/auth-context";
 import { listAssistants, type Assistant } from "@/lib/assistant-client";
 import { AttachmentError, listAttachments, uploadAttachment, type Attachment } from "@/lib/attachment-client";
@@ -29,6 +29,7 @@ import { useWorkspaceBySlug } from "@/lib/workspace-context";
 import { ConversationSidebar } from "@/components/conversation-sidebar";
 import { SourcesSidebar } from "@/components/sources-sidebar";
 import { PendingAttachmentChips, SentAttachmentChips, hasBlockedImage } from "@/components/attachment-chips";
+import { ImageThumbnails } from "@/components/image-thumbnails";
 import { MarkdownMessage } from "@/components/markdown-message";
 
 // Groups a conversation's attachments by the message they were sent with — what lets a message
@@ -76,9 +77,9 @@ function assistantTurnsNewestFirst(messages: Message[]): { messageId: string; la
 }
 
 // One tool call's activity, live (ok still null, mid-run) or from history (ok already settled).
-type ToolActivity = { name: string; ok: boolean | null };
+type ToolActivity = { name: string; ok: boolean | null; imageCount?: number };
 
-function ToolActivityChip({ name, ok }: ToolActivity) {
+function ToolActivityChip({ name, ok, imageCount = 0 }: ToolActivity) {
   return (
     <div
       className={`max-w-[75%] rounded-md border px-2 py-1 text-xs ${
@@ -88,6 +89,7 @@ function ToolActivityChip({ name, ok }: ToolActivity) {
       }`}
     >
       🔧 <span className="font-medium">{name}</span> — {ok === null ? "running…" : ok ? "done" : "failed"}
+      {imageCount > 0 && ` · ${imageCount} image${imageCount === 1 ? "" : "s"}`}
     </div>
   );
 }
@@ -199,7 +201,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
               const index = prev.findLastIndex((a) => a.name === evt.data.name && a.ok === null);
               if (index === -1) return prev;
               const next = [...prev];
-              next[index] = { name: evt.data.name, ok: evt.data.ok };
+              next[index] = { name: evt.data.name, ok: evt.data.ok, imageCount: evt.data.image_count };
               return next;
             });
           } else if (evt.event === "sources") {
@@ -286,7 +288,7 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
                 const index = prev.findLastIndex((a) => a.name === evt.data.name && a.ok === null);
                 if (index === -1) return prev;
                 const next = [...prev];
-                next[index] = { name: evt.data.name, ok: evt.data.ok };
+                next[index] = { name: evt.data.name, ok: evt.data.ok, imageCount: evt.data.image_count };
                 return next;
               });
             } else if (evt.event === "sources") {
@@ -553,11 +555,13 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
               className={`flex flex-col gap-1 ${m.role === "user" ? "items-end" : "items-start"}`}
             >
               {(toolInvocationsByMessageId[m.id] ?? []).map((invocation) => (
-                <ToolActivityChip
-                  key={invocation.id}
-                  name={invocation.name}
-                  ok={invocation.status === "success"}
-                />
+                <Fragment key={invocation.id}>
+                  <ToolActivityChip name={invocation.name} ok={invocation.status === "success"} />
+                  <ImageThumbnails
+                    workspaceId={workspace.id}
+                    images={invocation.images.map((image) => ({ id: image.id, alt: invocation.name }))}
+                  />
+                </Fragment>
               ))}
               <div
                 className={`rounded-lg px-3 py-2 text-sm ${
@@ -569,7 +573,10 @@ export function ChatThread({ slug, conversationId }: { slug: string; conversatio
                 {m.role === "user" ? m.content : <MarkdownMessage content={m.content} />}
                 {m.error && <p className="mt-1 text-xs text-danger">{m.error}</p>}
               </div>
-              <SentAttachmentChips attachments={attachmentsByMessageId[m.id] ?? []} />
+              <SentAttachmentChips
+                workspaceId={workspace.id}
+                attachments={attachmentsByMessageId[m.id] ?? []}
+              />
             </div>
           ))}
           {(liveToolActivity.length > 0 || streamingText) && (

@@ -25,7 +25,8 @@ const securityHeaders = [
       // recipe, not an ad-hoc weakening.
       "script-src 'self' 'unsafe-inline'",
       "style-src 'self' 'unsafe-inline'",
-      "img-src 'self' data:",
+      // The API origin, and only it, for images a conversation's own attachments serve back.
+      `img-src 'self' data: ${apiOrigin}`,
       "font-src 'self' data:",
       `connect-src 'self' ${apiOrigin}`,
       "object-src 'none'",
