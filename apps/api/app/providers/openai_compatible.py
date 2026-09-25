@@ -204,10 +204,16 @@ class OpenAICompatibleProvider:
                     yield TextDelta(text=delta_text)
                 for tc_delta in delta.get("tool_calls") or []:
                     index = tc_delta.get("index", 0)
+                    function = tc_delta.get("function") or {}
+                    # Some vLLM-backed providers (Nebius) mis-number a call's last argument chunk;
+                    # a genuinely new call always opens with an id or name, so this continues one.
+                    if index not in call_fragments and call_fragments and not (
+                        tc_delta.get("id") or function.get("name")
+                    ):
+                        index = next(reversed(call_fragments))
                     fragment = call_fragments.setdefault(index, {"id": "", "name": "", "arguments": ""})
                     if tc_delta.get("id"):
                         fragment["id"] = tc_delta["id"]
-                    function = tc_delta.get("function") or {}
                     if function.get("name"):
                         fragment["name"] += function["name"]
                     if function.get("arguments"):
@@ -225,7 +231,9 @@ class OpenAICompatibleProvider:
                             calls=tuple(
                                 ToolCall(
                                     id=fragment["id"],
-                                    name=fragment["name"],
+                                    # gpt-oss on some providers leaks a `<|channel|>...` marker
+                                    # into the name; no real tool name can contain `<`.
+                                    name=fragment["name"].split("<|", 1)[0],
                                     arguments=_parse_tool_arguments(fragment["arguments"]),
                                 )
                                 for fragment in call_fragments.values()

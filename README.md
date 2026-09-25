@@ -18,8 +18,10 @@ that were deliberately left out.
   processes; a retried send attaches to the in-flight generation instead of billing twice.
 - **Tools the model can actually call** — a built-in web search (Tavily), plus any HTTP endpoint a
   workspace registers as a tool: name, description, JSON Schema parameters, method, URL, and an
-  optional secret header. The agent loop executes calls, feeds results back, and records every one
-  in the transcript — bounded by a timeout, a result-size cap, and a 5-iteration ceiling.
+  optional secret header. Or connect a remote MCP server (Streamable HTTP, optional auth header)
+  and enable whichever of its tools a chat should see. The agent loop executes calls, feeds results
+  back, and records every one in the transcript — bounded by a timeout, a result-size cap, and a
+  5-iteration ceiling.
 - **Assistants** — save a name, instructions, an optional preferred model and a set of tools, then
   point a conversation at it. Instructions and tools are resolved live on every send, so editing an
   assistant reaches conversations already using it.
@@ -75,7 +77,7 @@ flowchart LR
     Worker --> PG
     Worker <-->|"job queue · same live-stream protocol"| Redis
     API -->|"streamed chat, one adapter per provider"| LLM["Anthropic · OpenAI · Google<br/>any OpenAI-compatible endpoint"]
-    API -->|"web search · registered HTTP tools"| Tools["Tool endpoints<br/>(SSRF-guarded)"]
+    API -->|"web search · registered HTTP tools · MCP servers"| Tools["Tool endpoints<br/>(SSRF-guarded)"]
     API -->|"recall / record"| Mem0["mem0<br/>(workspace's own key)"]
 
     PG -.->|"row-level security backstop"| API
@@ -121,7 +123,7 @@ Then flip a flag on for your workspace at `/admin/flags`:
 
 | Flag | Unlocks | Settings page |
 |---|---|---|
-| `tools` | Web search (paste a [Tavily](https://tavily.com) key) and custom HTTP tools | Settings → Tools |
+| `tools` | Web search (paste a [Tavily](https://tavily.com) key), custom HTTP tools, and MCP servers | Settings → Tools |
 | `memory` | ReMind recall — needs a [mem0](https://mem0.ai) key | Settings → Assistants |
 | `delegation` | One assistant handing a task to another | Settings → Assistants (delegate picker) |
 | `knowledge` | ReStore connectors and retrieval | Settings → Knowledge |
@@ -139,7 +141,7 @@ apps/api/          FastAPI backend (Python 3.12)
   app/services/       business logic — no FastAPI imports, fully unit-testable
   app/routers/v1/     HTTP surface — thin, delegates to services
   app/providers/      one adapter per LLM backend behind a shared protocol (chat + embeddings)
-  app/tools/          tool executors (web search, HTTP) + the bounded dispatcher
+  app/tools/          tool executors (web search, HTTP, MCP) + the bounded dispatcher
   app/memory/         the mem0 client wrapper ReMind sits on
   app/knowledge/      website crawling + text chunking for ReStore's indexer
   app/workflows/      ReFlow's step-prompt template renderer
@@ -147,7 +149,7 @@ apps/api/          FastAPI backend (Python 3.12)
   app/deps/           the auth → workspace → role dependency chain, plus flag gates
   app/scripts/        one-off scripts (demo seed, load test)
   migrations/         Alembic, one revision per schema change
-  tests/              pytest, 437 tests
+  tests/              pytest, 469 tests
 apps/web/           Next.js 16 (App Router), React 19, Tailwind 4
   app/                routes — auth, workspace, chat, settings, admin
   lib/                one typed API client per domain + React context
@@ -208,14 +210,14 @@ CI runs the same API and web checks on every push and pull request.
 ## Security
 
 - Argon2id password hashing; opaque Redis-backed sessions, not JWTs
-- Envelope-encrypted secrets — provider keys, the mem0 key, the web-search key, and each HTTP
-  tool's secret header value all use the same AES-256-GCM scheme, where a master key wraps a random
-  per-secret data key. Plaintext is never a field on any response schema.
-- SSRF guard on every user-supplied URL — provider base URLs, tool endpoints, and ReStore's website
-  connectors, all re-checked immediately before each call (and every crawl redirect hop), not just
-  when the URL was registered
-- Tool execution is bounded: a 15s timeout, an 8,000-character result cap, and a 5-iteration
-  ceiling per generation, so one bad tool degrades a single turn rather than a whole run
+- Envelope-encrypted secrets — provider keys, the mem0 key, the web-search key, each HTTP tool's
+  secret header value, and each MCP server's auth header value all use the same AES-256-GCM scheme,
+  where a master key wraps a random per-secret data key. Plaintext is never a field on any response schema.
+- SSRF guard on every user-supplied URL — provider base URLs, tool endpoints, MCP servers, and
+  ReStore's website connectors, all re-checked immediately before each call (and every crawl
+  redirect hop), not just when the URL was registered
+- Tool execution is bounded: a 15s timeout (60s for MCP tools), an 8,000-character result cap,
+  and a 5-iteration ceiling per generation, so one bad tool degrades a single turn rather than a whole run
 - Tenancy enforced by one dependency chain (`current_user → workspace_ctx → require_role`), 404
   (not 403) for non-members, and backstopped by Postgres row-level security under a dedicated
   low-privilege runtime role — see the RLS migration's own docstring for the details worth knowing
@@ -236,6 +238,6 @@ with resumable streaming, feature flags, attachments, metering and audit, RLS ha
 calling, assistants, ReMind memory, one-level delegation, ReStore knowledge retrieval, and ReFlow
 background workflows.
 
-What's deliberately absent — programmatic API keys, usage rollup tables, workflow schedule/webhook
-triggers and approval resume, multi-level delegation, per-dimension ANN indexing — is listed with
-the reasoning in `docs/ARCHITECTURE.md` §21.
+What's deliberately absent — programmatic API keys, usage rollup tables, workflow schedule
+triggers and approval resume, OAuth and stdio for MCP servers, multi-level delegation,
+per-dimension ANN indexing — is listed with the reasoning in `docs/ARCHITECTURE.md` §21.

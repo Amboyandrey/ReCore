@@ -375,6 +375,53 @@ async def test_openai_assembles_a_streamed_tool_call() -> None:
     ]
 
 
+async def test_openai_keeps_a_misnumbered_argument_chunk_with_its_call() -> None:
+    """Nebius (vLLM) sends a call's final argument chunk under the next index with no id or name
+    — it must continue the open call, not start a nameless second one."""
+    body = _sse(
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function",'
+        '"function":{"name":"get_weather","arguments":""}}]}}]}',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":'
+        '{"arguments":"{\\"city\\": \\"Par"}}]}}]}',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"is\\"}"}}]},'
+        '"finish_reason":"tool_calls"}]}',
+        "data: [DONE]",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    provider = OpenAICompatibleProvider(api_key="k", transport=httpx.MockTransport(handler))
+    chunks = [
+        c async for c in provider.stream(model="gpt-oss", messages=MESSAGES, max_tokens=50, tools=[_TOOL])
+    ]
+
+    assert chunks == [
+        ToolCallRequest(calls=(ToolCall(id="call_1", name="get_weather", arguments={"city": "Paris"}),))
+    ]
+
+
+async def test_openai_strips_a_leaked_chat_format_marker_from_a_tool_name() -> None:
+    """gpt-oss on Nebius can append `<|channel|>commentary` to a call's name — cut it off so the
+    call still reaches the tool it named."""
+    body = _sse(
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function",'
+        '"function":{"name":"get_weather<|channel|>commentary","arguments":"{}"}}]},'
+        '"finish_reason":"tool_calls"}]}',
+        "data: [DONE]",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    provider = OpenAICompatibleProvider(api_key="k", transport=httpx.MockTransport(handler))
+    chunks = [
+        c async for c in provider.stream(model="gpt-oss", messages=MESSAGES, max_tokens=50, tools=[_TOOL])
+    ]
+
+    assert chunks == [ToolCallRequest(calls=(ToolCall(id="call_1", name="get_weather", arguments={}),))]
+
+
 async def test_openai_replays_a_tool_call_and_its_result() -> None:
     """A past assistant tool_calls turn and the tool turn answering it round-trip into OpenAI's
     own `tool_calls`/`tool_call_id` message shape."""

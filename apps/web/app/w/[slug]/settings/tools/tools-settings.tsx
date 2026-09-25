@@ -14,6 +14,7 @@ import {
 } from "@/lib/tool-client";
 import { useWorkspaceFlags } from "@/lib/use-workspace-flags";
 import { useWorkspaceBySlug } from "@/lib/workspace-context";
+import { McpServersSection } from "./mcp-servers-section";
 
 const HTTP_METHODS: HttpMethod[] = ["GET", "POST", "PUT", "PATCH", "DELETE"];
 
@@ -43,9 +44,10 @@ const EMPTY_FORM: HttpToolFormState = {
   secretValue: "",
 };
 
-// The tools settings page: enable the built-in web search, and register or manage third-party
-// HTTP tools that a chat in this workspace can call. Open to any member, not just admins — the
-// same floor sending a message already has, since a tool is only ever usable inside a chat.
+// The tools settings page: enable the built-in web search, register or manage third-party HTTP
+// tools, and connect MCP servers that a chat in this workspace can call. Open to any member, not
+// just admins — the same floor sending a message already has, since a tool is only ever usable
+// inside a chat.
 export function ToolsSettings({ slug }: { slug: string }) {
   const { loading: authLoading } = useRequireAuth();
   const { workspace, loading: wsLoading } = useWorkspaceBySlug(slug);
@@ -84,6 +86,11 @@ export function ToolsSettings({ slug }: { slug: string }) {
 
   const webSearch = tools.find((t) => t.name === "web_search");
   const httpTools = useMemo(() => tools.filter((t) => t.kind === "http"), [tools]);
+
+  async function reloadTools() {
+    if (!workspace) return;
+    setTools(await listTools(workspace.id));
+  }
 
   async function handleEnableWebSearch(e: FormEvent) {
     e.preventDefault();
@@ -457,6 +464,14 @@ export function ToolsSettings({ slug }: { slug: string }) {
           </div>
         </form>
       </div>
+
+      <McpServersSection
+        workspaceId={workspace.id}
+        tools={tools}
+        onToggleTool={handleToggleEnabled}
+        onToolsChanged={reloadTools}
+        onError={setError}
+      />
     </div>
   );
 }

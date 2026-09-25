@@ -71,6 +71,7 @@ class ToolOut(BaseModel):
     url: str | None
     secret_header: str | None
     has_secret: bool
+    mcp_server_id: uuid.UUID | None
     created_at: datetime
 
 
