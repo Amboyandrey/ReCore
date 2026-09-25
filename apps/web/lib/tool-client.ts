@@ -1,6 +1,6 @@
 import { apiPublicUrl } from "./config";
 
-export type ToolKind = "builtin" | "http";
+export type ToolKind = "builtin" | "http" | "mcp";
 export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
 export type Tool = {
@@ -14,6 +14,7 @@ export type Tool = {
   url: string | null;
   secret_header: string | null;
   has_secret: boolean;
+  mcp_server_id: string | null;
   created_at: string;
 };
 
@@ -38,6 +39,23 @@ export type ToolUpdateInput = {
   url?: string;
   secret_header?: string;
   secret_value?: string;
+};
+
+export type McpServer = {
+  id: string;
+  name: string;
+  url: string;
+  auth_header: string | null;
+  has_secret: boolean;
+  last_synced_at: string | null;
+  created_at: string;
+};
+
+export type McpServerInput = {
+  name: string;
+  url: string;
+  auth_header?: string;
+  auth_value?: string;
 };
 
 export type ToolInvocation = {
@@ -114,6 +132,40 @@ export async function updateTool(
 // of registering it again from scratch.
 export async function deleteTool(workspaceId: string, toolId: string): Promise<void> {
   const res = await api(`/api/v1/workspaces/${workspaceId}/tools/${toolId}`, { method: "DELETE" });
+  await throwIfNotOk(res);
+}
+
+// Connects a remote MCP server and imports its tools, disabled until someone turns them on.
+export async function createMcpServer(workspaceId: string, input: McpServerInput): Promise<McpServer> {
+  const res = await api(`/api/v1/workspaces/${workspaceId}/mcp-servers`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  await throwIfNotOk(res);
+  return (await res.json()) as McpServer;
+}
+
+// Lists every MCP server connected to the workspace.
+export async function listMcpServers(workspaceId: string): Promise<McpServer[]> {
+  const res = await api(`/api/v1/workspaces/${workspaceId}/mcp-servers`);
+  await throwIfNotOk(res);
+  return (await res.json()) as McpServer[];
+}
+
+// Re-reads a server's tool list, picking up added, changed, and removed tools.
+export async function syncMcpServer(workspaceId: string, serverId: string): Promise<McpServer> {
+  const res = await api(`/api/v1/workspaces/${workspaceId}/mcp-servers/${serverId}/sync`, {
+    method: "POST",
+  });
+  await throwIfNotOk(res);
+  return (await res.json()) as McpServer;
+}
+
+// Removes a server along with every tool it contributed.
+export async function deleteMcpServer(workspaceId: string, serverId: string): Promise<void> {
+  const res = await api(`/api/v1/workspaces/${workspaceId}/mcp-servers/${serverId}`, {
+    method: "DELETE",
+  });
   await throwIfNotOk(res);
 }
 
