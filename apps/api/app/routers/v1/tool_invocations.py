@@ -10,7 +10,8 @@ from app.core.db import get_db
 from app.deps.flags import flag_gate
 from app.deps.workspace import WorkspaceCtx
 from app.models import Role
-from app.schemas.tool import ToolInvocationOut
+from app.schemas.tool import ToolImageOut, ToolInvocationOut
+from app.services.attachments import list_tool_images
 from app.services.chat import get_conversation
 from app.services.tools import list_tool_invocations
 
@@ -32,4 +33,10 @@ async def list_tool_invocations_route(
         db, workspace_id=ctx.workspace_id, conversation_id=conversation_id, viewer_id=ctx.user.id
     )
     invocations = await list_tool_invocations(db, conversation_id=conversation_id)
-    return [ToolInvocationOut.model_validate(i, from_attributes=True) for i in invocations]
+    images = await list_tool_images(db, tool_invocation_ids=[i.id for i in invocations])
+    return [
+        ToolInvocationOut.model_validate(i, from_attributes=True).model_copy(
+            update={"images": [ToolImageOut(id=a.id, mime=a.mime) for a in images.get(i.id, [])]}
+        )
+        for i in invocations
+    ]

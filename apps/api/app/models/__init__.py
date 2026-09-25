@@ -5,6 +5,7 @@ from app.models.assistant_connector import AssistantConnector
 from app.models.assistant_delegate import AssistantDelegate
 from app.models.assistant_tool import AssistantTool
 from app.models.attachment import Attachment
+from app.models.attachment_source import AttachmentSource
 from app.models.audit_log import AuditLog
 from app.models.connector import Connector
 from app.models.connector_chunk import ConnectorChunk
@@ -51,6 +52,7 @@ __all__ = [
     "AssistantDelegate",
     "AssistantTool",
     "Attachment",
+    "AttachmentSource",
     "AuditLog",
     "Connector",
     "ConnectorChunk",

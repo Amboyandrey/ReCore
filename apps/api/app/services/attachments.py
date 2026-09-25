@@ -14,6 +14,7 @@ change.
 """
 
 import asyncio
+import re
 import uuid
 from io import BytesIO
 from pathlib import Path
@@ -29,7 +30,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.errors import AttachmentNotFound, AttachmentTooLarge
-from app.models import Attachment, ExtractStatus
+from app.models import Attachment, AttachmentSource, ExtractStatus
+from app.tools.base import ToolImage
 
 settings = get_settings()
 
@@ -253,6 +255,48 @@ async def save_attachment(
     return attachment
 
 
+_IMAGE_EXTENSIONS = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}
+
+
+def save_tool_image(
+    db: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    message_id: uuid.UUID,
+    tool_invocation_id: uuid.UUID,
+    uploaded_by: uuid.UUID,
+    tool_name: str,
+    ordinal: int,
+    image: ToolImage,
+) -> Attachment:
+    """Write an image a tool returned to disk and record it on the reply it belongs to. Stored
+    as-is: the executor already held it to an allowed format and the attachment size limit."""
+    safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", tool_name)  # a delegate's call is "ask_x/tool"
+    attachment_id = uuid.uuid4()
+    storage_key = f"{workspace_id}/{attachment_id}"
+    path = Path(settings.storage_dir) / storage_key
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(image.data)
+
+    attachment = Attachment(
+        id=attachment_id,
+        workspace_id=workspace_id,
+        conversation_id=conversation_id,
+        message_id=message_id,
+        tool_invocation_id=tool_invocation_id,
+        uploaded_by=uploaded_by,
+        original_filename=f"{safe_name}-{ordinal}.{_IMAGE_EXTENSIONS.get(image.mime, 'img')}",
+        mime=image.mime,
+        size=len(image.data),
+        storage_key=storage_key,
+        extract_status=ExtractStatus.PASSTHROUGH,
+        source=AttachmentSource.TOOL,
+    )
+    db.add(attachment)
+    return attachment
+
+
 def read_attachment_bytes(attachment: Attachment) -> bytes:
     """Read an attachment's stored bytes back off disk — used to hand an image attachment to a
     provider adapter as an ImagePart. Synchronous, matching save_attachment's own direct
@@ -262,10 +306,11 @@ def read_attachment_bytes(attachment: Attachment) -> bytes:
 
 
 async def list_attachments(db: AsyncSession, *, conversation_id: uuid.UUID) -> list[Attachment]:
-    """List every attachment uploaded into a conversation, oldest first."""
+    """List every attachment uploaded into a conversation, oldest first — tool images are listed
+    with their tool call instead (see list_tool_images)."""
     stmt = (
         select(Attachment)
-        .where(Attachment.conversation_id == conversation_id)
+        .where(Attachment.conversation_id == conversation_id, Attachment.source == AttachmentSource.UPLOAD)
         .order_by(Attachment.created_at)
     )
     return list((await db.scalars(stmt)).all())
@@ -285,6 +330,23 @@ async def get_attachment(
     return attachment
 
 
+async def get_conversation_attachment(
+    db: AsyncSession, *, workspace_id: uuid.UUID, attachment_id: uuid.UUID
+) -> Attachment:
+    """Load an upload or tool image that belongs to a conversation in this workspace, or raise.
+    The caller still has to check the viewer may read that conversation."""
+    attachment = await db.scalar(
+        select(Attachment).where(
+            Attachment.id == attachment_id,
+            Attachment.workspace_id == workspace_id,
+            Attachment.conversation_id.is_not(None),
+        )
+    )
+    if attachment is None:
+        raise AttachmentNotFound()
+    return attachment
+
+
 async def attach_to_message(
     db: AsyncSession,
     *,
@@ -292,16 +354,37 @@ async def attach_to_message(
     attachment_ids: list[uuid.UUID],
     message_id: uuid.UUID,
 ) -> list[Attachment]:
-    """Link already-uploaded attachments to the message that was just sent alongside them."""
+    """Link already-uploaded attachments to the message that was just sent alongside them. A tool
+    image is never re-linked this way, since that would move it off the reply that produced it."""
     attachments = []
     for attachment_id in attachment_ids:
         attachment = await get_attachment(
             db, conversation_id=conversation_id, attachment_id=attachment_id
         )
+        if attachment.source != AttachmentSource.UPLOAD:
+            raise AttachmentNotFound()
         attachment.message_id = message_id
         attachments.append(attachment)
     await db.flush()
     return attachments
+
+
+async def list_tool_images(
+    db: AsyncSession, *, tool_invocation_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, list[Attachment]]:
+    """Group the images tool calls returned by the call that produced them, in the order saved."""
+    if not tool_invocation_ids:
+        return {}
+    stmt = (
+        select(Attachment)
+        .where(Attachment.tool_invocation_id.in_(tool_invocation_ids))
+        .order_by(Attachment.original_filename)
+    )
+    grouped: dict[uuid.UUID, list[Attachment]] = {}
+    for attachment in (await db.scalars(stmt)).all():
+        assert attachment.tool_invocation_id is not None
+        grouped.setdefault(attachment.tool_invocation_id, []).append(attachment)
+    return grouped
 
 
 async def attach_to_run(

@@ -62,7 +62,7 @@ from app.providers.base import (
 from app.providers.registry import build_provider
 from app.services.assistant_runtime import AssistantTurn, DelegateSpec, prepare_assistant_turn
 from app.services.assistants import get_assistant
-from app.services.attachments import attach_to_message, read_attachment_bytes
+from app.services.attachments import attach_to_message, read_attachment_bytes, save_tool_image
 from app.services.credentials import decrypt_credential_key, get_credential
 from app.services.flags import evaluate_flag
 from app.services.generations import (
@@ -76,6 +76,7 @@ from app.services.memory import record_turn
 from app.services.memory import retrieve_for_turn as retrieve_memory_for_turn
 from app.services.tools import list_enabled_tools, to_tool_definition
 from app.services.usage import record_usage_event
+from app.tools.base import ToolImage
 from app.tools.execute import MAX_RESULT_CHARS, execute_tool
 
 tracer = get_tracer(__name__)
@@ -535,7 +536,8 @@ class _DelegateUsage:
 @dataclass
 class _ToolInvocationRecord:
     """One tool call from this generation, held in memory until the final assistant message
-    exists to attach it to — see the persistence step at the end of _run_generation.
+    exists to attach it to — see the persistence step at the end of _run_generation. That
+    includes any images it returned, which are only written to disk then.
 
     `children` and `usage` are only ever set on a delegation record: a delegate's own tool calls
     (recorded under it so the transcript shows what it actually did) and what its own LLM usage
@@ -551,6 +553,8 @@ class _ToolInvocationRecord:
     latency_ms: int
     children: list["_ToolInvocationRecord"] = field(default_factory=list)
     usage: _DelegateUsage | None = None
+    # Held in memory, like the rest of the record, until the reply exists to save them onto.
+    images: tuple[ToolImage, ...] = ()
 
 
 class _StopSignal:
@@ -776,7 +780,12 @@ async def _execute_tool_call(
         ctx.redis,
         ctx.generation_id,
         "tool_result",
-        {"name": display_name, "ok": result.ok, "content": result.content},
+        {
+            "name": display_name,
+            "ok": result.ok,
+            "content": result.content,
+            "image_count": len(result.images),
+        },
     )
     return _ToolInvocationRecord(
         tool_id=tool.id,
@@ -786,6 +795,7 @@ async def _execute_tool_call(
         status=ToolInvocationStatus.SUCCESS if result.ok else ToolInvocationStatus.ERROR,
         error=None if result.ok else result.content,
         latency_ms=latency_ms,
+        images=result.images,
     )
 
 
@@ -1100,19 +1110,33 @@ async def _run_generation(
         total_cost_usd = own_cost_usd
         for record in result.invocations:
             for row in (record, *record.children):
-                db.add(
-                    ToolInvocation(
-                        workspace_id=workspace_id,
-                        message_id=assistant_message.id,
-                        tool_id=row.tool_id,
-                        name=row.name,
-                        arguments=row.arguments,
-                        result=row.result,
-                        status=row.status,
-                        error=row.error,
-                        latency_ms=row.latency_ms,
-                    )
+                invocation = ToolInvocation(
+                    id=uuid.uuid4(),
+                    workspace_id=workspace_id,
+                    message_id=assistant_message.id,
+                    tool_id=row.tool_id,
+                    name=row.name,
+                    arguments=row.arguments,
+                    result=row.result,
+                    status=row.status,
+                    error=row.error,
+                    latency_ms=row.latency_ms,
                 )
+                db.add(invocation)
+                if row.images:
+                    await db.flush()  # the images' foreign key needs the invocation row to exist first
+                for ordinal, image in enumerate(row.images, start=1):
+                    save_tool_image(
+                        db,
+                        workspace_id=workspace_id,
+                        conversation_id=conversation_id,
+                        message_id=assistant_message.id,
+                        tool_invocation_id=invocation.id,
+                        uploaded_by=user_id,
+                        tool_name=row.name,
+                        ordinal=ordinal,
+                        image=image,
+                    )
             if record.usage is None:
                 continue
             usage = record.usage

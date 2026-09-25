@@ -75,6 +75,13 @@ class ToolOut(BaseModel):
     created_at: datetime
 
 
+class ToolImageOut(BaseModel):
+    """An image a tool call returned — fetched from the attachment content route by its id."""
+
+    id: uuid.UUID
+    mime: str
+
+
 class ToolInvocationOut(BaseModel):
     """One tool call made during a conversation, as the chat thread shows it — no secrets ride
     along here, just what was asked and what came back."""
@@ -87,4 +94,5 @@ class ToolInvocationOut(BaseModel):
     result: str | None
     status: ToolInvocationStatus
     error: str | None
+    images: list[ToolImageOut] = []
     created_at: datetime
