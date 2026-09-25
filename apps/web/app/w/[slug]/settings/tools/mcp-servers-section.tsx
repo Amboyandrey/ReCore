@@ -60,8 +60,8 @@ export function McpServersSection({
     try {
       const hasAuth = form.authValue.trim() !== "";
       const created = await createMcpServer(workspaceId, {
-        name: form.name,
-        url: form.url,
+        name: form.name.trim(),
+        url: form.url.trim(),
         ...(hasAuth ? { auth_header: form.authHeader, auth_value: form.authValue } : {}),
       });
       setServers((prev) => [...prev, created]);

@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from typing import Self
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # The tool-name rule (see schemas/tool.py), capped at 32 so `<server>__<tool>` has room left.
 _SERVER_NAME_PATTERN = r"^[a-zA-Z0-9_-]+$"
@@ -14,6 +14,9 @@ _SERVER_NAME_PATTERN = r"^[a-zA-Z0-9_-]+$"
 class McpServerCreate(BaseModel):
     """Connecting a server: a short name that prefixes its tools, its Streamable HTTP endpoint,
     and an optional header (e.g. `Authorization`) plus value sent on every request."""
+
+    # A pasted URL's stray leading space passes the SSRF guard's parse but not the MCP client's.
+    model_config = ConfigDict(str_strip_whitespace=True)
 
     name: str = Field(min_length=1, max_length=32, pattern=_SERVER_NAME_PATTERN)
     url: str = Field(min_length=1)
@@ -31,6 +34,8 @@ class McpServerCreate(BaseModel):
 class McpServerUpdate(BaseModel):
     """Changing how a server is reached — only the fields actually sent are touched. Sending
     `auth_value` rotates the stored secret; omitting it leaves the current one in place."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
 
     url: str | None = Field(default=None, min_length=1)
     auth_header: str | None = Field(default=None, min_length=1)

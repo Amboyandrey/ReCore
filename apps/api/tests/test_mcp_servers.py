@@ -19,6 +19,7 @@ from app.core.errors import (
 )
 from app.core.ssrf import UnsafeBaseUrlError
 from app.models import AuditLog, FeatureFlag, FlagScope, McpServer, Tool, ToolKind, User, Workspace
+from app.schemas.mcp_server import McpServerCreate
 from app.services import mcp_servers
 from app.services.flags import set_override
 from app.services.mcp_servers import (
@@ -325,3 +326,10 @@ async def test_connecting_a_server_end_to_end(
 
     actions = (await db.scalars(select(AuditLog.action).where(AuditLog.target_type == "mcp_server"))).all()
     assert sorted(actions) == ["mcp_server.created", "mcp_server.deleted", "mcp_server.synced"]
+
+
+def test_create_strips_whitespace_around_a_pasted_url() -> None:
+    """A leading space passes the SSRF guard's own parse but breaks the MCP client's request."""
+    body = McpServerCreate(name=" docs ", url=f" {URL} ")
+
+    assert (body.name, body.url) == ("docs", URL)
