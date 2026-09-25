@@ -7,11 +7,12 @@ from typing import Any
 
 import pytest
 from mcp.server.mcpserver import MCPServer
-from mcp.types import ImageContent
+from mcp.types import ImageContent, TextContent
 
 from app.core.crypto import encrypt_secret
 from app.models import Tool, ToolKind
 from app.tools import execute, mcp_tool
+from app.tools.base import ToolImage
 from app.tools.execute import execute_tool
 
 _server = MCPServer("test")
@@ -31,8 +32,14 @@ def explode() -> str:
 
 @_server.tool()
 def snapshot() -> list[Any]:
-    """Return an image the model can't be sent as text."""
-    return [ImageContent(data="aGk=", mime_type="image/png")]
+    """Return a PNG alongside a caption."""
+    return [TextContent(text="Here you go."), ImageContent(data="aGk=", mime_type="image/png")]
+
+
+@_server.tool()
+def vector() -> list[Any]:
+    """Return an SVG, which is never kept since it can carry script."""
+    return [ImageContent(data="PHN2Zz4=", mime_type="image/svg+xml")]
 
 
 @pytest.fixture
@@ -62,7 +69,7 @@ async def test_list_remote_tools_returns_each_tool_s_schema() -> None:
     tools = await mcp_tool.list_remote_tools("https://example.com/mcp", {})
 
     by_name = {t.name: t for t in tools}
-    assert set(by_name) == {"add", "explode", "snapshot"}
+    assert set(by_name) == {"add", "explode", "snapshot", "vector"}
     assert by_name["add"].description == "Add two numbers."
     assert by_name["add"].parameters["required"] == ["a", "b"]
 
@@ -91,11 +98,20 @@ async def test_execute_reports_a_tool_error_as_a_failed_result() -> None:
 
 
 @pytest.mark.usefixtures("in_process_server")
-async def test_execute_replaces_non_text_content_with_a_placeholder() -> None:
+async def test_execute_returns_an_image_and_notes_it_for_the_model() -> None:
     result = await mcp_tool.execute(_mcp_tool(name="demo__snapshot", remote_name="snapshot"), {})
 
     assert result.ok is True
+    assert result.content == "Here you go.\n[image 1 generated and shown to the user]"
+    assert result.images == (ToolImage(mime="image/png", data=b"hi"),)
+
+
+@pytest.mark.usefixtures("in_process_server")
+async def test_execute_omits_an_image_format_it_won_t_serve() -> None:
+    result = await mcp_tool.execute(_mcp_tool(name="demo__vector", remote_name="vector"), {})
+
     assert result.content == "[image content omitted]"
+    assert result.images == ()
 
 
 async def test_execute_rechecks_the_url_against_the_ssrf_guard() -> None:
@@ -169,3 +185,17 @@ async def test_execute_tool_gives_an_mcp_tool_the_longer_timeout(monkeypatch: py
     result, _latency_ms = await execute_tool(_mcp_tool(), {})
 
     assert result.content == "done"
+
+
+async def test_execute_tool_keeps_images_when_it_truncates_the_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    image = ToolImage(mime="image/png", data=b"hi")
+
+    async def verbose(tool: Tool, arguments: dict[str, object]) -> mcp_tool.ToolExecutionResult:
+        return mcp_tool.ToolExecutionResult(ok=True, content="x" * 10_000, images=(image,))
+
+    monkeypatch.setattr(mcp_tool, "execute", verbose)
+
+    result, _latency_ms = await execute_tool(_mcp_tool(), {})
+
+    assert result.content.endswith("[...truncated]")
+    assert result.images == (image,)

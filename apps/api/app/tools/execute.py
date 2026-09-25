@@ -36,7 +36,9 @@ async def execute_tool(tool: Tool, arguments: dict[str, object]) -> tuple[ToolEx
 
     if len(result.content) > MAX_RESULT_CHARS:
         result = ToolExecutionResult(
-            ok=result.ok, content=result.content[:MAX_RESULT_CHARS] + "\n\n[...truncated]"
+            ok=result.ok,
+            content=result.content[:MAX_RESULT_CHARS] + "\n\n[...truncated]",
+            images=result.images,
         )
     return result, latency_ms
 

@@ -7,7 +7,7 @@ import httpx
 from app.core.crypto import EncryptedSecret, decrypt_secret
 from app.core.ssrf import UnsafeBaseUrlError, assert_safe_base_url
 from app.models import Tool
-from app.tools.base import ToolExecutionResult
+from app.tools.base import ToolExecutionResult, accept_image
 
 _TIMEOUT = 10.0
 MAX_RESPONSE_CHARS = 8_000
@@ -55,6 +55,13 @@ async def execute(tool: Tool, arguments: dict[str, object]) -> ToolExecutionResu
                 response = await client.request(tool.method, tool.url, json=arguments, headers=headers)
     except httpx.HTTPError as exc:
         return ToolExecutionResult(ok=False, content=f"Could not reach the tool: {exc}")
+
+    if response.status_code < 400 and response.headers.get("content-type", "").startswith("image/"):
+        image = accept_image(response.headers["content-type"], response.content)
+        if image is None:
+            return ToolExecutionResult(ok=False, content="The tool returned an unusable image.")
+        note = "[image 1 generated and shown to the user]"
+        return ToolExecutionResult(ok=True, content=note, images=(image,))
 
     body = response.text[:MAX_RESPONSE_CHARS]
     if response.status_code >= 400:

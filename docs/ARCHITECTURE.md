@@ -96,7 +96,7 @@ ReCore/
 │   ├── app/routers/v1/         # thin — parse, delegate, serialize
 │   ├── app/scripts/             # seed, load test
 │   ├── migrations/             # Alembic, one revision per schema change
-│   └── tests/                  # pytest, 469 tests against real Postgres/Redis
+│   └── tests/                  # pytest, 481 tests against real Postgres/Redis
 ├── apps/web/                 # Next.js 16 (App Router), React 19, Tailwind 4
 │   ├── app/(auth)/             # login, signup
 │   ├── app/w/[slug]/           # chat + settings, workspace-scoped
@@ -126,7 +126,7 @@ through a join, because derivable means forgettable.
 | models | Enabled models per workspace | credential_id, provider_model_id, cost_per_mtok in/out, supports_vision, kind (chat/embedding) |
 | conversations | Chat threads | user_id, model_id, assistant_id, system_prompt, shared |
 | messages | Turns | role, content, tokens_in/out, cost_usd, finish_reason, error |
-| attachments | Uploaded files | conversation_id / workflow_id (exactly one set), message_id, workflow_run_id, mime, size, storage_key, extracted_text, extract_status |
+| attachments | Uploaded files and tool images | conversation_id / workflow_id (exactly one set), message_id, workflow_run_id, source (upload/tool), tool_invocation_id, mime, size, storage_key, extracted_text, extract_status |
 | tools | What a chat may call | name unique per workspace, kind enum, parameters jsonb, enabled, method/url/secret_header, ciphertext/nonce/wrapped_key |
 | tool_invocations | One row per call actually made | message_id, tool_id (nullable), name, arguments, result, status, latency_ms |
 | assistants | Saved instructions + optional model | name, instructions, model_id (nullable), memory_enabled, created_by |
@@ -340,7 +340,18 @@ Three kinds of tool exist behind that one dispatcher:
   enabled one — and only `enabled` can be edited on them. A sync refreshes rows in place (so
   assistant assignments survive), adds new ones disabled, and disables any the server dropped.
   Each call opens a fresh session (stateless, so the worker can run it too); text content is
-  passed back, and images or binary resources become a placeholder.
+  passed back, images are kept as tool images (below), and other binary content becomes a
+  placeholder.
+
+**Tools can return images.** An MCP image block, or an HTTP tool whose response is `image/*`,
+becomes a `ToolImage` on the result — PNG, JPEG, WebP or GIF only (an SVG can carry script, and
+these are served back inline), at most four per call, each within the attachment size limit. The
+model never receives the image: it gets a text note (`[image 1 generated and shown to the user]`)
+so it can refer to it. Like the rest of a tool call's record, the bytes stay in memory until the
+reply is persisted, then are written as `attachments` rows with `source = TOOL` and the
+`tool_invocation_id` that produced them — which is why they appear once the reply finishes rather
+than mid-stream, and why the loop itself still never touches the database. A workflow step's tool
+images are dropped for now (§21).
 
 An HTTP tool's or MCP server's URL is checked against the SSRF guard at registration **and again immediately before
 every call** — a DNS answer can change in between, and the second check is the one that runs at the
@@ -567,6 +578,14 @@ Two details worth keeping:
 Sending an image to a model not marked `supports_vision` is rejected pre-flight, before anything is
 persisted or a generation starts.
 
+A conversation's attachments — uploads and tool images alike (§8) — are served by
+`GET /workspaces/{id}/attachments/{attachment_id}/content`, behind the same visibility check as the
+conversation itself (a private one 404s for everyone but its owner). Raster images come back
+inline and anything else as a download; the web app's CSP allows `img-src` from the API origin and
+nowhere else, so images linked from other sites in a reply still render as links. A tool image is
+never listed or re-attachable as an upload: it belongs to the reply that produced it, and history
+only replays the user's own attachments.
+
 Files live on a local disk volume, keyed `{workspace_id}/{attachment_id}` — the same volume and
 layout a ReStore file connector's own uploaded documents use, keyed by connector instead of
 conversation. An object store would be a drop-in replacement for that one module; nothing else
@@ -728,6 +747,9 @@ Named here so nobody hunts for them or assumes they're half-finished:
   that stops being true.
 - **Knowledge retrieval or memory for a delegate's inner turn.** Both extend only to the
   orchestrating assistant today.
+- **Images from a workflow step's tool calls.** A step's invocations are inline JSON on its step
+  run, with no row for an attachment to point at, so its tool images are dropped. Images are also
+  never fed back to the model, and there's no built-in image generation tool yet.
 - **OAuth and stdio for MCP servers.** Only a static auth header is supported, so hosted servers
   that require the OAuth 2.1 flow can't be connected yet; stdio servers would mean running a
   user-supplied command on the API host, which a multi-tenant app shouldn't do. MCP resources and
@@ -758,7 +780,7 @@ Named here so nobody hunts for them or assumes they're half-finished:
 
 ## 23. Testing
 
-469 pytest tests run against a real Postgres and Redis — never mocks of them. `conftest.py` forces
+481 pytest tests run against a real Postgres and Redis — never mocks of them. `conftest.py` forces
 a separate `_test`-suffixed database and Redis index before any app code loads, so running the
 suite can't touch data a dev stack is using. `FakeProvider` implements both the chat and embedding
 protocols, which is what makes the whole chat pipeline, plus ReStore's indexing/retrieval and

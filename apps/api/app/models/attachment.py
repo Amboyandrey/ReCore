@@ -6,6 +6,7 @@ from sqlalchemy import Enum, ForeignKey, Integer
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
+from app.models.attachment_source import AttachmentSource
 from app.models.extract_status import ExtractStatus
 from app.models.mixins import TimestampMixin, UUIDPrimaryKeyMixin
 
@@ -19,6 +20,9 @@ class Attachment(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     uploaded ahead of the send that references it, same as most chat products let you attach
     before you hit send. `workflow_run_id` plays the same role for a workflow upload: null until
     the run it was uploaded for starts.
+
+    A `TOOL` attachment is an image a tool call returned: it's saved on the assistant reply along
+    with `tool_invocation_id`, and `uploaded_by` is the member whose chat made the call.
     """
 
     __tablename__ = "attachments"
@@ -46,3 +50,9 @@ class Attachment(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         Enum(ExtractStatus, name="extract_status"), default=ExtractStatus.PENDING
     )
     extract_error: Mapped[str | None] = mapped_column(default=None)
+    source: Mapped[AttachmentSource] = mapped_column(
+        Enum(AttachmentSource, name="attachment_source"), default=AttachmentSource.UPLOAD
+    )
+    tool_invocation_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("tool_invocations.id", ondelete="CASCADE"), default=None
+    )

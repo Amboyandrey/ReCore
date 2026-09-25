@@ -20,7 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.models import FeatureFlag, FlagScope
+from app.models import FeatureFlag, FlagScope, Role, User, WorkspaceMember
 from app.providers.fake import VALID_KEY, FakeProvider
 from app.services.attachments import MAX_IMAGE_DIMENSION
 from app.services.flags import set_override
@@ -540,3 +540,62 @@ async def test_a_corrupt_image_falls_back_to_the_original_bytes_marked_failed(
     body = response.json()
     assert body["extract_status"] == "failed"
     assert body["extracted_text"] is None
+
+
+# ---------- Serving an attachment's bytes ----------
+
+
+async def _upload(
+    client: AsyncClient, workspace_id: str, conversation_id: str, name: str, data: bytes, mime: str
+) -> str:
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/attachments",
+        files={"file": (name, data, mime)},
+    )
+    return str(response.json()["id"])
+
+
+async def test_an_image_is_served_inline_and_other_files_as_downloads(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    workspace_id, model_id = await _workspace_with_model(client)
+    await _enable_attachments(db, redis_client, workspace_id=workspace_id)
+    conversation_id = (
+        await client.post(f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id})
+    ).json()["id"]
+    image_id = await _upload(client, workspace_id, conversation_id, "red.png", _minimal_png(), "image/png")
+    text_id = await _upload(client, workspace_id, conversation_id, "notes.txt", b"hello", "text/plain")
+
+    image = await client.get(f"/api/v1/workspaces/{workspace_id}/attachments/{image_id}/content")
+    text = await client.get(f"/api/v1/workspaces/{workspace_id}/attachments/{text_id}/content")
+
+    assert image.status_code == 200
+    assert image.headers["content-type"] == "image/png"
+    assert image.headers["content-disposition"] == "inline"
+    assert Image.open(BytesIO(image.content)).size == (50, 30)
+    assert text.headers["content-type"] == "application/octet-stream"
+    assert text.headers["content-disposition"] == "attachment"
+    assert text.content == b"hello"
+
+
+async def test_another_member_can_t_read_an_attachment_in_a_private_conversation(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    """The same privacy the conversation itself has — a 404, not a 403, like every other miss."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    await _enable_attachments(db, redis_client, workspace_id=workspace_id)
+    conversation_id = (
+        await client.post(f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id})
+    ).json()["id"]
+    image_id = await _upload(client, workspace_id, conversation_id, "red.png", _minimal_png(), "image/png")
+    other = {"email": "other@example.com", "password": "correct horse battery staple"}
+    await client.post("/api/v1/auth/signup", json=other)
+    other_user = await db.scalar(select(User).where(User.email == other["email"]))
+    assert other_user is not None
+    db.add(WorkspaceMember(workspace_id=uuid.UUID(workspace_id), user_id=other_user.id, role=Role.MEMBER))
+    await db.commit()
+    await client.post("/api/v1/auth/login", json=other)
+
+    response = await client.get(f"/api/v1/workspaces/{workspace_id}/attachments/{image_id}/content")
+
+    assert response.status_code == 404

@@ -67,6 +67,7 @@ export type ToolInvocation = {
   result: string | null;
   status: "success" | "error";
   error: string | null;
+  images: { id: string; mime: string }[];
   created_at: string;
 };
 

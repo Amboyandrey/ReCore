@@ -17,6 +17,11 @@ export type Attachment = {
 
 export class AttachmentError extends Error {}
 
+// Where the browser loads an attachment's bytes from, readable only by those who can read its conversation.
+export function attachmentContentUrl(workspaceId: string, attachmentId: string): string {
+  return `${apiPublicUrl}/api/v1/workspaces/${workspaceId}/attachments/${attachmentId}/content`;
+}
+
 async function throwIfNotOk(res: Response): Promise<void> {
   if (res.ok) return;
   const body = (await res.json().catch(() => null)) as { detail?: string } | null;

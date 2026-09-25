@@ -1,6 +1,7 @@
 "use client";
 
 import type { Attachment } from "@/lib/attachment-client";
+import { ImageThumbnails } from "./image-thumbnails";
 
 // What each attachment's chip shows next to its filename — silence here is exactly how three
 // separate attachment bugs went unnoticed for as long as they did (see ARCHITECTURE.md history).
@@ -65,20 +66,37 @@ export function PendingAttachmentChips({
 
 // Read-only chips shown under an already-sent message — what makes an attachment's presence (and
 // whether the model actually got to read it) visible in history, not just in the composer at the
-// moment it was sent.
-export function SentAttachmentChips({ attachments }: { attachments: Attachment[] }) {
+// moment it was sent. Images show as thumbnails instead, since the model read them as images.
+export function SentAttachmentChips({
+  workspaceId,
+  attachments,
+}: {
+  workspaceId: string;
+  attachments: Attachment[];
+}) {
   if (attachments.length === 0) return null;
+  const images = attachments.filter((a) => a.extract_status === "passthrough");
+  const files = attachments.filter((a) => a.extract_status !== "passthrough");
   return (
-    <div className="mt-1.5 flex flex-wrap justify-end gap-1.5">
-      {attachments.map((a) => (
-        <span
-          key={a.id}
-          className="flex items-center gap-1 rounded-full border border-border-strong/60 bg-surface-sunk px-2 py-0.5 text-[0.7rem] text-text-muted"
-        >
-          <span className="max-w-[10rem] truncate">📎 {a.original_filename}</span>
-          <span className="opacity-70">· {EXTRACT_STATUS_LABEL[a.extract_status]}</span>
-        </span>
-      ))}
+    <div className="mt-1.5 flex flex-col items-end gap-1.5">
+      <ImageThumbnails
+        workspaceId={workspaceId}
+        align="end"
+        images={images.map((a) => ({ id: a.id, alt: a.original_filename }))}
+      />
+      {files.length > 0 && (
+        <div className="flex flex-wrap justify-end gap-1.5">
+          {files.map((a) => (
+            <span
+              key={a.id}
+              className="flex items-center gap-1 rounded-full border border-border-strong/60 bg-surface-sunk px-2 py-0.5 text-[0.7rem] text-text-muted"
+            >
+              <span className="max-w-[10rem] truncate">📎 {a.original_filename}</span>
+              <span className="opacity-70">· {EXTRACT_STATUS_LABEL[a.extract_status]}</span>
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

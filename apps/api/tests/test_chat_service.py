@@ -8,6 +8,7 @@ import asyncio
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from io import BytesIO
+from pathlib import Path
 
 import pytest
 from PIL import Image
@@ -17,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import encrypt_secret
 from app.core.errors import (
+    AttachmentNotFound,
     ConversationNotFound,
     InsufficientRole,
     ModelDoesNotSupportImages,
@@ -26,6 +28,7 @@ from app.memory import mem0
 from app.models import (
     Assistant,
     Attachment,
+    AttachmentSource,
     FeatureFlag,
     FlagScope,
     LLMModel,
@@ -57,7 +60,7 @@ from app.providers.base import (
 from app.providers.fake import FAKE_REPLY, VALID_KEY, FakeProvider
 from app.services.assistant_runtime import delegate_tool_name
 from app.services.assistants import create_assistant, delete_assistant, update_assistant
-from app.services.attachments import save_attachment
+from app.services.attachments import attach_to_message, list_attachments, save_attachment
 from app.services.chat import (
     MAX_TOOL_ITERATIONS,
     create_conversation,
@@ -72,7 +75,7 @@ from app.services.flags import set_override
 from app.services.generations import read_events, request_stop
 from app.services.memory import curated_agent_id, personal_agent_id, set_credential
 from app.services.tools import to_tool_definition
-from app.tools.base import ToolExecutionResult
+from app.tools.base import ToolExecutionResult, ToolImage
 
 
 class SlowFakeProvider(FakeProvider):
@@ -1495,6 +1498,55 @@ async def test_a_tool_call_is_executed_and_fed_back_for_a_final_answer(
     assert invocations[0].arguments == {"city": "Paris"}
     assert invocations[0].status == ToolInvocationStatus.SUCCESS
     assert invocations[0].result == "It is sunny in Paris"
+
+
+async def test_a_tool_s_images_are_saved_on_the_reply_but_not_as_uploads(
+    db: AsyncSession,
+    redis_client: Redis,
+    tool_calling_provider: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An image a tool returns is written to disk and recorded against the reply and the call
+    that made it — but it's not an upload, so it can't be re-sent as one."""
+    user, workspace, model = await _workspace_with_model(db)
+    await _enable_tools(db, redis_client, workspace_id=workspace.id)
+    await _add_tool(db, workspace_id=workspace.id, created_by=user.id)
+    monkeypatch.setattr("app.services.attachments.settings.storage_dir", str(tmp_path))
+
+    async def draws(tool: Tool, arguments: dict[str, object]) -> tuple[ToolExecutionResult, int]:
+        del tool, arguments
+        note = "[image 1 generated and shown to the user]"
+        return ToolExecutionResult(ok=True, content=note, images=(ToolImage("image/png", b"png"),)), 5
+
+    monkeypatch.setattr("app.services.chat.execute_tool", draws)
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+
+    generation_id = await send_message(
+        db, redis_client, workspace_id=workspace.id, conversation=conversation,
+        content="Draw Paris", idempotency_key=None,
+    )
+    events = [e async for e in read_events(redis_client, generation_id, block_ms=50)]
+
+    assert [e.data["image_count"] for e in events if e.type == "tool_result"] == [1]
+    messages = await list_messages(db, conversation_id=conversation.id)
+    invocation = (
+        await db.scalars(select(ToolInvocation).where(ToolInvocation.message_id == messages[1].id))
+    ).one()
+    image = (await db.scalars(select(Attachment).where(Attachment.tool_invocation_id == invocation.id))).one()
+    assert image.source == AttachmentSource.TOOL
+    assert image.message_id == messages[1].id
+    assert image.uploaded_by == user.id
+    assert image.original_filename == "get_weather-1.png"
+    assert (tmp_path / image.storage_key).read_bytes() == b"png"
+    assert await list_attachments(db, conversation_id=conversation.id) == []
+    with pytest.raises(AttachmentNotFound):
+        await attach_to_message(
+            db, conversation_id=conversation.id, attachment_ids=[image.id], message_id=messages[0].id
+        )
 
 
 async def test_a_failing_tool_returns_an_error_to_the_model_not_the_generation(
