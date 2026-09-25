@@ -21,6 +21,7 @@ from app.routers.v1 import (
     hooks,
     invitations,
     knowledge,
+    mcp_servers,
     members,
     memory,
     models,
@@ -63,6 +64,7 @@ app.include_router(flags.evaluate_router, prefix="/api/v1")
 app.include_router(flags.admin_router, prefix="/api/v1")
 app.include_router(attachments.router, prefix="/api/v1")
 app.include_router(tools.router, prefix="/api/v1")
+app.include_router(mcp_servers.router, prefix="/api/v1")
 app.include_router(tool_invocations.router, prefix="/api/v1")
 app.include_router(assistants.router, prefix="/api/v1")
 app.include_router(memory.credential_router, prefix="/api/v1")

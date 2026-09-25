@@ -32,6 +32,7 @@ def _to_tool_out(tool: Tool) -> ToolOut:
         url=tool.url,
         secret_header=tool.secret_header,
         has_secret=tool.ciphertext is not None,
+        mcp_server_id=tool.mcp_server_id,
         created_at=tool.created_at,
     )
 

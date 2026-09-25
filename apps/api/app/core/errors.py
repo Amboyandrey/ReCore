@@ -213,6 +213,37 @@ class ToolNameAlreadyExists(AppError):
     detail = "A tool with this name already exists."
 
 
+class McpToolReadOnly(AppError):
+    """Raised when editing anything but `enabled` on a tool discovered from an MCP server — its
+    definition comes from the server, and the next sync would overwrite a local edit anyway."""
+
+    status_code = 409
+    detail = "An MCP tool's definition comes from its server; it can only be enabled or disabled."
+
+
+class McpServerNotFound(AppError):
+    """Raised for an MCP server id that doesn't exist in the workspace it was looked up under."""
+
+    status_code = 404
+    detail = "MCP server not found."
+
+
+class McpServerNameAlreadyExists(AppError):
+    """Raised when registering an MCP server whose name is already taken in this workspace — the
+    name prefixes every tool it contributes, so two servers can't share one."""
+
+    status_code = 409
+    detail = "An MCP server with this name already exists."
+
+
+class McpServerUnreachable(AppError):
+    """Raised when registering or syncing a server whose tool list couldn't be fetched — bad URL,
+    rejected auth, or a server that doesn't speak MCP over Streamable HTTP."""
+
+    status_code = 502
+    detail = "Couldn't reach the MCP server."
+
+
 class AssistantNotFound(AppError):
     """Raised for an assistant id that doesn't exist in the workspace it was looked up under."""
 

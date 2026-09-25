@@ -14,7 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import encrypt_secret
-from app.core.errors import ToolNameAlreadyExists, ToolNotFound
+from app.core.errors import McpToolReadOnly, ToolNameAlreadyExists, ToolNotFound
 from app.core.ssrf import assert_safe_base_url
 from app.models import Message, Tool, ToolInvocation, ToolKind, User
 from app.providers.base import ToolDefinition
@@ -136,9 +136,12 @@ async def update_tool(
     `enabled` applies to any tool, built-in or HTTP — the lightweight on/off switch that keeps a
     tool's configuration (and secret) around for later, the same role `disable_model()` plays for
     LLM models. Every other field is HTTP-tool-only; a URL change is re-checked against the SSRF
-    guard exactly like a brand-new one is.
+    guard exactly like a brand-new one is. An MCP tool's definition belongs to its server, so
+    only `enabled` may change on one.
     """
     tool = await get_tool(db, workspace_id=workspace_id, tool_id=tool_id)
+    if tool.kind == ToolKind.MCP and set(changes) - {"enabled"}:
+        raise McpToolReadOnly()
     if "name" in changes and changes["name"] != tool.name:
         await _assert_name_available(
             db, workspace_id=workspace_id, name=changes["name"], excluding_tool_id=tool.id
