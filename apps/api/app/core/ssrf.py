@@ -16,6 +16,7 @@ import ipaddress
 import socket
 from urllib.parse import urlparse
 
+from app.core.config import get_settings
 from app.core.errors import AppError
 
 
@@ -45,6 +46,8 @@ def assert_safe_base_url(url: str) -> None:
         raise UnsafeBaseUrlError("Base URL must start with http:// or https://.")
     if not parsed.hostname:
         raise UnsafeBaseUrlError("Base URL must include a host.")
+    if parsed.hostname.lower() in {host.lower() for host in get_settings().ssrf_allowed_hosts}:
+        return
 
     try:
         addrinfo = socket.getaddrinfo(parsed.hostname, None)

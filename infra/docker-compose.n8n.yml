@@ -1,0 +1,17 @@
+# Local demo only: lets ReCore reach a local n8n MCP server at http://n8n:5678/mcp/<path>.
+# Usage: docker compose -f infra/docker-compose.yml -f infra/docker-compose.n8n.yml up -d
+# Requires the n8n stack (network "n8n-local_default") to be running first.
+services:
+  api:
+    environment:
+      SSRF_ALLOWED_HOSTS: '["n8n"]'
+    networks: [default, n8n]
+  worker:
+    environment:
+      SSRF_ALLOWED_HOSTS: '["n8n"]'
+    networks: [default, n8n]
+
+networks:
+  n8n:
+    name: n8n-local_default
+    external: true

@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     # Origins allowed to call the API with credentials, from the web app
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
 
+    # Exact hostnames the SSRF guard lets through even on private addresses; local demos only
+    ssrf_allowed_hosts: list[str] = Field(default_factory=list)
+
     # Master key for envelope-encrypting provider credentials (phase 4); base64, 32 bytes
     master_key: str = Field(default="")
 
