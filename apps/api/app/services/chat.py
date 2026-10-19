@@ -87,6 +87,8 @@ TITLE_MAX_LENGTH = 60
 # A model that keeps calling tools forever is a billing runaway, not a feature — this bounds one
 # generation to at most this many round trips through the provider before it's forced to a stop.
 MAX_TOOL_ITERATIONS = 5
+# The error a loop reports when it hits MAX_TOOL_ITERATIONS, distinct from a provider failure.
+TOOL_LOOP_EXHAUSTED = "The model kept calling tools without finishing an answer."
 
 # A delegate run is a whole LLM tool-calling loop of its own (up to MAX_TOOL_ITERATIONS provider
 # round trips), so it needs far more headroom than execute_tool's own 15s per-call timeout.
@@ -522,7 +524,7 @@ async def send_message(
 
 
 @dataclass
-class _DelegateUsage:
+class DelegateUsage:
     """What a delegate run spent — priced and recorded as its own UsageEvent once the outer
     generation is persisted, since it ran on its own model and possibly its own credential."""
 
@@ -534,7 +536,7 @@ class _DelegateUsage:
 
 
 @dataclass
-class _ToolInvocationRecord:
+class ToolInvocationRecord:
     """One tool call from this generation, held in memory until the final assistant message
     exists to attach it to — see the persistence step at the end of _run_generation. That
     includes any images it returned, which are only written to disk then.
@@ -551,8 +553,8 @@ class _ToolInvocationRecord:
     status: ToolInvocationStatus
     error: str | None
     latency_ms: int
-    children: list["_ToolInvocationRecord"] = field(default_factory=list)
-    usage: _DelegateUsage | None = None
+    children: list["ToolInvocationRecord"] = field(default_factory=list)
+    usage: DelegateUsage | None = None
     # Held in memory, like the rest of the record, until the reply exists to save them onto.
     images: tuple[ToolImage, ...] = ()
 
@@ -594,7 +596,7 @@ class _LoopContext:
 
 
 @dataclass
-class _LoopResult:
+class LoopResult:
     """What one run through the tool-calling loop produced — shaped identically whether it was
     the outer generation's own turn or a delegate's."""
 
@@ -604,10 +606,10 @@ class _LoopResult:
     finish_reason: str
     error_message: str | None
     stopped: bool
-    invocations: list[_ToolInvocationRecord]
+    invocations: list[ToolInvocationRecord]
 
 
-async def _run_delegation(ctx: _LoopContext, call: ToolCall, spec: DelegateSpec) -> _ToolInvocationRecord:
+async def _run_delegation(ctx: _LoopContext, call: ToolCall, spec: DelegateSpec) -> ToolInvocationRecord:
     """Run one delegate end to end: recall its own memory if it has any, run its own tool-calling
     loop on the task alone — it never sees the outer conversation — and turn the result into the
     same shape a regular tool call produces, including its own nested ToolInvocation children and
@@ -623,7 +625,7 @@ async def _run_delegation(ctx: _LoopContext, call: ToolCall, spec: DelegateSpec)
         await append_event(
             ctx.redis, ctx.generation_id, "tool_result", {"name": call.name, "ok": False, "content": content}
         )
-        return _ToolInvocationRecord(
+        return ToolInvocationRecord(
             tool_id=None,
             name=call.name,
             arguments=call.arguments,
@@ -684,7 +686,7 @@ async def _run_delegation(ctx: _LoopContext, call: ToolCall, spec: DelegateSpec)
                 "tool_result",
                 {"name": call.name, "ok": False, "content": content},
             )
-            return _ToolInvocationRecord(
+            return ToolInvocationRecord(
                 tool_id=None,
                 name=call.name,
                 arguments=call.arguments,
@@ -695,7 +697,7 @@ async def _run_delegation(ctx: _LoopContext, call: ToolCall, spec: DelegateSpec)
             )
 
     latency_ms = int((time.monotonic() - started_at) * 1000)
-    usage = _DelegateUsage(
+    usage = DelegateUsage(
         model_id=spec.model_id,
         provider=spec.provider,
         tokens_in=inner.input_tokens or 0,
@@ -720,7 +722,7 @@ async def _run_delegation(ctx: _LoopContext, call: ToolCall, spec: DelegateSpec)
         "tool_result",
         {"name": call.name, "ok": status == ToolInvocationStatus.SUCCESS, "content": content},
     )
-    return _ToolInvocationRecord(
+    return ToolInvocationRecord(
         tool_id=None,
         name=call.name,
         arguments=call.arguments,
@@ -739,7 +741,7 @@ async def _execute_tool_call(
     tools_by_name: dict[str, Tool],
     delegates_by_name: dict[str, DelegateSpec],
     name_prefix: str,
-) -> _ToolInvocationRecord:
+) -> ToolInvocationRecord:
     """Run one requested call, emitting the SSE events either side of it, and return a record
     ready to persist once the generation finishes.
 
@@ -766,7 +768,7 @@ async def _execute_tool_call(
             "tool_result",
             {"name": display_name, "ok": False, "content": content},
         )
-        return _ToolInvocationRecord(
+        return ToolInvocationRecord(
             tool_id=None,
             name=display_name,
             arguments=call.arguments,
@@ -787,7 +789,7 @@ async def _execute_tool_call(
             "image_count": len(result.images),
         },
     )
-    return _ToolInvocationRecord(
+    return ToolInvocationRecord(
         tool_id=tool.id,
         name=display_name,
         arguments=call.arguments,
@@ -810,7 +812,7 @@ async def _run_tool_loop(
     delegates_by_name: dict[str, DelegateSpec],
     emit_deltas: bool,
     name_prefix: str = "",
-) -> _LoopResult:
+) -> LoopResult:
     """Drive the provider round-trip / tool-call cycle to a final answer, up to
     MAX_TOOL_ITERATIONS times. Used both for the outer generation's own turn (`emit_deltas=True`,
     `name_prefix=""`) and, one level deep, for a delegate's own turn (`emit_deltas=False` so its
@@ -827,7 +829,7 @@ async def _run_tool_loop(
     finish_reason = "stop"
     error_message: str | None = None
     stopped = False
-    invocations: list[_ToolInvocationRecord] = []
+    invocations: list[ToolInvocationRecord] = []
 
     try:
         for _ in range(MAX_TOOL_ITERATIONS):
@@ -884,11 +886,11 @@ async def _run_tool_loop(
             # Exhausted every iteration without a break — the model never stopped calling tools
             # for a final answer. Doesn't override a real error or an explicit stop.
             if not error_message and not stopped:
-                error_message = "The model kept calling tools without finishing an answer."
+                error_message = TOOL_LOOP_EXHAUSTED
     except Exception as exc:  # noqa: BLE001 — any transport failure still needs a terminal result
         error_message = f"Streaming failed: {exc}"
 
-    return _LoopResult(
+    return LoopResult(
         text="".join(text_parts),
         input_tokens=input_tokens,
         output_tokens=output_tokens,
@@ -909,7 +911,7 @@ async def run_assistant_task(
     task: str,
     emit_deltas: bool,
     attachments: Sequence[Attachment] = (),
-) -> _LoopResult:
+) -> LoopResult:
     """Run one assistant turn to a final answer outside of chat entirely — what
     workers/run_workflow.py calls once per step, on an AssistantTurn already resolved by
     prepare_assistant_turn. The public seam a caller outside this module goes through instead of

@@ -2169,3 +2169,12 @@ async def test_a_delegate_with_memory_enabled_recalls_its_own_scope(
     assert search_queries == ["Find X"]  # the delegated task, not the outer user message "Hi"
     # The orchestrator has no memory_enabled of its own, so no personal memory is ever written.
     assert add_calls == []
+
+
+def test_loop_result_types_are_public() -> None:
+    """The eval harness imports these by their public names, never chat.py's private ones."""
+    from app.services.chat import TOOL_LOOP_EXHAUSTED, LoopResult, ToolInvocationRecord
+
+    assert LoopResult.__name__ == "LoopResult"
+    assert ToolInvocationRecord.__name__ == "ToolInvocationRecord"
+    assert TOOL_LOOP_EXHAUSTED == "The model kept calling tools without finishing an answer."

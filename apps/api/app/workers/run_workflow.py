@@ -51,7 +51,7 @@ _EVENT_PREVIEW_CHARS = 2000
 
 
 def _serialize_invocation(record: Any) -> dict[str, Any]:
-    """Turn one chat.py _ToolInvocationRecord into the plain JSON a step run's `invocations`
+    """Turn one chat.py ToolInvocationRecord into the plain JSON a step run's `invocations`
     column stores — the same information a chat ToolInvocation row carries, just inline rather
     than in its own table (see WorkflowStepRun's own docstring for why). Typed as `Any` rather
     than importing that private name — see chat.py's run_assistant_task, the public seam this
