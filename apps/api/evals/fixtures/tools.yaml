@@ -1,0 +1,26 @@
+# Tool definitions offered to the model in eval tasks, referenced by name from tasks/*.yaml.
+- name: get_weather
+  description: Get the current weather for a city. Returns temperature in Celsius and conditions.
+  parameters:
+    type: object
+    properties:
+      city: { type: string, description: City name, e.g. "Manila" }
+    required: [city]
+- name: convert_units
+  description: Convert a numeric value between units, e.g. celsius to fahrenheit or km to miles.
+  parameters:
+    type: object
+    properties:
+      value: { type: number }
+      from_unit: { type: string }
+      to_unit: { type: string }
+    required: [value, from_unit, to_unit]
+- name: send_email
+  description: Send an email to a recipient. Only use when the user explicitly asks to send an email.
+  parameters:
+    type: object
+    properties:
+      to: { type: string }
+      subject: { type: string }
+      body: { type: string }
+    required: [to, subject, body]
