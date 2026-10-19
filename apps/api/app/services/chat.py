@@ -777,7 +777,13 @@ async def _execute_tool_call(
             error=content,
             latency_ms=0,
         )
-    result, latency_ms = await execute_tool(tool, call.arguments)
+    with tracer.start_as_current_span(
+        "gen_ai.execute_tool",
+        attributes={"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": call.name},
+    ) as tool_span:
+        result, latency_ms = await execute_tool(tool, call.arguments)
+        tool_span.set_attribute("recore.tool.status", "success" if result.ok else "error")
+        tool_span.set_attribute("recore.tool.latency_ms", latency_ms)
     await append_event(
         ctx.redis,
         ctx.generation_id,
@@ -846,26 +852,35 @@ async def _run_tool_loop(
             stream = adapter.stream(
                 model=provider_model_id, messages=history, max_tokens=MAX_TOKENS, tools=tool_definitions
             )
-            async for chunk in stream:
-                if await ctx.stop.check():
-                    finish_reason = "stopped"
-                    stopped = True
-                    break
-                if isinstance(chunk, TextDelta):
-                    iteration_text.append(chunk.text)
-                    text_parts.append(chunk.text)
-                    if emit_deltas:
-                        await append_event(ctx.redis, ctx.generation_id, "delta", {"text": chunk.text})
-                elif isinstance(chunk, ToolCallRequest):
-                    requested_calls = chunk.calls
-                elif isinstance(chunk, Usage):
-                    input_tokens = (input_tokens or 0) + chunk.input_tokens
-                    output_tokens = (output_tokens or 0) + chunk.output_tokens
-                elif isinstance(chunk, Done):
-                    finish_reason = chunk.finish_reason
-                elif isinstance(chunk, StreamError):
-                    error_message = chunk.message
-                    break
+            # One span per provider round trip; only counts and names, never prompt or reply text.
+            with tracer.start_as_current_span(
+                "gen_ai.chat",
+                attributes={"gen_ai.operation.name": "chat", "gen_ai.request.model": provider_model_id},
+            ) as round_span:
+                async for chunk in stream:
+                    if await ctx.stop.check():
+                        finish_reason = "stopped"
+                        stopped = True
+                        break
+                    if isinstance(chunk, TextDelta):
+                        iteration_text.append(chunk.text)
+                        text_parts.append(chunk.text)
+                        if emit_deltas:
+                            await append_event(ctx.redis, ctx.generation_id, "delta", {"text": chunk.text})
+                    elif isinstance(chunk, ToolCallRequest):
+                        requested_calls = chunk.calls
+                    elif isinstance(chunk, Usage):
+                        input_tokens = (input_tokens or 0) + chunk.input_tokens
+                        output_tokens = (output_tokens or 0) + chunk.output_tokens
+                        round_span.set_attribute("gen_ai.usage.input_tokens", chunk.input_tokens)
+                        round_span.set_attribute("gen_ai.usage.output_tokens", chunk.output_tokens)
+                    elif isinstance(chunk, Done):
+                        finish_reason = chunk.finish_reason
+                    elif isinstance(chunk, StreamError):
+                        error_message = chunk.message
+                        break
+                round_span.set_attribute("gen_ai.response.finish_reasons", (finish_reason,))
+                round_span.set_attribute("recore.tool_calls_requested", len(requested_calls))
 
             if error_message or stopped:
                 break

@@ -1,0 +1,10 @@
+# Optional local trace viewer: run with `docker compose -f infra/docker-compose.tracing.yml up -d`,
+# then start the API with OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 and open http://localhost:16686.
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4318:4318"

@@ -1,22 +1,25 @@
-"""OpenTelemetry tracing setup — one span per generation's provider call.
+"""OpenTelemetry tracing setup — a generation span with one child per provider round trip and tool call.
 
-No collector is wired up yet (that's a hardening-phase concern, alongside a real metrics/traces
-backend); spans export to stdout for now, so `docker compose logs api` shows a trace of exactly
-what ARCHITECTURE.md's phase-7 demo asks for: "a trace of one generation."
+Spans export over OTLP/HTTP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (see
+infra/docker-compose.tracing.yml for a local Jaeger), and to stdout otherwise, so
+`docker compose logs api` still shows a trace of one generation with no collector running.
 """
 
+import os
+
 from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import ConsoleSpanExporter, SimpleSpanProcessor
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter, SimpleSpanProcessor
 
 _configured = False
 
 
 def configure_tracing(service_name: str) -> None:
-    """Wire a process-wide TracerProvider exporting spans to stdout — idempotent, once per process.
+    """Wire a process-wide TracerProvider exporting spans over OTLP or to stdout — idempotent.
 
-    `SimpleSpanProcessor` exports synchronously as each span ends, deliberately not the batching
+    The stdout fallback uses `SimpleSpanProcessor`, exporting as each span ends, not the batching
     processor: a background export thread outliving pytest's per-test stdout capture is exactly
     the kind of "harmless in prod, noisy in tests" trap not worth the batching win at this volume.
     """
@@ -24,7 +27,11 @@ def configure_tracing(service_name: str) -> None:
     if _configured:
         return
     provider = TracerProvider(resource=Resource.create({"service.name": service_name}))
-    provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
+    if os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"):
+        # The exporter reads the endpoint and headers from the standard OTEL_* env vars itself.
+        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    else:
+        provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
     trace.set_tracer_provider(provider)
     _configured = True
 
