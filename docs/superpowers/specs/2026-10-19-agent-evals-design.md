@@ -33,8 +33,8 @@ New package `apps/api/app/evals/`; data under `apps/api/evals/`.
 | Module | Responsibility |
 |---|---|
 | `tasks.py` | Load and validate task YAML into Pydantic models |
-| `fixtures.py` | Local fixture HTTP server on `localhost`, random port, deterministic responses per fixture name, including scripted errors and injection payloads |
-| `turn.py` | Build an in-memory `AssistantTurn` from a task: transient `Tool` rows (HTTP kind, URL on the fixture server), `DelegateSpec`s, an `LLMModel` carrying prices; no database writes |
+| `fixtures.py` | In-process fixture ASGI app served through `http_tool`'s transport seam, deterministic responses per fixture name, including scripted errors and injection payloads |
+| `turn.py` | Build an in-memory `AssistantTurn` from a task: transient `Tool` rows (HTTP kind, URL on the fixture app), `DelegateSpec`s, an `LLMModel` carrying prices; no database writes |
 | `cassette.py` | `RecordingProvider` and `ReplayProvider`, each wrapping any `LLMProvider` |
 | `scoring.py` | Pure scoring functions over a loop result |
 | `judge.py` | Judge prompt, verdict parsing, calibration statistics |
@@ -56,11 +56,10 @@ apps/api/evals/
 
 Data flow: task YAML, then `turn.py` builds the turn, then `run_assistant_task` (unchanged), then the loop result, then `scoring.py`, then `report.py`.
 
-The harness runs the fixture server on `localhost` and sets `SSRF_ALLOWED_HOSTS=["localhost"]` in its own process only, before `get_settings()` is first called (it is `lru_cache`d), so fixture tools go through the real `http_tool` and SSRF guard path. Redis is required, as `run_assistant_task` uses it for events and stop signals.
+Fixture tools are served in process: the harness sets `app.tools.http_tool._transport` to an `httpx.ASGITransport` over the fixture app and replaces `http_tool.assert_safe_base_url` with a no-op, both only inside the eval process and restored on exit. No production SSRF code changes; the cost is that evals do not exercise the real SSRF guard, which keeps its own tests. Redis is required, as `run_assistant_task` uses it for events and stop signals.
 
 ### Production code changes
 
-0. Port the opt-in SSRF host allowlist (`ssrf_allowed_hosts` setting and its check) from commit `8a361d0` on the unmerged `feat/ssrf-host-allowlist` branch; only `config.py`, `ssrf.py` and `test_ssrf.py`, not the n8n compose file.
 1. A public result type and seam: rename `_LoopResult` and `_ToolInvocationRecord` to public names (or re-export them) so `app/evals` never imports private names from `services/chat.py`.
 2. Tracing: add a `gen_ai.chat` span per provider round trip in `_run_tool_loop` and a `gen_ai.execute_tool` span per tool call in `_execute_tool_call`, nested under the existing `llm.generate`. Attributes follow the OTel GenAI semantic conventions (`gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.tool.name`, finish reason, status). Prompt text, tool arguments, and tool results are never span attributes.
 3. `core/tracing.py`: when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, add a batching OTLP exporter; otherwise keep the console exporter. Adds `opentelemetry-exporter-otlp-proto-http`.
@@ -133,13 +132,13 @@ Metrics per model and category: pass@1 (mean pass rate) and, for live runs with 
 
 - Live mode retries a provider error twice with exponential backoff before marking `error`.
 - Default concurrency is 4, configurable by flag.
-- The fixture server always shuts down in a `finally`.
+- The fixture transport and SSRF stub are always restored in a `finally`.
 - A malformed task file fails loading with the task id and field before any model call.
 
 ## Testing
 
 - Unit tests: argument matchers, scoring, task validation, cassette hashing and round trip, gate rules, kappa and false-pass math.
-- End-to-end test: three tasks through `run_assistant_task` against `FakeProvider` with the fixture server, on real Redis.
+- End-to-end test: three tasks through `run_assistant_task` against `FakeProvider` with fixture tools, on real Redis.
 - CI replay gate as above.
 
 ## Deliverables

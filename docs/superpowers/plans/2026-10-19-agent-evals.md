@@ -4,7 +4,7 @@
 
 **Goal:** Add a provider-agnostic eval harness (golden tasks, scoring, calibrated judge, record/replay, CI gate) and per-round-trip OTel spans to ReCore's agent loop.
 
-**Architecture:** A new `apps/api/app/evals/` package builds an in-memory `AssistantTurn` per YAML task and runs the real `run_assistant_task`; tools are real HTTP tools pointed at a local fixture server; every `LLMProvider` is wrapped by a recording or replaying cassette so PR CI is deterministic and secret-free. Results feed pure scoring functions, a markdown/JSON report, and a baseline gate.
+**Architecture:** A new `apps/api/app/evals/` package builds an in-memory `AssistantTurn` per YAML task and runs the real `run_assistant_task`; tools are real HTTP tools served in process through `http_tool`'s transport seam; every `LLMProvider` is wrapped by a recording or replaying cassette so PR CI is deterministic and secret-free. Results feed pure scoring functions, a markdown/JSON report, and a baseline gate.
 
 **Tech Stack:** Python 3.12, FastAPI, uvicorn, httpx, Pydantic v2, PyYAML, Redis, OpenTelemetry SDK + OTLP HTTP exporter, pytest (asyncio auto mode), GitHub Actions.
 
@@ -33,31 +33,9 @@
 
 ---
 
-### Task 1: Port the SSRF host allowlist
+### Task 1: (dropped)
 
-**Files:**
-- Modify: `apps/api/app/core/config.py`, `apps/api/app/core/ssrf.py`
-- Test: `apps/api/tests/test_ssrf.py`
-
-**Interfaces:**
-- Produces: `Settings.ssrf_allowed_hosts: list[str]` (env `SSRF_ALLOWED_HOSTS`, JSON list); `assert_safe_base_url` returns early for an exact, case-insensitive hostname match.
-
-- [ ] **Step 1: Apply only the three app/test files from commit `8a361d0`**
-
-Run (repo root): `git show 8a361d0 -- apps/api/app/core/config.py apps/api/app/core/ssrf.py apps/api/tests/test_ssrf.py | git apply`
-Expected: no output; `git status` shows those three files modified, `infra/docker-compose.n8n.yml` untouched.
-
-- [ ] **Step 2: Run the SSRF tests**
-
-Run: `uv run pytest tests/test_ssrf.py -q`
-Expected: PASS, including `test_an_allowlisted_host_passes_even_on_a_private_address` and `test_the_allowlist_only_covers_exact_hostnames`.
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add apps/api/app/core/config.py apps/api/app/core/ssrf.py apps/api/tests/test_ssrf.py
-git commit -m "feat(api): opt-in SSRF host allowlist for local fixtures"
-```
+Removed by user decision: no SSRF allowlist; fixtures use the in-process transport seam (see Task 5).
 
 ---
 
@@ -202,7 +180,7 @@ For `order="any"` find a one-to-one assignment of expected to observed calls by 
 
 ---
 
-### Task 5: Fixture tool server
+### Task 5: In-process fixture tools
 
 **Files:**
 - Create: `apps/api/app/evals/fixtures.py`, `apps/api/evals/fixtures/responses.json`, `apps/api/tests/evals/test_fixtures.py`
@@ -210,27 +188,29 @@ For `order="any"` find a one-to-one assignment of expected to observed calls by 
 **Interfaces:**
 - Consumes: `Matcher`, `match_value` (Task 4).
 - Produces:
+  - `FIXTURE_BASE = "http://fixtures.evals"`
   - `FixtureRule(match: dict[str, Matcher] = {}, status: int = 200, body: str | dict[str, Any] | list[Any])`
   - `load_fixtures(path: Path) -> dict[str, dict[str, list[FixtureRule]]]` (set name, then tool name, then ordered rules)
-  - `class FixtureServer` async context manager: `FixtureServer(fixtures)`, `url_for(fixture_set: str, tool: str) -> str` returning `http://localhost:<port>/<set>/<tool>`.
-  - Route `POST /{fixture_set}/{tool}`: first rule whose `match` passes against the JSON body wins (empty `match` matches all); dict/list bodies serialized with `json.dumps(sort_keys=True, separators=(",", ":"))`; no rule or unknown set/tool returns 404 `"no fixture for <set>/<tool>"`.
+  - `fixture_app(fixtures) -> FastAPI` with route `POST /{fixture_set}/{tool}`: first rule whose `match` passes against the JSON body wins (empty `match` matches all); dict/list bodies serialized with `json.dumps(sort_keys=True, separators=(",", ":"))`; no rule or unknown set/tool returns 404 `"no fixture for <set>/<tool>"`.
+  - `url_for(fixture_set: str, tool: str) -> str` returning `f"{FIXTURE_BASE}/{fixture_set}/{tool}"`.
+  - `class FixtureTools` context manager: on enter sets `http_tool._transport = httpx.ASGITransport(app=fixture_app(fixtures))` and `http_tool.assert_safe_base_url` to a no-op; on exit restores both originals, even on error.
 
 - [ ] **Step 1: Write failing tests**
 
 ```python
-async def test_first_matching_rule_wins(): ...  # manila rule before default rule
-async def test_unknown_tool_is_404(): ...
-async def test_dict_bodies_are_serialized_deterministically(): ...
-async def test_server_stops_on_exit(): ...  # request after __aexit__ raises httpx.ConnectError
+async def test_first_matching_rule_wins(): ...  # via http_tool.execute on a transient Tool inside FixtureTools
+async def test_unknown_tool_is_404(): ...       # ToolExecutionResult ok False, content mentions "no fixture"
+def test_dict_bodies_are_serialized_deterministically(): ...
+def test_transport_and_guard_are_restored_on_exit(): ...  # also when the body raises
 ```
 
 - [ ] **Step 2: Run, expect failure**
 
-- [ ] **Step 3: Implement** with a small FastAPI app served by `uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning"))` started as a task; read the bound port from `server.servers[0].sockets[0].getsockname()[1]`; `__aexit__` sets `should_exit` and awaits the task.
+- [ ] **Step 3: Implement**
 
 - [ ] **Step 4: Run tests, ruff, mypy** — pass.
 
-- [ ] **Step 5: Commit** — `feat(evals): local fixture tool server`
+- [ ] **Step 5: Commit** — `feat(evals): in-process fixture tools`
 
 ---
 
@@ -275,20 +255,20 @@ def test_cassette_never_contains_the_api_key(tmp_path): ...  # record with VALID
 - Create: `apps/api/app/evals/models_config.py`, `apps/api/app/evals/turn.py`, `apps/api/app/evals/execute.py`, `apps/api/evals/models.yaml`, `apps/api/tests/evals/test_execute.py`
 
 **Interfaces:**
-- Consumes: Tasks 2, 4, 5, 6; `build_provider`, `delegate_tool_name`, `DelegateSpec`, `AssistantTurn`, `run_assistant_task`.
+- Consumes: Tasks 2, 4, 5, 6 (fixtures active via `FixtureTools` for the whole run); `build_provider`, `delegate_tool_name`, `DelegateSpec`, `AssistantTurn`, `run_assistant_task`.
 - Produces:
   - `ModelSpec(id: str, provider: Provider, provider_model_id: str, base_url: str | None = None, key_env: str, cost_per_mtok_in: float, cost_per_mtok_out: float)`; `EvalModels(models: list[ModelSpec], judge: ModelSpec)`; `load_models(path: Path) -> EvalModels`.
   - `Mode = Literal["live", "record", "replay"]`
   - `build_adapter(spec: ModelSpec, mode: Mode, cassette_path: Path) -> LLMProvider` — live: registry adapter with `os.environ[spec.key_env]` (raise `MissingKeyError(spec.key_env)` if unset); record: `RecordingProvider` around it; replay: `ReplayProvider` (no key needed).
-  - `build_turn(task: Task, catalog: dict[str, ToolDef], spec: ModelSpec, adapter: LLMProvider, server: FixtureServer) -> AssistantTurn` — transient `Tool(kind=ToolKind.HTTP, method="POST", url=server.url_for(task.fixtures.get(name, "default"), name), ...)` with fresh uuid ids; delegates share the same adapter and spec, `memory_active=False`; `LLMModel` transient with spec prices.
+  - `build_turn(task: Task, catalog: dict[str, ToolDef], spec: ModelSpec, adapter: LLMProvider, fixtures: FixtureTools) -> AssistantTurn` — transient `Tool(kind=ToolKind.HTTP, method="POST", url=url_for(task.fixtures.get(name, "default"), name), ...)` with fresh uuid ids; delegates share the same adapter and spec, `memory_active=False`; `LLMModel` transient with spec prices.
   - `TaskRun(task_id: str, category: Category, model_id: str, rep: int, status: Literal["pass","fail","error","cassette_miss"], checks: dict[str, bool], reasons: list[str], answer: str, tokens_in: int, tokens_out: int, cost_usd: float, latency_ms: int)`
-  - `async def run_task(task, *, spec, mode, rep, catalog, server, redis, cassette_dir: Path) -> TaskRun` — runs inside a span `eval.task` with attributes `eval.task_id`, `eval.model`, `eval.rep`; status precedence: `cassette_miss` if replay adapter missed; else `error` if `error_message` set and not equal to `TOOL_LOOP_EXHAUSTED`; else hard scoring. Cost includes delegate `usage` tokens at the same prices. Live mode retries a whole task run twice on `error` with 1 s then 2 s backoff.
+  - `async def run_task(task, *, spec, mode, rep, catalog, redis, cassette_dir: Path) -> TaskRun` — runs inside a span `eval.task` with attributes `eval.task_id`, `eval.model`, `eval.rep`; status precedence: `cassette_miss` if replay adapter missed; else `error` if `error_message` set and not equal to `TOOL_LOOP_EXHAUSTED`; else hard scoring. Cost includes delegate `usage` tokens at the same prices. Live mode retries a whole task run twice on `error` with 1 s then 2 s backoff.
 - `evals/models.yaml` initial content: agents `gpt-oss-120b` (`openai_compatible`, `openai/gpt-oss-120b`) and a Qwen3 model, judge a DeepSeek or GLM model, all `key_env: EVAL_KEY_NEBIUS`, Nebius base URL and prices copied from the provider page in ReCore at implementation time.
 
-- [ ] **Step 1: Write failing tests** (real Redis via `redis_client` fixture, `FakeProvider` subclasses, `SSRF` allowlist via monkeypatching `app.core.ssrf.get_settings` to return `ssrf_allowed_hosts=["localhost"]`)
+- [ ] **Step 1: Write failing tests** (real Redis via `redis_client` fixture, `FakeProvider` subclasses, fixtures via `FixtureTools`)
 
 ```python
-async def test_tool_task_passes_end_to_end(...): ...      # scripted get_weather call hits fixture server, status "pass"
+async def test_tool_task_passes_end_to_end(...): ...      # scripted get_weather call hits fixture tools, status "pass"
 async def test_forbidden_call_fails_injection_task(...): ...
 async def test_replay_miss_reports_cassette_miss(...): ...  # empty cassette dir, mode "replay"
 async def test_provider_stream_error_reports_error(...): ...
@@ -353,13 +333,13 @@ async def test_run_task_fails_on_judge_fail_and_errors_on_no_verdict(...): ...
 **Interfaces:**
 - Consumes: Tasks 4 to 8.
 - Produces:
-  - `async def run_matrix(tasks: list[Task], models: list[ModelSpec], *, mode: Mode, k: int, concurrency: int, judge: Judge | None, ...) -> list[TaskRun]` — `asyncio.Semaphore(concurrency)`, one `FixtureServer` for the run, record mode forces `k=1`, judge built by `build_adapter(judge_spec, mode, ...)` with judge cassette paths.
+  - `async def run_matrix(tasks: list[Task], models: list[ModelSpec], *, mode: Mode, k: int, concurrency: int, judge: Judge | None, ...) -> list[TaskRun]` — `asyncio.Semaphore(concurrency)`, one `FixtureTools` for the run, record mode forces `k=1`, judge built by `build_adapter(judge_spec, mode, ...)` with judge cassette paths.
   - `Summary` per (model, category): `n`, `passed`, `errors`, `misses`, `pass_at_1` (passes / non-error runs), `pass_pow_k` (tasks where all k reps passed / tasks with no error rep), `cost_usd`, `latency_p50_ms`, `latency_p95_ms`.
   - `summarize(runs: list[TaskRun]) -> dict[str, dict[str, Summary]]`
   - `write_results(runs, meta: dict[str, Any], out_dir: Path) -> None` writing `results.json` and `report.md` (per-model table of categories x pass@1, pass^k, cost, p50/p95; then a failures section listing task id, model, reasons).
   - `Baseline(judge_kappa: float, models: dict[str, BaselineModel])`, `BaselineModel(categories: dict[str, float], injection_passed: list[str])`; `load_baseline(path) -> Baseline`; `baseline_from(runs, kappa) -> Baseline`.
   - `gate(runs, baseline, *, mode: Mode) -> list[str]` returning violation messages (empty means pass), applying Global Constraints thresholds; missing model or category in current runs is a violation; new ones are not.
-  - CLI (`python -m app.evals`): `run --mode {live,record,replay} [--models ids] [--category c] [--k 1] [--concurrency 4] [--out evals/out]`; `calibrate [--labels evals/labels.jsonl]` prints `CalibrationReport` and exits 0; `gate [--mode replay]` runs, writes outputs, prints violations, exits 1 on any; `baseline --from evals/out/results.json --kappa <float>` writes `evals/baseline.json`. CLI sets `SSRF_ALLOWED_HOSTS='["localhost"]'` and calls `get_settings.cache_clear()` before anything else. Judge counted only when baseline kappa >= 0.6 (for `run` without a baseline file, judge results are shown but not counted).
+  - CLI (`python -m app.evals`): `run --mode {live,record,replay} [--models ids] [--category c] [--k 1] [--concurrency 4] [--out evals/out]`; `calibrate [--labels evals/labels.jsonl]` prints `CalibrationReport` and exits 0; `gate [--mode replay]` runs, writes outputs, prints violations, exits 1 on any; `baseline --from evals/out/results.json --kappa <float>` writes `evals/baseline.json`. CLI wraps the run in `FixtureTools`. Judge counted only when baseline kappa >= 0.6 (for `run` without a baseline file, judge results are shown but not counted).
 
 - [ ] **Step 1: Write failing tests**
 
