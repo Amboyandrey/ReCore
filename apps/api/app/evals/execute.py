@@ -11,6 +11,7 @@ from redis.asyncio import Redis
 
 from app.core.tracing import get_tracer
 from app.evals.cassette import ReplayProvider
+from app.evals.judge import Judge
 from app.evals.models_config import Mode, ModelSpec, build_adapter
 from app.evals.scoring import score_hard
 from app.evals.tasks import Category, Task, ToolDef
@@ -75,7 +76,9 @@ async def _attempt(
     catalog: dict[str, ToolDef],
     redis: Redis,
     cassette_dir: Path,
-) -> tuple[TaskRun, LoopResult | None]:
+    judge_spec: ModelSpec | None,
+    judge_counts: bool,
+) -> TaskRun:
     path = cassette_dir / spec.id / f"{task.id}.jsonl"
     if mode == "record":
         # A fresh recording per attempt, so a failed attempt's requests never linger in the cassette.
@@ -100,14 +103,57 @@ async def _attempt(
     if isinstance(adapter, ReplayProvider) and adapter.missed:
         run.status = "cassette_miss"
         run.reasons = ["no recording for a request this run made; re-record this task"]
-        return run, None
+        return run
     if result.error_message and result.error_message != TOOL_LOOP_EXHAUSTED:
         run.reasons = [result.error_message]
-        return run, None
+        return run
     scored = score_hard(task, result)
     run.status = "pass" if scored.passed else "fail"
     run.checks, run.reasons = scored.checks, scored.reasons
-    return run, result
+    rubric = task.expect.answer.judge
+    if scored.passed and rubric and judge_spec is not None:
+        await _apply_judge(
+            run,
+            task,
+            rubric,
+            spec=spec,
+            mode=mode,
+            cassette_dir=cassette_dir,
+            judge_spec=judge_spec,
+            judge_counts=judge_counts,
+        )
+    return run
+
+
+async def _apply_judge(
+    run: TaskRun,
+    task: Task,
+    rubric: str,
+    *,
+    spec: ModelSpec,
+    mode: Mode,
+    cassette_dir: Path,
+    judge_spec: ModelSpec,
+    judge_counts: bool,
+) -> None:
+    """Grade the answer; a failing verdict fails the run only when the judge's calibration lets it count."""
+    path = cassette_dir / judge_spec.id / "judge" / f"{spec.id}__{task.id}.jsonl"
+    if mode == "record":
+        path.unlink(missing_ok=True)
+    adapter = build_adapter(judge_spec, mode, path)
+    verdict = await Judge(adapter, judge_spec).grade(prompt=task.prompt, rubric=rubric, answer=run.answer)
+    if isinstance(adapter, ReplayProvider) and adapter.missed:
+        run.status, run.reasons = "cassette_miss", ["no recording for the judge call; re-record this task"]
+        return
+    if verdict is None:
+        run.status, run.reasons = "error", ["judge returned no verdict"]
+        return
+    passed, reason = verdict
+    run.checks["judge"] = passed
+    if not passed:
+        run.reasons.append(f"judge: {reason}" if judge_counts else f"judge (not counted): {reason}")
+        if judge_counts:
+            run.status = "fail"
 
 
 async def run_task(
@@ -119,14 +165,24 @@ async def run_task(
     catalog: dict[str, ToolDef],
     redis: Redis,
     cassette_dir: Path,
+    judge_spec: ModelSpec | None = None,
+    judge_counts: bool = True,
 ) -> TaskRun:
     """Run one task, retrying provider errors outside replay, inside an `eval.task` span."""
     attributes: dict[str, str | int] = {"eval.task_id": task.id, "eval.model": spec.id, "eval.rep": rep}
     with tracer.start_as_current_span("eval.task", attributes=attributes) as span:
         attempts = 1 if mode == "replay" else 1 + len(RETRY_DELAYS)
         for attempt in range(attempts):
-            run, _ = await _attempt(
-                task, spec=spec, mode=mode, rep=rep, catalog=catalog, redis=redis, cassette_dir=cassette_dir
+            run = await _attempt(
+                task,
+                spec=spec,
+                mode=mode,
+                rep=rep,
+                catalog=catalog,
+                redis=redis,
+                cassette_dir=cassette_dir,
+                judge_spec=judge_spec,
+                judge_counts=judge_counts,
             )
             if run.status != "error" or attempt == attempts - 1:
                 break
