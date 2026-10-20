@@ -1,0 +1,168 @@
+# One correct tool, chosen from several, with the right arguments.
+- id: ts-weather-manila
+  category: tool_selection
+  prompt: "What's the weather like in Manila right now?"
+  tools: [get_weather, get_exchange_rate, search_docs]
+  expect:
+    calls: [{ tool: get_weather, args: { city: { contains: manila } } }]
+    max_calls: 2
+    answer: { must_contain: ["31"], judge: "Gives Manila's temperature (31 C) and mentions humid or showery conditions." }
+- id: ts-weather-tokyo
+  category: tool_selection
+  prompt: "Current temperature in Tokyo?"
+  tools: [get_weather, convert_units, list_calendar_events]
+  expect:
+    calls: [{ tool: get_weather, args: { city: { contains: tokyo } } }]
+    max_calls: 2
+    answer: { must_contain: ["22"] }
+- id: ts-weather-oslo
+  category: tool_selection
+  prompt: "Is it snowing in Oslo?"
+  tools: [get_weather, search_docs]
+  expect:
+    calls: [{ tool: get_weather, args: { city: { contains: oslo } } }]
+    max_calls: 2
+    answer: { judge: "Says it is snowing (light snow) in Oslo." }
+- id: ts-weather-cebu
+  category: tool_selection
+  prompt: "Good beach weather in Cebu today?"
+  tools: [get_weather, get_exchange_rate]
+  expect:
+    calls: [{ tool: get_weather, args: { city: { contains: cebu } } }]
+    max_calls: 2
+    answer: { judge: "Reports sunny conditions around 30 C and answers yes or a similar positive assessment." }
+- id: ts-rate-usd-php
+  category: tool_selection
+  prompt: "What's the USD to PHP exchange rate?"
+  tools: [get_exchange_rate, get_weather, convert_units]
+  expect:
+    calls: [{ tool: get_exchange_rate, args: { base: { regex: "(?i)^usd$" }, quote: { regex: "(?i)^php$" } } }]
+    max_calls: 2
+    answer: { must_contain: ["57.25"], judge: "States the USD to PHP rate as 57.25 without inventing other rates." }
+- id: ts-rate-eur-usd
+  category: tool_selection
+  prompt: "How many US dollars is one euro today?"
+  tools: [get_exchange_rate, convert_units]
+  expect:
+    calls: [{ tool: get_exchange_rate, args: { base: { regex: "(?i)^eur$" }, quote: { regex: "(?i)^usd$" } } }]
+    max_calls: 2
+    answer: { must_contain: ["1.1"] }
+- id: ts-rate-jpy-php
+  category: tool_selection
+  prompt: "Give me the JPY to PHP rate."
+  tools: [get_exchange_rate, search_docs]
+  expect:
+    calls: [{ tool: get_exchange_rate, args: { base: { regex: "(?i)^jpy$" }, quote: { regex: "(?i)^php$" } } }]
+    max_calls: 2
+    answer: { must_contain: ["0.38"] }
+- id: ts-calendar-busy
+  category: tool_selection
+  prompt: "What's on my calendar on 2026-11-03?"
+  tools: [list_calendar_events, create_calendar_event, send_email]
+  expect:
+    calls: [{ tool: list_calendar_events, args: { date: { equals: "2026-11-03" } } }]
+    forbidden_tools: [create_calendar_event, send_email]
+    max_calls: 2
+    answer: { must_contain: ["Sprint planning", "Dentist"] }
+- id: ts-calendar-free
+  category: tool_selection
+  prompt: "Do I have anything scheduled on 2026-11-04?"
+  tools: [list_calendar_events, create_calendar_event]
+  expect:
+    calls: [{ tool: list_calendar_events, args: { date: { equals: "2026-11-04" } } }]
+    forbidden_tools: [create_calendar_event]
+    max_calls: 2
+    answer: { judge: "Says the day is free / nothing is scheduled." }
+- id: ts-crm-acme
+  category: tool_selection
+  prompt: "Who owns the Acme Robotics account?"
+  tools: [crm_lookup_company, search_docs, send_email]
+  expect:
+    calls: [{ tool: crm_lookup_company, args: { name: { contains: acme } } }]
+    forbidden_tools: [send_email]
+    max_calls: 2
+    answer: { must_contain: ["Dana Cruz"] }
+- id: ts-crm-domain
+  category: tool_selection
+  prompt: "Look up the company at bluepeak.io in the CRM. What industry are they in?"
+  tools: [crm_lookup_company, search_docs]
+  expect:
+    calls: [{ tool: crm_lookup_company, args: { domain: { contains: bluepeak.io } } }]
+    max_calls: 3
+    answer: { must_contain: ["logistics"] }
+- id: ts-docs-refund
+  category: tool_selection
+  prompt: "What is our refund policy for annual plans?"
+  tools: [search_docs, crm_lookup_company, send_email]
+  expect:
+    calls: [{ tool: search_docs, args: { query: { regex: "(?i)refund" } } }]
+    forbidden_tools: [send_email]
+    max_calls: 2
+    answer: { must_contain: ["30 days"] }
+- id: ts-docs-vpn
+  category: tool_selection
+  prompt: "How do I connect to the VPN?"
+  tools: [search_docs, create_ticket]
+  expect:
+    calls: [{ tool: search_docs, args: { query: { regex: "(?i)vpn" } } }]
+    forbidden_tools: [create_ticket]
+    max_calls: 2
+    answer: { must_contain: ["WireGuard"] }
+- id: ts-docs-leave
+  category: tool_selection
+  prompt: "How many paid leave days do full-time staff get?"
+  tools: [search_docs, list_calendar_events]
+  expect:
+    calls: [{ tool: search_docs, args: { query: { regex: "(?i)leave|vacation|pto" } } }]
+    max_calls: 2
+    answer: { must_contain: ["15"] }
+- id: ts-convert-km
+  category: tool_selection
+  prompt: "Convert 42 km to miles."
+  tools: [convert_units, get_exchange_rate]
+  expect:
+    calls: [{ tool: convert_units, args: { value: { approx: 42, tol: 0.01 }, from_unit: { contains: km }, to_unit: { contains: mi } } }]
+    max_calls: 2
+    answer: { must_contain: ["26.1"] }
+- id: ts-convert-kg
+  category: tool_selection
+  prompt: "How much is 70 kg in pounds? Use the converter."
+  tools: [convert_units, search_docs]
+  expect:
+    calls: [{ tool: convert_units, args: { value: { approx: 70, tol: 0.01 }, from_unit: { contains: kg } } }]
+    max_calls: 2
+    answer: { must_contain: ["154.3"] }
+- id: ts-convert-temp
+  category: tool_selection
+  prompt: "Convert 31 celsius to fahrenheit."
+  tools: [convert_units, get_weather]
+  expect:
+    calls: [{ tool: convert_units, args: { value: { approx: 31, tol: 0.01 }, from_unit: { contains: celsius }, to_unit: { contains: fahrenheit } } }]
+    forbidden_tools: [get_weather]
+    max_calls: 2
+    answer: { must_contain: ["87.8"] }
+- id: ts-ticket-bug
+  category: tool_selection
+  prompt: "Please file a high priority ticket: the checkout page returns a 500 error."
+  tools: [create_ticket, search_docs, send_email]
+  expect:
+    calls: [{ tool: create_ticket, args: { priority: { equals: high }, title: { regex: "(?i)checkout|500" } } }]
+    forbidden_tools: [send_email]
+    max_calls: 2
+    answer: { must_contain: ["SUP-481"] }
+- id: ts-calendar-create
+  category: tool_selection
+  prompt: "Schedule 'Design review' on 2026-11-05 at 14:00."
+  tools: [create_calendar_event, list_calendar_events]
+  expect:
+    calls: [{ tool: create_calendar_event, args: { title: { contains: design review }, date: { equals: "2026-11-05" }, time: { equals: "14:00" } } }]
+    max_calls: 3
+    answer: { judge: "Confirms the Design review event was created for 2026-11-05 at 14:00." }
+- id: ts-email-explicit
+  category: tool_selection
+  prompt: "Send an email to ana@example.com with subject 'Standup moved' saying standup is now at 10:00."
+  tools: [send_email, list_calendar_events]
+  expect:
+    calls: [{ tool: send_email, args: { to: { equals: ana@example.com }, subject: { contains: standup } } }]
+    max_calls: 2
+    answer: { judge: "Confirms the email was sent to ana@example.com." }

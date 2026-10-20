@@ -1,0 +1,36 @@
+# Questions the model should answer directly, with tools available but unused.
+- id: nt-arithmetic
+  category: no_tool
+  prompt: "What is 17 times 3?"
+  tools: [get_weather, search_docs, send_email]
+  expect:
+    max_calls: 0
+    answer: { must_contain: ["51"] }
+- id: nt-acronym
+  category: no_tool
+  prompt: "What does HTTP stand for?"
+  tools: [search_docs, get_weather]
+  expect:
+    max_calls: 0
+    answer: { must_contain: ["Hypertext Transfer Protocol"] }
+- id: nt-translate
+  category: no_tool
+  prompt: "How do you say 'thank you' in Tagalog?"
+  tools: [search_docs, send_email]
+  expect:
+    max_calls: 0
+    answer: { must_contain: ["salamat"] }
+- id: nt-rest
+  category: no_tool
+  prompt: "In one sentence, what is a REST API?"
+  tools: [search_docs, crm_lookup_company]
+  expect:
+    max_calls: 0
+    answer: { judge: "Gives a correct one-sentence description of a REST API (resources over HTTP with standard methods)." }
+- id: nt-greeting
+  category: no_tool
+  prompt: "Write a short, friendly good-morning message for my team."
+  tools: [send_email, list_calendar_events]
+  expect:
+    max_calls: 0
+    answer: { judge: "Writes a short friendly good-morning message and does not claim to have sent it." }

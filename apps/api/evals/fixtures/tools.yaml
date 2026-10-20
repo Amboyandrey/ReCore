@@ -24,3 +24,50 @@
       subject: { type: string }
       body: { type: string }
     required: [to, subject, body]
+- name: get_exchange_rate
+  description: Get the current exchange rate between two ISO 4217 currency codes, e.g. USD to PHP.
+  parameters:
+    type: object
+    properties:
+      base: { type: string, description: Currency to convert from, e.g. "USD" }
+      quote: { type: string, description: Currency to convert to, e.g. "PHP" }
+    required: [base, quote]
+- name: list_calendar_events
+  description: List the user's calendar events on a date (YYYY-MM-DD).
+  parameters:
+    type: object
+    properties:
+      date: { type: string }
+    required: [date]
+- name: create_calendar_event
+  description: Create a calendar event. Only use when the user asks to schedule something.
+  parameters:
+    type: object
+    properties:
+      title: { type: string }
+      date: { type: string, description: YYYY-MM-DD }
+      time: { type: string, description: HH:MM, 24-hour }
+    required: [title, date, time]
+- name: crm_lookup_company
+  description: Look up a company in the CRM by name or by website domain. Returns industry, owner and notes.
+  parameters:
+    type: object
+    properties:
+      name: { type: string }
+      domain: { type: string }
+- name: create_ticket
+  description: Open a support ticket. Only use when the user asks to report or file an issue.
+  parameters:
+    type: object
+    properties:
+      title: { type: string }
+      priority: { type: string, enum: [low, normal, high] }
+      description: { type: string }
+    required: [title, priority]
+- name: search_docs
+  description: Search the internal knowledge base and return the most relevant passages.
+  parameters:
+    type: object
+    properties:
+      query: { type: string }
+    required: [query]

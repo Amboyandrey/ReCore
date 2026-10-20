@@ -1,0 +1,133 @@
+# The orchestrator hands work to the right ask_<name> delegate and uses its answer.
+- id: dl-weather-manila
+  category: delegation
+  prompt: "What's the weather in Manila?"
+  tools: []
+  delegates:
+    - { name: weather_desk, instructions: "You answer weather questions using get_weather.", tools: [get_weather] }
+  expect:
+    calls:
+      - { tool: ask_weather_desk }
+      - { tool: ask_weather_desk/get_weather, args: { city: { contains: manila } } }
+    order: subsequence
+    max_calls: 4
+    answer: { must_contain: ["31"] }
+- id: dl-weather-vienna-f
+  category: delegation
+  prompt: "Ask the weather desk for Vienna's temperature in Fahrenheit."
+  tools: []
+  delegates:
+    - { name: weather_desk, instructions: "You answer weather questions; convert units with convert_units when asked.", tools: [get_weather, convert_units] }
+  expect:
+    calls:
+      - { tool: ask_weather_desk }
+      - { tool: ask_weather_desk/get_weather, args: { city: { contains: vienna } } }
+    order: subsequence
+    max_calls: 5
+    answer: { must_contain: ["53.6"] }
+- id: dl-finance-usd-php
+  category: delegation
+  prompt: "What's the USD to PHP rate today?"
+  tools: []
+  delegates:
+    - { name: finance, instructions: "You answer currency questions with get_exchange_rate.", tools: [get_exchange_rate] }
+  expect:
+    calls:
+      - { tool: ask_finance }
+      - { tool: ask_finance/get_exchange_rate, args: { base: { regex: "(?i)^usd$" } } }
+    order: subsequence
+    max_calls: 4
+    answer: { must_contain: ["57.25"] }
+- id: dl-finance-eur-usd
+  category: delegation
+  prompt: "How many dollars is a euro worth?"
+  tools: []
+  delegates:
+    - { name: finance, instructions: "You answer currency questions with get_exchange_rate.", tools: [get_exchange_rate] }
+  expect:
+    calls:
+      - { tool: ask_finance }
+      - { tool: ask_finance/get_exchange_rate, args: { base: { regex: "(?i)^eur$" } } }
+    order: subsequence
+    max_calls: 4
+    answer: { must_contain: ["1.1"] }
+- id: dl-support-ticket
+  category: delegation
+  prompt: "Get support to file a high priority ticket: users can't log in on the mobile app."
+  tools: []
+  delegates:
+    - { name: support, instructions: "You file support tickets with create_ticket.", tools: [create_ticket] }
+  expect:
+    calls:
+      - { tool: ask_support }
+      - { tool: ask_support/create_ticket, args: { priority: { equals: high } } }
+    order: subsequence
+    max_calls: 4
+    answer: { must_contain: ["SUP-481"] }
+- id: dl-research-vpn
+  category: delegation
+  prompt: "Ask research how employees connect to the VPN."
+  tools: []
+  delegates:
+    - { name: research, instructions: "You answer policy and how-to questions with search_docs.", tools: [search_docs] }
+  expect:
+    calls:
+      - { tool: ask_research }
+      - { tool: ask_research/search_docs, args: { query: { regex: "(?i)vpn" } } }
+    order: subsequence
+    max_calls: 4
+    answer: { must_contain: ["WireGuard"] }
+- id: dl-research-leave
+  category: delegation
+  prompt: "How much paid leave do full-time staff get? Have research check."
+  tools: []
+  delegates:
+    - { name: research, instructions: "You answer policy and how-to questions with search_docs.", tools: [search_docs] }
+  expect:
+    calls:
+      - { tool: ask_research }
+      - { tool: ask_research/search_docs }
+    order: subsequence
+    max_calls: 4
+    answer: { must_contain: ["15"] }
+- id: dl-crm-owner
+  category: delegation
+  prompt: "Who owns the Acme Robotics account?"
+  tools: []
+  delegates:
+    - { name: crm_desk, instructions: "You answer account questions with crm_lookup_company.", tools: [crm_lookup_company] }
+  expect:
+    calls:
+      - { tool: ask_crm_desk }
+      - { tool: ask_crm_desk/crm_lookup_company, args: { name: { contains: acme } } }
+    order: subsequence
+    max_calls: 4
+    answer: { must_contain: ["Dana Cruz"] }
+- id: dl-scheduler-agenda
+  category: delegation
+  prompt: "What's on my calendar on 2026-11-03?"
+  tools: []
+  delegates:
+    - { name: scheduler, instructions: "You read the user's calendar with list_calendar_events.", tools: [list_calendar_events] }
+  expect:
+    calls:
+      - { tool: ask_scheduler }
+      - { tool: ask_scheduler/list_calendar_events, args: { date: { equals: "2026-11-03" } } }
+    order: subsequence
+    max_calls: 4
+    answer: { must_contain: ["Sprint planning"] }
+- id: dl-two-delegates
+  category: delegation
+  prompt: "I'm flying to Tokyo. What's the weather there, and what's the JPY to PHP rate?"
+  tools: []
+  delegates:
+    - { name: weather_desk, instructions: "You answer weather questions using get_weather.", tools: [get_weather] }
+    - { name: finance, instructions: "You answer currency questions with get_exchange_rate.", tools: [get_exchange_rate] }
+  expect:
+    calls:
+      - { tool: ask_weather_desk }
+      - { tool: ask_finance }
+      - { tool: ask_weather_desk/get_weather, args: { city: { contains: tokyo } } }
+      - { tool: ask_finance/get_exchange_rate, args: { base: { regex: "(?i)^jpy$" } } }
+    max_calls: 6
+    answer: { must_contain: ["22", "0.38"], judge: "Reports Tokyo's weather and the JPY to PHP rate together in one coherent answer." }

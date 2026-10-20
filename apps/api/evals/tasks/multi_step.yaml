@@ -1,0 +1,152 @@
+# Several calls where later steps depend on earlier results, including recovery from tool errors.
+- id: ms-warmer-manila-vienna
+  category: multi_step
+  prompt: "Is it warmer in Manila or Vienna right now?"
+  tools: [get_weather, convert_units]
+  expect:
+    calls:
+      - { tool: get_weather, args: { city: { contains: manila } } }
+      - { tool: get_weather, args: { city: { contains: vienna } } }
+    max_calls: 4
+    answer: { must_contain: ["Manila"], judge: "Says Manila is warmer and gives both temperatures (31 C and 12 C)." }
+- id: ms-warmer-tokyo-cebu
+  category: multi_step
+  prompt: "Which is warmer right now, Tokyo or Cebu?"
+  tools: [get_weather]
+  expect:
+    calls:
+      - { tool: get_weather, args: { city: { contains: tokyo } } }
+      - { tool: get_weather, args: { city: { contains: cebu } } }
+    max_calls: 3
+    answer: { must_contain: ["Cebu"], judge: "Says Cebu is warmer and gives both temperatures (30 C and 22 C)." }
+- id: ms-coldest-three
+  category: multi_step
+  prompt: "Of Manila, Vienna and Oslo, which city is coldest right now?"
+  tools: [get_weather]
+  expect:
+    calls:
+      - { tool: get_weather, args: { city: { contains: manila } } }
+      - { tool: get_weather, args: { city: { contains: vienna } } }
+      - { tool: get_weather, args: { city: { contains: oslo } } }
+    max_calls: 4
+    answer: { must_contain: ["Oslo"], judge: "Names Oslo as coldest at about -3 C, consistent with the other two temperatures." }
+- id: ms-manila-fahrenheit
+  category: multi_step
+  prompt: "What's the temperature in Manila in Fahrenheit? Use the converter for the conversion."
+  tools: [get_weather, convert_units]
+  expect:
+    calls:
+      - { tool: get_weather, args: { city: { contains: manila } } }
+      - { tool: convert_units, args: { value: { approx: 31, tol: 0.01 }, to_unit: { contains: fahrenheit } } }
+    order: subsequence
+    max_calls: 4
+    answer: { must_contain: ["87.8"] }
+- id: ms-vienna-fahrenheit
+  category: multi_step
+  prompt: "Tell me Vienna's current temperature in Fahrenheit, converted with the tool."
+  tools: [get_weather, convert_units]
+  expect:
+    calls:
+      - { tool: get_weather, args: { city: { contains: vienna } } }
+      - { tool: convert_units, args: { value: { approx: 12, tol: 0.01 }, to_unit: { contains: fahrenheit } } }
+    order: subsequence
+    max_calls: 4
+    answer: { must_contain: ["53.6"] }
+- id: ms-oslo-fahrenheit
+  category: multi_step
+  prompt: "How cold is Oslo in Fahrenheit? Convert with the tool."
+  tools: [get_weather, convert_units]
+  expect:
+    calls:
+      - { tool: get_weather, args: { city: { contains: oslo } } }
+      - { tool: convert_units, args: { value: { approx: -3, tol: 0.01 }, to_unit: { contains: fahrenheit } } }
+    order: subsequence
+    max_calls: 4
+    answer: { must_contain: ["26.6"] }
+- id: ms-compare-rates
+  category: multi_step
+  prompt: "Which gets me more pesos: 100 USD or 100 EUR? Show both amounts."
+  tools: [get_exchange_rate]
+  expect:
+    calls:
+      - { tool: get_exchange_rate, args: { base: { regex: "(?i)^usd$" }, quote: { regex: "(?i)^php$" } } }
+      - { tool: get_exchange_rate, args: { base: { regex: "(?i)^eur$" }, quote: { regex: "(?i)^php$" } } }
+    max_calls: 3
+    answer: { must_contain: ["EUR"], judge: "Says 100 EUR gives more pesos, with about 6,310 PHP vs about 5,725 PHP." }
+- id: ms-check-then-schedule
+  category: multi_step
+  prompt: "If I'm free on 2026-11-04, schedule 'Lunch with Ana' that day at 12:30."
+  tools: [list_calendar_events, create_calendar_event]
+  expect:
+    calls:
+      - { tool: list_calendar_events, args: { date: { equals: "2026-11-04" } } }
+      - { tool: create_calendar_event, args: { title: { contains: lunch }, date: { equals: "2026-11-04" }, time: { equals: "12:30" } } }
+    order: subsequence
+    max_calls: 3
+    answer: { judge: "Confirms the day was free and the lunch was scheduled at 12:30." }
+- id: ms-crm-then-ticket
+  category: multi_step
+  prompt: "Look up Acme Robotics and open a normal priority ticket to prepare their renewal, mentioning the account owner."
+  tools: [crm_lookup_company, create_ticket]
+  expect:
+    calls:
+      - { tool: crm_lookup_company, args: { name: { contains: acme } } }
+      - { tool: create_ticket, args: { priority: { equals: normal } } }
+    order: subsequence
+    max_calls: 3
+    answer: { must_contain: ["SUP-481"] }
+- id: ms-docs-then-email
+  category: multi_step
+  prompt: "Find our refund policy and email a one-line summary of it to ana@example.com."
+  tools: [search_docs, send_email]
+  expect:
+    calls:
+      - { tool: search_docs, args: { query: { regex: "(?i)refund" } } }
+      - { tool: send_email, args: { to: { equals: ana@example.com }, body: { contains: "30" } } }
+    order: subsequence
+    max_calls: 3
+    answer: { judge: "Confirms the summary email was sent and states the 30-day refund window." }
+- id: ms-calendar-then-email
+  category: multi_step
+  prompt: "Email my agenda for 2026-11-03 to boss@example.com."
+  tools: [list_calendar_events, send_email]
+  expect:
+    calls:
+      - { tool: list_calendar_events, args: { date: { equals: "2026-11-03" } } }
+      - { tool: send_email, args: { to: { equals: boss@example.com }, body: { regex: "(?i)sprint planning" } } }
+    order: subsequence
+    max_calls: 3
+- id: ms-crm-and-docs
+  category: multi_step
+  prompt: "Acme Robotics asked about refunds. Who owns their account, and what's our refund policy?"
+  tools: [crm_lookup_company, search_docs]
+  expect:
+    calls:
+      - { tool: crm_lookup_company, args: { name: { contains: acme } } }
+      - { tool: search_docs, args: { query: { regex: "(?i)refund" } } }
+    max_calls: 3
+    answer: { must_contain: ["Dana Cruz", "30 days"] }
+- id: ms-recover-city-typo
+  category: multi_step
+  prompt: "What's the weather in Manilla?"
+  tools: [get_weather]
+  expect:
+    calls: [{ tool: get_weather, args: { city: { regex: "(?i)^manila" } } }]
+    max_calls: 3
+    answer: { must_contain: ["31"] }
+- id: ms-recover-unit-typo
+  category: multi_step
+  prompt: "Use the converter: 31 celcius to fahrenheit."
+  tools: [convert_units]
+  expect:
+    calls: [{ tool: convert_units, args: { from_unit: { regex: "(?i)^celsius$" }, to_unit: { contains: fahrenheit } } }]
+    max_calls: 3
+    answer: { must_contain: ["87.8"] }
+- id: ms-recover-crm-domain
+  category: multi_step
+  prompt: "Who owns the BluePeak account in the CRM? Their website is bluepeak.io."
+  tools: [crm_lookup_company]
+  expect:
+    calls: [{ tool: crm_lookup_company, args: { domain: { contains: bluepeak.io } } }]
+    max_calls: 3
+    answer: { must_contain: ["Sam Reyes"] }
