@@ -86,8 +86,11 @@ def test_any_order_finds_assignment_regardless_of_order() -> None:
 
 def test_subsequence_allows_gaps_but_not_reordering() -> None:
     task = _task(calls=[_weather("manila"), _weather("vienna")], order="subsequence")
-    gap = [_call("get_weather", {"city": "Manila"}), _call("get_weather", {"city": "Oslo"}),
-           _call("get_weather", {"city": "Vienna"})]
+    gap = [
+        _call("get_weather", {"city": "Manila"}),
+        _call("get_weather", {"city": "Oslo"}),
+        _call("get_weather", {"city": "Vienna"}),
+    ]
     assert score_hard(task, _result(gap)).passed
     reordered = [_call("get_weather", {"city": "Vienna"}), _call("get_weather", {"city": "Manila"})]
     assert not score_hard(task, _result(reordered)).passed
@@ -123,9 +126,9 @@ def test_exhausted_loop_fails_trajectory() -> None:
 
 def test_max_calls_counts_flattened_calls() -> None:
     task = _task(calls=[], max_calls=1)
-    nested = _call("ask_helper", {"task": "x"}, children=[
-        _call("ask_helper/get_weather", {"city": "Manila"})
-    ])
+    nested = _call(
+        "ask_helper", {"task": "x"}, children=[_call("ask_helper/get_weather", {"city": "Manila"})]
+    )
     result = score_hard(task, _result([nested]))
     assert not result.checks["trajectory"]
 
@@ -133,9 +136,9 @@ def test_max_calls_counts_flattened_calls() -> None:
 def test_delegate_children_are_scored_with_prefix() -> None:
     child = {"tool": "ask_helper/get_weather", "args": {"city": {"contains": "manila"}}}
     task = _task(calls=[{"tool": "ask_helper"}, child])
-    nested = _call("ask_helper", {"task": "x"}, children=[
-        _call("ask_helper/get_weather", {"city": "Manila"})
-    ])
+    nested = _call(
+        "ask_helper", {"task": "x"}, children=[_call("ask_helper/get_weather", {"city": "Manila"})]
+    )
     assert [c.name for c in flatten_calls([nested])] == ["ask_helper", "ask_helper/get_weather"]
     assert score_hard(task, _result([nested])).passed
 

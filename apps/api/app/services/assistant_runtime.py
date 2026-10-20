@@ -48,6 +48,23 @@ def delegate_tool_name(name: str, taken: set[str]) -> str:
         suffix += 1
 
 
+def delegate_definition(tool_name: str, assistant_name: str) -> ToolDefinition:
+    """The tool a delegate is offered to the model as — one task string in, the delegate's answer out."""
+    return ToolDefinition(
+        name=tool_name,
+        description=(
+            f'Delegate a task to the "{assistant_name}" assistant and get its answer '
+            "back. Write a complete, self-contained task — it cannot see this "
+            "conversation."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {"task": {"type": "string"}},
+            "required": ["task"],
+        },
+    )
+
+
 @dataclass(frozen=True)
 class DelegateSpec:
     """One assistant this turn's assistant may hand a task to — everything needed to run its own
@@ -132,19 +149,7 @@ async def build_delegate_specs(
             DelegateSpec(
                 assistant_id=delegate.id,
                 tool_name=tool_name,
-                definition=ToolDefinition(
-                    name=tool_name,
-                    description=(
-                        f'Delegate a task to the "{delegate.name}" assistant and get its answer '
-                        "back. Write a complete, self-contained task — it cannot see this "
-                        "conversation."
-                    ),
-                    parameters={
-                        "type": "object",
-                        "properties": {"task": {"type": "string"}},
-                        "required": ["task"],
-                    },
-                ),
+                definition=delegate_definition(tool_name, delegate.name),
                 instructions=delegate.instructions,
                 adapter=adapter,
                 provider=provider,

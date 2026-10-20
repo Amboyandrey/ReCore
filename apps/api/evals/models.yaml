@@ -1,0 +1,26 @@
+# Models under test and the judge. key_env names an env var holding the key; never put keys here.
+# Prices are USD per 1M tokens, used only for the report's cost columns; check them against each provider's page.
+models:
+  - id: gpt-oss-120b
+    provider: openai_compatible
+    provider_model_id: openai/gpt-oss-120b
+    base_url: https://api.tokenfactory.nebius.com/v1/
+    key_env: EVAL_KEY_NEBIUS
+    cost_per_mtok_in: 0.15
+    cost_per_mtok_out: 0.60
+  - id: qwen3-27b
+    provider: openai_compatible
+    provider_model_id: qwen/qwen3.8-27b
+    base_url: https://api.groq.com/openai/v1
+    key_env: EVAL_KEY_GROQ
+    cost_per_mtok_in: 0.29
+    cost_per_mtok_out: 0.59
+judge:
+  id: deepseek-v3-judge
+  provider: openai_compatible
+  # Confirm this id against GET /v1/models on Nebius before the first record run.
+  provider_model_id: deepseek-ai/DeepSeek-V3-0324
+  base_url: https://api.tokenfactory.nebius.com/v1/
+  key_env: EVAL_KEY_NEBIUS
+  cost_per_mtok_in: 0.50
+  cost_per_mtok_out: 1.50
