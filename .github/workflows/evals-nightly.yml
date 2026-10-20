@@ -1,0 +1,57 @@
+name: Evals nightly
+
+on:
+  schedule:
+    - cron: "0 18 * * *" # 02:00 Asia/Manila
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/api
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: recore
+          POSTGRES_PASSWORD: recore
+          POSTGRES_DB: recore
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U recore"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://recore:recore@localhost:5432/recore
+      REDIS_URL: redis://localhost:6379/0
+      # CI-only key, fine to commit — wraps provider-credential data keys (see .env.example).
+      MASTER_KEY: BpiLXgRyl3uYpRm32mG0+1lcq+BvToj7jg0XIuaENWA=
+      STORAGE_DIR: /tmp/recore-attachments
+      EVAL_KEY_NEBIUS: ${{ secrets.EVAL_KEY_NEBIUS }}
+      EVAL_KEY_GROQ: ${{ secrets.EVAL_KEY_GROQ }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+      - run: uv sync
+      - run: uv run python -m app.evals run --mode live --k 3
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-report
+          path: apps/api/evals/out/

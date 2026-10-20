@@ -780,7 +780,7 @@ Named here so nobody hunts for them or assumes they're half-finished:
 
 ## 23. Testing
 
-481 pytest tests run against a real Postgres and Redis — never mocks of them. `conftest.py` forces
+547 pytest tests run against a real Postgres and Redis — never mocks of them. `conftest.py` forces
 a separate `_test`-suffixed database and Redis index before any app code loads, so running the
 suite can't touch data a dev stack is using. `FakeProvider` implements both the chat and embedding
 protocols, which is what makes the whole chat pipeline, plus ReStore's indexing/retrieval and
@@ -806,3 +806,19 @@ a provider key.
 
 CI runs `ruff`, `mypy app`, `pytest` on the API and `eslint`, `tsc --noEmit`, `next build` on the
 web app, on every push and pull request.
+
+## 24. Agent evals and tracing
+
+`app/evals/` builds an in-memory `AssistantTurn` per YAML task and runs it through the same
+`run_assistant_task` a workflow step uses, so what is scored is the production loop, not a copy.
+Tools are ordinary HTTP tools whose URLs point at an in-process fixture app reached through
+`http_tool`'s transport seam; the SSRF guard is stubbed only inside the eval process, since no
+request leaves it. Every `LLMProvider` is wrapped by a recording or replaying cassette keyed on a
+hash of the exact request, which is what lets PR CI replay all four adapters deterministically and
+without keys; a request with no recording is a `cassette_miss` and fails the gate rather than
+silently going live.
+
+Tracing nests a `gen_ai.chat` span per provider round trip and a `gen_ai.execute_tool` span per
+tool call under each generation, with GenAI semantic-convention attributes and never any prompt,
+argument or result text. Spans export over OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set
+(`infra/docker-compose.tracing.yml` runs Jaeger locally) and to stdout otherwise.

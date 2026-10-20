@@ -47,6 +47,14 @@ jobs:
       - run: uv run ruff check .
       - run: uv run mypy app
       - run: uv run pytest -q
+      - name: Agent eval gate (replay, no secrets)
+        # Inactive until a recorded baseline is committed; see docs/evals/README.md.
+        run: |
+          if [ -f evals/baseline.json ]; then
+            uv run python -m app.evals gate --mode replay
+          else
+            echo "No evals/baseline.json yet; skipping the eval gate."
+          fi
 
   web:
     runs-on: ubuntu-latest

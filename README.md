@@ -205,6 +205,22 @@ script's own docstring for what it found the first time it was run):
 cd apps/api && uv run python -m app.scripts.load_test
 ```
 
+## Agent evals
+
+60 golden tasks run through the real agent loop (`run_assistant_task`) on any provider ReCore
+supports, covering tool selection, multi-step chains with error recovery, delegation, prompt
+injection from tool results, and questions that need no tool. Each run is scored on tool choice,
+arguments, call order and budget, and the final answer, with an LLM judge for free-text rubrics
+that only counts once it agrees with hand labels (Cohen's kappa of at least 0.6).
+
+Model responses are recorded once and replayed in CI, so the gate needs no secrets; a nightly job
+runs the suite live three times per task and reports pass@1, pass^3, cost and latency. See
+[`docs/evals/README.md`](docs/evals/README.md) for how to record, calibrate and read the report.
+
+```bash
+cd apps/api && uv run python -m app.evals gate --mode replay
+```
+
 CI runs the same API and web checks on every push and pull request.
 
 ## Security
