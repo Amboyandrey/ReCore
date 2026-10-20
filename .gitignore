@@ -38,3 +38,6 @@ apps/web/blob-report/
 
 # Locally uploaded attachments (apps/api's default STORAGE_DIR when run outside Docker)
 apps/api/uploads/
+
+# Eval run output; the committed sample report lives in docs/evals/
+apps/api/evals/out/
