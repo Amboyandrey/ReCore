@@ -90,3 +90,19 @@ async def test_gate_reports_misses_without_cassettes(evals_dir: Path) -> None:
     assert await amain(["gate", "--evals-dir", str(evals_dir)]) == 1
     report = (evals_dir / "out" / "report.md").read_text()
     assert "cassette_miss" in report
+
+
+async def test_live_run_checks_every_key_before_any_call(
+    evals_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    judge_line = MODELS.index("judge:")
+    models = MODELS[:judge_line] + MODELS[judge_line:].replace("EVAL_KEY_TEST", "EVAL_KEY_JUDGE", 1)
+    (evals_dir / "models.yaml").write_text(models)
+    monkeypatch.delenv("EVAL_KEY_JUDGE", raising=False)
+    called: list[str] = []
+    monkeypatch.setattr(
+        models_config, "build_provider", lambda *a, **k: called.append("x") or _Weather(VALID_KEY)
+    )
+    assert await amain(["run", "--mode", "live", "--evals-dir", str(evals_dir)]) == 2
+    assert not called
+    assert not (evals_dir / "out" / "results.json").exists()

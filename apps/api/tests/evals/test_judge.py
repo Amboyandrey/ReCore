@@ -138,3 +138,47 @@ async def test_run_task_fails_on_judge_fail_and_errors_on_no_verdict(
     if status == "fail":
         assert run.checks["judge"] is False
         assert any("vague" in r for r in run.reasons)
+
+
+async def test_grade_returns_none_when_the_adapter_raises() -> None:
+    class _Raises(FakeProvider):
+        async def stream(self, **kwargs: Any) -> AsyncIterator[Chunk]:  # type: ignore[override]
+            raise TimeoutError("judge read timeout")
+            yield  # pragma: no cover
+
+    assert await Judge(_Raises(api_key=VALID_KEY), SPEC).grade(prompt="p", rubric="r", answer="a") is None
+
+
+async def test_missing_judge_cassette_reports_cassette_miss(
+    monkeypatch: pytest.MonkeyPatch, redis_client: Redis, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("EVAL_KEY_TEST", VALID_KEY)
+    monkeypatch.setattr(
+        models_config, "build_provider", lambda provider, api_key, base_url: _Weather(api_key)
+    )
+    task = Task.model_validate(
+        {
+            "id": "j2",
+            "category": "tool_selection",
+            "prompt": "Weather in Manila?",
+            "tools": ["get_weather"],
+            "expect": {
+                "calls": [{"tool": "get_weather"}],
+                "max_calls": 2,
+                "answer": {"judge": "Gives a temp."},
+            },
+        }
+    )
+    judge_spec = SPEC.model_copy(update={"id": "judge"})
+    common: dict[str, Any] = {
+        "spec": SPEC,
+        "rep": 0,
+        "catalog": CATALOG,
+        "redis": redis_client,
+        "cassette_dir": tmp_path,
+    }
+    with FixtureTools({"default": {"get_weather": [FixtureRule(body="31C")]}}):
+        recorded = await run_task(task, mode="record", **common)
+        replayed = await run_task(task, mode="replay", judge_spec=judge_spec, **common)
+    assert recorded.status == "pass"
+    assert replayed.status == "cassette_miss"

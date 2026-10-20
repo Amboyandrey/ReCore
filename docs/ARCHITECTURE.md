@@ -780,7 +780,7 @@ Named here so nobody hunts for them or assumes they're half-finished:
 
 ## 23. Testing
 
-547 pytest tests run against a real Postgres and Redis — never mocks of them. `conftest.py` forces
+553 pytest tests run against a real Postgres and Redis — never mocks of them. `conftest.py` forces
 a separate `_test`-suffixed database and Redis index before any app code loads, so running the
 suite can't touch data a dev stack is using. `FakeProvider` implements both the chat and embedding
 protocols, which is what makes the whole chat pipeline, plus ReStore's indexing/retrieval and

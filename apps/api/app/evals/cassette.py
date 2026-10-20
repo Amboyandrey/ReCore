@@ -112,6 +112,10 @@ class RecordingProvider:
             ):
                 chunks.append(chunk)
                 yield chunk
+        except Exception as exc:
+            # Replay then ends the stream the same way the agent loop saw it end: as a failure.
+            chunks.append(StreamError(message=f"{type(exc).__name__}: {exc}"))
+            raise
         finally:
             # Written even when the consumer stops early, so replay reproduces exactly what it saw.
             self._path.parent.mkdir(parents=True, exist_ok=True)

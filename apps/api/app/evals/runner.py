@@ -29,17 +29,31 @@ async def run_matrix(
 
     async def one(task: Task, spec: ModelSpec, rep: int) -> TaskRun:
         async with semaphore:
-            return await run_task(
-                task,
-                spec=spec,
-                mode=mode,
-                rep=rep,
-                catalog=catalog,
-                redis=redis,
-                cassette_dir=cassette_dir,
-                judge_spec=judge_spec,
-                judge_counts=judge_counts,
-            )
+            try:
+                return await guarded(task, spec, rep)
+            except Exception as exc:  # noqa: BLE001 — one broken job must not discard the whole matrix
+                reason = f"harness error: {type(exc).__name__}: {exc}"
+                return TaskRun(
+                    task_id=task.id,
+                    category=task.category,
+                    model_id=spec.id,
+                    rep=rep,
+                    status="error",
+                    reasons=[reason],
+                )
+
+    async def guarded(task: Task, spec: ModelSpec, rep: int) -> TaskRun:
+        return await run_task(
+            task,
+            spec=spec,
+            mode=mode,
+            rep=rep,
+            catalog=catalog,
+            redis=redis,
+            cassette_dir=cassette_dir,
+            judge_spec=judge_spec,
+            judge_counts=judge_counts,
+        )
 
     jobs = [one(task, spec, rep) for spec in models for task in tasks for rep in range(reps)]
     return list(await asyncio.gather(*jobs))

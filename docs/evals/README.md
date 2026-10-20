@@ -34,14 +34,15 @@ All commands run from `apps/api` with Postgres and Redis up (`docker compose -f 
    ```
 
 4. Calibrate the judge: `uv run python -m app.evals calibrate --mode record`. If kappa is below 0.6, tighten the rubrics or `JUDGE_PROMPT` in `app/evals/judge.py` and re-run.
-5. Write the baseline: `uv run python -m app.evals baseline --from evals/out/results.json --kappa <kappa>`.
+5. Write the baseline: `uv run python -m app.evals baseline --from evals/out/results.json --kappa <kappa>`. With kappa at 0.6 or above, judge failures recorded in step 2 count as failures in the baseline, matching how the gate will score them.
 6. Check the gate: `uv run python -m app.evals gate --mode replay` exits 0. Copy `evals/out/report.md` to `docs/evals/report.md` and commit cassettes, labels, baseline and report together.
 
 ## Day to day
 
 - A change that alters anything sent to the model (prompts, tool definitions, loop behaviour) causes `cassette_miss`. Re-record the affected tasks (`--category`, `--models`) and commit the new cassettes in the same PR.
 - Raising or lowering `baseline.json` is a deliberate, reviewed change.
-- The nightly workflow (`.github/workflows/evals-nightly.yml`) runs live with `--k 3` and uploads the report as an artifact; add `EVAL_KEY_NEBIUS` and `EVAL_KEY_GROQ` as repository secrets first.
+- The nightly workflow (`.github/workflows/evals-nightly.yml`) runs live with `--k 3`, gated against the baseline so drift shows as a failed (non-blocking) job, and uploads the report as an artifact; add `EVAL_KEY_NEBIUS` and `EVAL_KEY_GROQ` as repository secrets first.
+- Live and record runs check every needed key env var before making any call, and exit 2 naming the missing ones.
 
 ## Reading the report
 

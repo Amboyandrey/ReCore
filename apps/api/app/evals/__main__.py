@@ -15,14 +15,11 @@ from app.evals.execute import TaskRun
 from app.evals.fixtures import FixtureTools, load_fixtures
 from app.evals.judge import Judge, calibration_stats, load_labels
 from app.evals.models_config import Mode, build_adapter, load_models
-from app.evals.report import baseline_from, gate, load_baseline, load_runs, write_results
+from app.evals.report import MIN_JUDGE_KAPPA, baseline_from, gate, load_baseline, load_runs, write_results
 from app.evals.runner import run_matrix
 from app.evals.tasks import load_tasks, load_tool_catalog
 
 EVALS_DIR = Path(__file__).resolve().parents[2] / "evals"
-
-# The judge's verdicts only count toward pass/fail once calibration shows it agrees with humans this well.
-MIN_JUDGE_KAPPA = 0.6
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -46,6 +43,16 @@ def _parser() -> argparse.ArgumentParser:
     for p in sub.choices.values():
         p.add_argument("--evals-dir", type=Path, default=EVALS_DIR)
     return parser
+
+
+def _missing_keys(args: argparse.Namespace) -> list[str]:
+    """Env vars a live or record run needs but lacks, checked before any paid call is made."""
+    if args.mode == "replay":
+        return []
+    config = load_models(args.evals_dir / "models.yaml")
+    wanted = set(args.models.split(",")) if args.models else None
+    specs = [m for m in config.models if wanted is None or m.id in wanted] + [config.judge]
+    return sorted({s.key_env for s in specs if not os.environ.get(s.key_env)})
 
 
 async def _run(args: argparse.Namespace) -> list[TaskRun]:
@@ -119,6 +126,10 @@ async def amain(argv: list[str]) -> int:
         return 0
     if args.command == "calibrate":
         return await _calibrate(args)
+    missing = _missing_keys(args)
+    if missing:
+        print(f"{args.command}: set {', '.join(missing)} before a {args.mode} run")
+        return 2
     if args.command == "gate" and not (args.evals_dir / "baseline.json").exists():
         print("gate: no baseline.json; record a run and write one with the baseline command first")
         return 1

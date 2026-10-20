@@ -1,5 +1,6 @@
 """Record/replay cassettes — keyed on the exact request, replaying chunks byte for byte."""
 
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ from app.providers.base import (
     ChatMessage,
     Chunk,
     ImagePart,
+    StreamError,
     TextDelta,
     ToolCall,
     ToolCallRequest,
@@ -75,3 +77,18 @@ async def test_cassette_never_contains_the_api_key(tmp_path: Path) -> None:
     path = tmp_path / "t.jsonl"
     await _collect(RecordingProvider(FakeProvider(api_key=VALID_KEY), path), _messages())
     assert VALID_KEY not in path.read_text()
+
+
+async def test_an_exception_while_recording_replays_as_a_stream_error(tmp_path: Path) -> None:
+    class _Dies(FakeProvider):
+        async def stream(self, **kwargs: object) -> AsyncIterator[Chunk]:  # type: ignore[override]
+            yield TextDelta(text="partial ")
+            raise ConnectionError("connection reset")
+
+    path = tmp_path / "t.jsonl"
+    with pytest.raises(ConnectionError):
+        await _collect(RecordingProvider(_Dies(api_key=VALID_KEY), path), _messages())
+    replayed = await _collect(ReplayProvider(path), _messages())
+    assert replayed[0] == TextDelta(text="partial ")
+    assert isinstance(replayed[-1], StreamError)
+    assert "connection reset" in replayed[-1].message

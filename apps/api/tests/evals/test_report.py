@@ -106,3 +106,11 @@ def test_report_md_lists_failures_with_reasons(tmp_path: Path) -> None:
     data = json.loads((tmp_path / "results.json").read_text())
     assert data["run"]["mode"] == "replay"
     assert len(data["results"]) == 2
+
+
+def test_baseline_counts_judge_failures_once_kappa_is_trusted() -> None:
+    judged = _run("a")
+    judged.checks = {"judge": False}
+    runs = [judged, _run("b")]
+    assert baseline_from(runs, kappa=0.7).models["m"].categories["tool_selection"] == 0.5
+    assert baseline_from(runs, kappa=0.5).models["m"].categories["tool_selection"] == 1.0

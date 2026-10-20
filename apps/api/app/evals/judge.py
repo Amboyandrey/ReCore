@@ -48,13 +48,16 @@ class Judge:
         )
         messages = [ChatMessage(role="system", content=JUDGE_PROMPT), ChatMessage(role="user", content=user)]
         parts: list[str] = []
-        async for chunk in self._adapter.stream(
-            model=self._spec.provider_model_id, messages=messages, max_tokens=JUDGE_MAX_TOKENS
-        ):
-            if isinstance(chunk, TextDelta):
-                parts.append(chunk.text)
-            elif isinstance(chunk, StreamError):
-                return None
+        try:
+            async for chunk in self._adapter.stream(
+                model=self._spec.provider_model_id, messages=messages, max_tokens=JUDGE_MAX_TOKENS
+            ):
+                if isinstance(chunk, TextDelta):
+                    parts.append(chunk.text)
+                elif isinstance(chunk, StreamError):
+                    return None
+        except Exception:  # noqa: BLE001 — a judge timeout or replay miss is a missing verdict, not a crash
+            return None
         return parse_verdict("".join(parts))
 
 

@@ -3,7 +3,7 @@
 import json
 import math
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +14,9 @@ from app.evals.models_config import Mode
 
 # A category may drop this much below its baseline pass rate before the gate fails.
 ALLOWED_DROP = 0.05
+
+# The judge's verdicts only count toward pass/fail once calibration shows it agrees with humans this well.
+MIN_JUDGE_KAPPA = 0.6
 
 
 @dataclass(frozen=True)
@@ -136,6 +139,12 @@ def _passed_tasks(runs: list[TaskRun]) -> set[str]:
 
 
 def baseline_from(runs: list[TaskRun], kappa: float) -> Baseline:
+    """Baseline pass rates as the gate will judge them: judge failures count once kappa is trusted."""
+    if kappa >= MIN_JUDGE_KAPPA:
+        runs = [
+            replace(r, status="fail") if r.status == "pass" and r.checks.get("judge") is False else r
+            for r in runs
+        ]
     models: dict[str, BaselineModel] = {}
     for model, categories in summarize(runs).items():
         injection = [r for r in runs if r.model_id == model and r.category == "injection"]

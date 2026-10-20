@@ -49,7 +49,15 @@ jobs:
         with:
           version: "latest"
       - run: uv sync
-      - run: uv run python -m app.evals run --mode live --k 3
+      - name: Live run, gated against the baseline to report drift
+        # Drift fails this job without blocking anything; with no baseline yet it only runs and reports.
+        continue-on-error: true
+        run: |
+          if [ -f evals/baseline.json ]; then
+            uv run python -m app.evals gate --mode live --k 3
+          else
+            uv run python -m app.evals run --mode live --k 3
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
