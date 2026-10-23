@@ -53,7 +53,7 @@ from app.services.assistants import create_assistant
 from app.services.attachments import save_attachment
 from app.services.flags import set_override
 from app.services.workflows import StepInput, create_workflow, start_run
-from app.workers.run_workflow import run_workflow
+from app.workers.run_workflow import WORKFLOW_STEP_MAX_TOKENS, run_workflow
 
 
 class ErrorFakeProvider(FakeProvider):
@@ -70,6 +70,25 @@ class ErrorFakeProvider(FakeProvider):
         del model, max_tokens, tools
         self.last_messages = messages
         yield StreamError(message="the provider disconnected")
+
+
+class TruncatingFakeProvider(FakeProvider):
+    """Stops mid-answer at the output limit, reporting whichever finish reason FINISH_REASON names."""
+
+    FINISH_REASON = "length"
+
+    async def stream(
+        self,
+        *,
+        model: str,
+        messages: Sequence[ChatMessage],
+        max_tokens: int,
+        tools: Sequence[ToolDefinition] = (),
+    ) -> AsyncIterator[Chunk]:
+        del model, tools
+        self.last_messages, self.last_max_tokens = messages, max_tokens
+        yield TextDelta(text="| Barcode | Description |\n| 20000000")
+        yield Done(finish_reason=self.FINISH_REASON)
 
 
 class DelegatingFakeProvider(FakeProvider):
@@ -585,3 +604,33 @@ async def test_a_scanned_pdf_needs_a_vision_model_and_reaches_it_as_page_images(
     first_user_turn = next(m for m in builder.built[0].last_messages if m.role == "user")
     assert [image.mime for image in first_user_turn.images] == ["image/jpeg"]
 
+
+@pytest.mark.parametrize("finish_reason", ["length", "max_tokens", "MAX_TOKENS"])
+async def test_a_step_cut_off_at_the_output_limit_fails_instead_of_feeding_the_next_step(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch, finish_reason: str
+) -> None:
+    """A half-written answer must never reach a later step as if it were complete, whichever
+    provider's wording (OpenAI-compatible, Anthropic, Google) the cut-off arrives in."""
+    providers: list[TruncatingFakeProvider] = []
+
+    def _build(provider: Provider, *, api_key: str, base_url: str | None) -> FakeProvider:
+        fake = TruncatingFakeProvider(api_key=api_key)
+        fake.FINISH_REASON = finish_reason
+        providers.append(fake)
+        return fake
+
+    monkeypatch.setattr("app.workers.run_workflow.build_provider", _build)
+    user, workspace, model, workflow = await _two_step_workflow(db)
+    run = await start_run(
+        db, workspace_id=workspace.id, workflow=workflow, trigger=WorkflowTrigger.MANUAL,
+        run_input="Compare these", started_by=user.id,
+    )
+    await db.commit()
+
+    await run_workflow({}, str(run.id), str(workspace.id))
+    steps = await _refresh_run_and_steps(db, run)
+    assert run.status == WorkflowRunStatus.FAILED
+    assert steps[0].status == WorkflowStepStatus.FAILED
+    assert steps[0].error is not None and "cut off" in steps[0].error
+    assert steps[1].status == WorkflowStepStatus.SKIPPED
+    assert providers[0].last_max_tokens == WORKFLOW_STEP_MAX_TOKENS

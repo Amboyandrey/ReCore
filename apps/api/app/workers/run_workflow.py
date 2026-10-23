@@ -45,6 +45,9 @@ from app.workflows.template import references_input, render
 # possibly including a delegation) — generous relative to a single chat turn's own headroom,
 # since nothing here is a person waiting in real time for a reply.
 WORKFLOW_STEP_TIMEOUT_SECONDS = 600
+# Larger than chat's own cap: a step's whole answer feeds the next step, and reasoning models
+# spend part of this budget thinking before they write anything visible.
+WORKFLOW_STEP_MAX_TOKENS = 16384
 # Trimmed before going into the event stream — a step's full output is always in the database;
 # this is only what a live viewer sees scroll by before the run detail page refetches the row.
 _EVENT_PREVIEW_CHARS = 2000
@@ -196,9 +199,15 @@ async def run_workflow(ctx: dict[str, Any], run_id: str, workspace_id: str) -> N
                             task=prompt,
                             emit_deltas=False,
                             attachments=step_attachments,
+                            max_tokens=WORKFLOW_STEP_MAX_TOKENS,
                         )
                     if result.error_message:
                         raise ValueError(result.error_message)
+                    if result.truncated:
+                        raise ValueError(
+                            f"The model's answer was cut off at the {WORKFLOW_STEP_MAX_TOKENS}-token "
+                            "output limit, so later steps were not run on an incomplete result."
+                        )
                 except TimeoutError:
                     error_message = (
                         f"Step timed out after {WORKFLOW_STEP_TIMEOUT_SECONDS} seconds."

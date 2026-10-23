@@ -82,6 +82,8 @@ from app.tools.execute import MAX_RESULT_CHARS, execute_tool
 tracer = get_tracer(__name__)
 
 MAX_TOKENS = 4096
+# How each provider says it stopped at the output limit: OpenAI-compatible, Anthropic, Google.
+_TRUNCATED_FINISH_REASONS = frozenset({"length", "max_tokens", "MAX_TOKENS"})
 TITLE_MAX_LENGTH = 60
 
 # A model that keeps calling tools forever is a billing runaway, not a feature — this bounds one
@@ -606,6 +608,11 @@ class _LoopResult:
     stopped: bool
     invocations: list[_ToolInvocationRecord]
 
+    @property
+    def truncated(self) -> bool:
+        """Whether the answer was cut off at the output limit rather than finished."""
+        return self.finish_reason in _TRUNCATED_FINISH_REASONS
+
 
 async def _run_delegation(ctx: _LoopContext, call: ToolCall, spec: DelegateSpec) -> _ToolInvocationRecord:
     """Run one delegate end to end: recall its own memory if it has any, run its own tool-calling
@@ -810,6 +817,7 @@ async def _run_tool_loop(
     delegates_by_name: dict[str, DelegateSpec],
     emit_deltas: bool,
     name_prefix: str = "",
+    max_tokens: int = MAX_TOKENS,
 ) -> _LoopResult:
     """Drive the provider round-trip / tool-call cycle to a final answer, up to
     MAX_TOOL_ITERATIONS times. Used both for the outer generation's own turn (`emit_deltas=True`,
@@ -842,7 +850,7 @@ async def _run_tool_loop(
             requested_calls: tuple[ToolCall, ...] = ()
             iteration_text: list[str] = []
             stream = adapter.stream(
-                model=provider_model_id, messages=history, max_tokens=MAX_TOKENS, tools=tool_definitions
+                model=provider_model_id, messages=history, max_tokens=max_tokens, tools=tool_definitions
             )
             async for chunk in stream:
                 if await ctx.stop.check():
@@ -909,6 +917,7 @@ async def run_assistant_task(
     task: str,
     emit_deltas: bool,
     attachments: Sequence[Attachment] = (),
+    max_tokens: int = MAX_TOKENS,
 ) -> _LoopResult:
     """Run one assistant turn to a final answer outside of chat entirely — what
     workers/run_workflow.py calls once per step, on an AssistantTurn already resolved by
@@ -949,6 +958,7 @@ async def run_assistant_task(
             tools_by_name={t.name: t for t in turn.tools},
             delegates_by_name={d.tool_name: d for d in turn.delegates},
             emit_deltas=emit_deltas,
+            max_tokens=max_tokens,
         )
     finally:
         # Unlike _run_generation (whose task, and everything it opened, is garbage-collected the

@@ -537,6 +537,9 @@ code-execution surface.
   `{{input}}`, through the exact same code path a chat message's own attachments take (§15) —
   extracted text folded into the prompt, images as native image parts. A step whose model can't
   see images fails with that reason rather than silently dropping them.
+- **A cut-off answer fails its step.** Steps get a 16384-token output budget (chat keeps 4096,
+  since a reasoning model spends part of it thinking), and a reply that stops at that limit fails
+  the step instead of passing a half-written result to the next one.
 - **An inbound webhook per workflow.** Enabling it mints a `webhook_secret`; the public URL
   `POST /hooks/workflows/{workspace_id}/{secret}` starts a run with no session and no CSRF —
   possession of the URL is the credential, the same model an invitation link follows. The
