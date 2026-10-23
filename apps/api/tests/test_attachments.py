@@ -20,9 +20,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.models import FeatureFlag, FlagScope, Role, User, WorkspaceMember
+from app.models import Attachment, FeatureFlag, FlagScope, Role, User, WorkspaceMember
 from app.providers.fake import VALID_KEY, FakeProvider
-from app.services.attachments import MAX_IMAGE_DIMENSION
+from app.services.attachments import MAX_IMAGE_DIMENSION, MAX_SCANNED_PDF_PAGES, read_attachment_images
 from app.services.flags import set_override
 
 
@@ -68,6 +68,14 @@ def _minimal_pdf(text: bytes) -> bytes:
         out += f"{off:010} 00000 n \n".encode()
     out += f"trailer<</Size {len(objects) + 1}/Root 1 0 R>>\nstartxref\n{xref_offset}\n%%EOF".encode()
     return bytes(out)
+
+
+def _scanned_pdf(pages: int = 1) -> bytes:
+    """An image-only PDF, the shape a scanner or phone scanning app produces — no text layer at all."""
+    images = [Image.new("RGB", (1240, 1754), color=(255, 255, 255)) for _ in range(pages)]
+    buffer = BytesIO()
+    images[0].save(buffer, format="PDF", save_all=True, append_images=images[1:])
+    return buffer.getvalue()
 
 
 def _minimal_docx(paragraphs: list[str]) -> bytes:
@@ -286,13 +294,16 @@ async def test_uploading_a_pdf_extracts_its_text(
     assert body["extract_status"] == "done"
     assert body["extracted_text"] is not None
     assert "Hello PDF" in body["extracted_text"]
+    attachment = await db.get(Attachment, uuid.UUID(body["id"]))
+    assert attachment is not None
+    assert read_attachment_images(attachment) == []  # a text PDF is never also rendered
 
 
-async def test_a_pdf_with_no_extractable_text_is_marked_failed(
+async def test_a_pdf_with_no_text_layer_is_sent_as_images(
     client: AsyncClient, db: AsyncSession, redis_client: Redis
 ) -> None:
-    """A blank page (the shape a scanned/image-only PDF takes to a text extractor) fails clearly,
-    not silently — there's a real difference between 'no attachment' and 'nothing to read'."""
+    """A blank page (the shape a scanned/image-only PDF takes to a text extractor) is rendered for
+    a vision model instead of failing — the page itself is what the model needs to read."""
     workspace_id, model_id = await _workspace_with_model(client)
     await _enable_attachments(db, redis_client, workspace_id=workspace_id)
     conversation_id = (
@@ -307,6 +318,79 @@ async def test_a_pdf_with_no_extractable_text_is_marked_failed(
     response = await client.post(
         f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/attachments",
         files={"file": ("blank.pdf", buffer.getvalue(), "application/pdf")},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["extract_status"] == "passthrough"
+    assert body["extracted_text"] is None
+
+
+async def test_a_scanned_pdf_is_rendered_to_page_images(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    """Each page becomes its own downscaled JPEG, while the stored file stays the original PDF."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    await _enable_attachments(db, redis_client, workspace_id=workspace_id)
+    conversation_id = (
+        await client.post(f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id})
+    ).json()["id"]
+
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/attachments",
+        files={"file": ("invoice.pdf", _scanned_pdf(2), "application/pdf")},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["extract_status"] == "passthrough"
+    assert body["mime"] == "application/pdf"
+    assert body["extracted_text"] is None
+    attachment = await db.get(Attachment, uuid.UUID(body["id"]))
+    assert attachment is not None
+    images = read_attachment_images(attachment)
+    assert [image.mime for image in images] == ["image/jpeg", "image/jpeg"]
+    assert max(Image.open(BytesIO(images[0].data)).size) <= MAX_IMAGE_DIMENSION
+
+
+async def test_a_scanned_pdf_over_the_page_cap_keeps_the_first_pages_and_says_so(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    """Pages past the cap are dropped visibly, so the model knows it isn't seeing the whole file."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    await _enable_attachments(db, redis_client, workspace_id=workspace_id)
+    conversation_id = (
+        await client.post(f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id})
+    ).json()["id"]
+    total = MAX_SCANNED_PDF_PAGES + 2
+
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/attachments",
+        files={"file": ("long.pdf", _scanned_pdf(total), "application/pdf")},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["extract_status"] == "passthrough"
+    assert f"first {MAX_SCANNED_PDF_PAGES} of {total} pages" in body["extracted_text"]
+    attachment = await db.get(Attachment, uuid.UUID(body["id"]))
+    assert attachment is not None
+    assert len(read_attachment_images(attachment)) == MAX_SCANNED_PDF_PAGES
+
+
+async def test_a_corrupt_pdf_is_marked_failed(
+    client: AsyncClient, db: AsyncSession, redis_client: Redis
+) -> None:
+    """A file neither pypdf nor the renderer can open still uploads, failed with a reason."""
+    workspace_id, model_id = await _workspace_with_model(client)
+    await _enable_attachments(db, redis_client, workspace_id=workspace_id)
+    conversation_id = (
+        await client.post(f"/api/v1/workspaces/{workspace_id}/conversations", json={"model_id": model_id})
+    ).json()["id"]
+
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/conversations/{conversation_id}/attachments",
+        files={"file": ("broken.pdf", b"%PDF-1.4 not really a pdf", "application/pdf")},
     )
 
     assert response.status_code == 201

@@ -564,7 +564,9 @@ a run's input (gated by `workflows`, see §14) — exactly one of `conversation_
 set, enforced by a CHECK constraint. Text-bearing formats (PDF, DOCX, PPTX,
 XLSX, plain text) are extracted on upload and folded into the turn's context with a visible
 `[Attached file: name]` marker, so the model's context is never a mystery to the user. Images are
-normalized (HEIC/HEIF included, via pillow-heif) and passed through as native image parts.
+normalized (HEIC/HEIF included, via pillow-heif) and passed through as native image parts. A PDF
+with no text layer (a scan) is rendered page by page with pypdfium2, up to five pages, and sent
+the same way; the original PDF is what's stored and downloaded, its pages saved beside it.
 
 Two details worth keeping:
 

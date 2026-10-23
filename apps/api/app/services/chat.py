@@ -62,7 +62,7 @@ from app.providers.base import (
 from app.providers.registry import build_provider
 from app.services.assistant_runtime import AssistantTurn, DelegateSpec, prepare_assistant_turn
 from app.services.assistants import get_assistant
-from app.services.attachments import attach_to_message, read_attachment_bytes, save_tool_image
+from app.services.attachments import attach_to_message, read_attachment_images, save_tool_image
 from app.services.credentials import decrypt_credential_key, get_credential
 from app.services.flags import evaluate_flag
 from app.services.generations import (
@@ -305,8 +305,8 @@ def _augment_with_attachments(
     for attachment in attachments:
         if attachment.extracted_text:
             parts.append(f"[Attached file: {attachment.original_filename}]\n{attachment.extracted_text}")
-        elif attachment.extract_status == ExtractStatus.PASSTHROUGH:
-            images.append(ImagePart(mime=attachment.mime, data=read_attachment_bytes(attachment)))
+        # Not elif: a scanned PDF past the page cap carries both a note and its page images.
+        images.extend(read_attachment_images(attachment))
     return "\n\n".join(parts), tuple(images)
 
 

@@ -13,6 +13,12 @@ export const EXTRACT_STATUS_LABEL: Record<Attachment["extract_status"], string> 
   failed: "couldn't be read",
 };
 
+// A scanned PDF is also passthrough, but it reaches the model as rendered pages, not as itself.
+export function statusLabel(a: Attachment): string {
+  if (a.extract_status === "passthrough" && a.mime === "application/pdf") return "sent as page images";
+  return EXTRACT_STATUS_LABEL[a.extract_status];
+}
+
 // Whether any of these (not-yet-sent) attachments would be silently dropped by the current
 // model — an image, and the model doesn't accept images.
 export function hasBlockedImage(attachments: Attachment[], modelSupportsVision: boolean): boolean {
@@ -47,7 +53,7 @@ export function PendingAttachmentChips({
           >
             <span className="max-w-[12rem] truncate">{a.original_filename}</span>
             <span className="text-[0.65rem] uppercase tracking-wide opacity-80">
-              {blocked ? "model can't read images" : EXTRACT_STATUS_LABEL[a.extract_status]}
+              {blocked ? "model can't read images" : statusLabel(a)}
             </span>
             <button
               type="button"
@@ -75,8 +81,10 @@ export function SentAttachmentChips({
   attachments: Attachment[];
 }) {
   if (attachments.length === 0) return null;
-  const images = attachments.filter((a) => a.extract_status === "passthrough");
-  const files = attachments.filter((a) => a.extract_status !== "passthrough");
+  // Only real images get a thumbnail; a scanned PDF is served as a download, so it stays a chip.
+  const isImage = (a: Attachment) => a.extract_status === "passthrough" && a.mime.startsWith("image/");
+  const images = attachments.filter(isImage);
+  const files = attachments.filter((a) => !isImage(a));
   return (
     <div className="mt-1.5 flex flex-col items-end gap-1.5">
       <ImageThumbnails
@@ -92,7 +100,7 @@ export function SentAttachmentChips({
               className="flex items-center gap-1 rounded-full border border-border-strong/60 bg-surface-sunk px-2 py-0.5 text-[0.7rem] text-text-muted"
             >
               <span className="max-w-[10rem] truncate">📎 {a.original_filename}</span>
-              <span className="opacity-70">· {EXTRACT_STATUS_LABEL[a.extract_status]}</span>
+              <span className="opacity-70">· {statusLabel(a)}</span>
             </span>
           ))}
         </div>

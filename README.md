@@ -44,8 +44,9 @@ that were deliberately left out.
 - **Feature flags** — user → workspace → percentage rollout → default resolution, cached in Redis
   and invalidated instantly on edit. A per-provider killswitch is the platform's own admin lever.
 - **Attachments** — PDF, DOCX, PPTX, XLSX and text files extract into the next message's context;
-  images (HEIC included) pass through to vision-capable models, show as thumbnails in the thread,
-  and are refused pre-flight by models that can't read them.
+  images (HEIC included) and scanned PDFs (rendered page by page) pass through to vision-capable
+  models, images show as thumbnails in the thread, and both are refused pre-flight by models that
+  can't read them.
 - **Usage and audit** — every generation's (and workflow step's) tokens and cost land in an
   append-only ledger; every privileged action (who invited whom, whose key got rejected, which flag
   got flipped, who registered a tool) lands in an immutable audit trail.

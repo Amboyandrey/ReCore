@@ -429,6 +429,17 @@ class _RecordingBuilder:
         return fake
 
 
+def _scanned_pdf_bytes() -> bytes:
+    """A real one-page, image-only PDF — what a scanned invoice looks like to a text extractor."""
+    from io import BytesIO
+
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (200, 280), color=(255, 255, 255)).save(buffer, format="PDF")
+    return buffer.getvalue()
+
+
 def _png_bytes() -> bytes:
     """The smallest real PNG Pillow will both write and read back."""
     from io import BytesIO
@@ -533,3 +544,44 @@ async def test_an_image_needs_a_vision_model_to_run(
     assert run.status == WorkflowRunStatus.SUCCEEDED
     first_user_turn = next(m for m in builder.built[0].last_messages if m.role == "user")
     assert [image.mime for image in first_user_turn.images] == ["image/png"]
+
+
+async def test_a_scanned_pdf_needs_a_vision_model_and_reaches_it_as_page_images(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    builder = _RecordingBuilder()
+    monkeypatch.setattr("app.workers.run_workflow.build_provider", builder)
+    user, workspace, model, workflow = await _two_step_workflow(db)
+    attachment = await save_attachment(
+        db, workspace_id=workspace.id, workflow_id=workflow.id, uploaded_by=user.id,
+        filename="invoice.pdf", mime="application/pdf", data=_scanned_pdf_bytes(),
+    )
+    run = await start_run(
+        db, workspace_id=workspace.id, workflow=workflow, trigger=WorkflowTrigger.MANUAL,
+        run_input="", started_by=user.id, attachment_ids=[attachment.id],
+    )
+    await db.commit()
+
+    await run_workflow({}, str(run.id), str(workspace.id))
+    steps = await _refresh_run_and_steps(db, run)
+    assert run.status == WorkflowRunStatus.FAILED
+    assert steps[0].error is not None and "can't read images" in steps[0].error
+    assert builder.built == []
+
+    model.supports_vision = True
+    retry = await save_attachment(
+        db, workspace_id=workspace.id, workflow_id=workflow.id, uploaded_by=user.id,
+        filename="invoice.pdf", mime="application/pdf", data=_scanned_pdf_bytes(),
+    )
+    run = await start_run(
+        db, workspace_id=workspace.id, workflow=workflow, trigger=WorkflowTrigger.MANUAL,
+        run_input="", started_by=user.id, attachment_ids=[retry.id],
+    )
+    await db.commit()
+
+    await run_workflow({}, str(run.id), str(workspace.id))
+    await db.refresh(run)
+    assert run.status == WorkflowRunStatus.SUCCEEDED
+    first_user_turn = next(m for m in builder.built[0].last_messages if m.role == "user")
+    assert [image.mime for image in first_user_turn.images] == ["image/jpeg"]
+
