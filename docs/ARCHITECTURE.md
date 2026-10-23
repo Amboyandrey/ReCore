@@ -537,6 +537,9 @@ code-execution surface.
   `{{input}}`, through the exact same code path a chat message's own attachments take (§15) —
   extracted text folded into the prompt, images as native image parts. A step whose model can't
   see images fails with that reason rather than silently dropping them.
+- **A cut-off answer fails its step.** Steps get a 16384-token output budget (chat keeps 4096,
+  since a reasoning model spends part of it thinking), and a reply that stops at that limit fails
+  the step instead of passing a half-written result to the next one.
 - **An inbound webhook per workflow.** Enabling it mints a `webhook_secret`; the public URL
   `POST /hooks/workflows/{workspace_id}/{secret}` starts a run with no session and no CSRF —
   possession of the URL is the credential, the same model an invitation link follows. The
@@ -564,7 +567,9 @@ a run's input (gated by `workflows`, see §14) — exactly one of `conversation_
 set, enforced by a CHECK constraint. Text-bearing formats (PDF, DOCX, PPTX,
 XLSX, plain text) are extracted on upload and folded into the turn's context with a visible
 `[Attached file: name]` marker, so the model's context is never a mystery to the user. Images are
-normalized (HEIC/HEIF included, via pillow-heif) and passed through as native image parts.
+normalized (HEIC/HEIF included, via pillow-heif) and passed through as native image parts. A PDF
+with no text layer (a scan) is rendered page by page with pypdfium2, up to five pages, and sent
+the same way; the original PDF is what's stored and downloaded, its pages saved beside it.
 
 Two details worth keeping:
 

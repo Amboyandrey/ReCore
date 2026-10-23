@@ -5,12 +5,13 @@ Extraction is synchronous, on the request path, and covers what people actually 
 text/markdown/JSON/CSV decoded directly, real parsing for the modern (XML-based) Office formats —
 PDF, DOCX, PPTX, XLSX — and images, normalized (oriented, downscaled, HEIC transcoded to JPEG) and
 handed to the model directly rather than OCR'd, since a vision-capable model reads layout,
-diagrams and handwriting far better than OCR ever will. Anything else is stored but marked
-unsupported: legacy binary Office formats (.doc/.xls/.ppt) need a much heavier tool (LibreOffice
-headless, typically) than a pure-Python library, and audio/video need transcription, not text
-extraction at all — genuinely different features, not a missing case of this one. "Attached" and
-"extracted" are tracked separately, so adding either later is a new branch here, not a schema
-change.
+diagrams and handwriting far better than OCR ever will. A PDF with no text layer (a scan) takes
+the same route, rendered page by page, while the original PDF stays what's stored. Anything else
+is stored but marked unsupported: legacy binary Office formats (.doc/.xls/.ppt) need a much
+heavier tool (LibreOffice headless, typically) than a pure-Python library, and audio/video need
+transcription, not text extraction at all — genuinely different features, not a missing case of
+this one. "Attached" and "extracted" are tracked separately, so adding either later is a new
+branch here, not a schema change.
 """
 
 import asyncio
@@ -20,6 +21,7 @@ from io import BytesIO
 from pathlib import Path
 
 import pillow_heif
+import pypdfium2  # type: ignore[import-untyped]  # ships no py.typed marker
 from docx import Document as DocxDocument
 from openpyxl import load_workbook
 from PIL import Image, ImageOps
@@ -31,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.core.errors import AttachmentNotFound, AttachmentTooLarge
 from app.models import Attachment, AttachmentSource, ExtractStatus
+from app.providers.base import ImagePart
 from app.tools.base import ToolImage
 
 settings = get_settings()
@@ -55,6 +58,10 @@ _HEIC_MIMES = {"image/heic", "image/heif"}
 # similarly. Downscaling here means a 12MB phone photo reaches the model at all, rather than
 # being rejected by the size cap below before it ever gets a chance to shrink.
 MAX_IMAGE_DIMENSION = 1568
+
+# A scanned PDF's pages each cost one image of the request's image budget (see services/chat.py's
+# MAX_HISTORY_IMAGES); supplier invoices and receipts rarely run past a few pages.
+MAX_SCANNED_PDF_PAGES = 5
 
 # Caps how much of one file's text reaches the model — a single huge document otherwise crowds
 # out the rest of the conversation's context budget entirely.
@@ -200,6 +207,29 @@ def _normalize_image(data: bytes, mime: str) -> tuple[bytes, str, ExtractStatus,
         return data, mime, ExtractStatus.FAILED, str(exc)
 
 
+def _render_pdf_pages(data: bytes) -> tuple[list[bytes], int]:
+    """Render up to MAX_SCANNED_PDF_PAGES pages as JPEGs sized like a normalized image, plus the
+    PDF's total page count. Raises on a PDF pdfium can't open; runs in a thread, like
+    _normalize_image."""
+    pdf = pypdfium2.PdfDocument(data)
+    try:
+        pages = []
+        for index in range(min(len(pdf), MAX_SCANNED_PDF_PAGES)):
+            page = pdf[index]
+            scale = MAX_IMAGE_DIMENSION / max(page.get_size())
+            buffer = BytesIO()
+            page.render(scale=scale).to_pil().convert("RGB").save(buffer, format="JPEG", quality=85)
+            pages.append(buffer.getvalue())
+        return pages, len(pdf)
+    finally:
+        pdf.close()
+
+
+def _page_path(storage_key: str, number: int) -> Path:
+    """Where page `number` (from 1) of a scanned PDF is stored, next to the PDF itself."""
+    return Path(settings.storage_dir) / f"{storage_key}.page-{number}"
+
+
 async def save_attachment(
     db: AsyncSession,
     *,
@@ -224,6 +254,20 @@ async def save_attachment(
     else:
         extracted_text, extract_status, extract_error = extract_text(data, mime)
 
+    pages: list[bytes] = []
+    if mime == _PDF_MIME and extract_status == ExtractStatus.FAILED:
+        try:
+            pages, total_pages = await asyncio.to_thread(_render_pdf_pages, data)
+        except Exception:  # noqa: BLE001 — pdfium can't open it either, so pypdf's own failure stands
+            pages, total_pages = [], 0
+        if pages:
+            extract_status, extract_error = ExtractStatus.PASSTHROUGH, None
+            if total_pages > len(pages):
+                extracted_text = (
+                    f"[Scanned PDF: only the first {len(pages)} of {total_pages} pages "
+                    "are attached as images.]"
+                )
+
     # Checked after normalization, not before: the whole point of downscaling is that a 10-12MB
     # phone photo reaches the model at all, rather than being rejected here before it ever
     # shrinks. Non-image files are untouched above, so this behaves exactly as it did before.
@@ -235,6 +279,8 @@ async def save_attachment(
     path = Path(settings.storage_dir) / storage_key
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
+    for number, page in enumerate(pages, start=1):
+        _page_path(storage_key, number).write_bytes(page)
 
     attachment = Attachment(
         id=attachment_id,
@@ -303,6 +349,22 @@ def read_attachment_bytes(attachment: Attachment) -> bytes:
     `path.write_bytes()` call above: these are local files under a bind-mounted volume, not a
     network store, so there's no request-serving benefit to a thread hop here."""
     return (Path(settings.storage_dir) / attachment.storage_key).read_bytes()
+
+
+def read_attachment_images(attachment: Attachment) -> list[ImagePart]:
+    """What a model reads of an attachment as images: an image is itself, a scanned PDF is its
+    rendered pages in order, and anything with extracted text instead is nothing."""
+    if attachment.extract_status != ExtractStatus.PASSTHROUGH:
+        return []
+    if attachment.mime != _PDF_MIME:
+        return [ImagePart(mime=attachment.mime, data=read_attachment_bytes(attachment))]
+    images = []
+    for number in range(1, MAX_SCANNED_PDF_PAGES + 1):
+        path = _page_path(attachment.storage_key, number)
+        if not path.exists():
+            break
+        images.append(ImagePart(mime="image/jpeg", data=path.read_bytes()))
+    return images
 
 
 async def list_attachments(db: AsyncSession, *, conversation_id: uuid.UUID) -> list[Attachment]:

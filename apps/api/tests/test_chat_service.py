@@ -285,6 +285,25 @@ async def _add_member(db: AsyncSession, *, workspace_id: uuid.UUID, email: str) 
     return user
 
 
+async def _upload_scanned_pdf(
+    db: AsyncSession, *, workspace_id: uuid.UUID, conversation_id: uuid.UUID, uploaded_by: uuid.UUID
+) -> Attachment:
+    """Upload a real two-page, image-only PDF through the attachment service, so it comes out
+    rendered to page images and marked `passthrough` exactly as a scanned invoice would."""
+    pages = [Image.new("RGB", (200, 280), color=(255, 255, 255)) for _ in range(2)]
+    buffer = BytesIO()
+    pages[0].save(buffer, format="PDF", save_all=True, append_images=pages[1:])
+    return await save_attachment(
+        db,
+        workspace_id=workspace_id,
+        conversation_id=conversation_id,
+        uploaded_by=uploaded_by,
+        filename="invoice.pdf",
+        mime="application/pdf",
+        data=buffer.getvalue(),
+    )
+
+
 async def _upload_image(
     db: AsyncSession, *, workspace_id: uuid.UUID, conversation_id: uuid.UUID, uploaded_by: uuid.UUID
 ) -> Attachment:
@@ -880,6 +899,78 @@ async def test_an_attached_image_reaches_the_provider_as_an_image_part(
     assert len(sent_turn.images) == 1
     assert sent_turn.images[0].mime == "image/png"
     assert isinstance(sent_turn.images[0], ImagePart)
+
+
+async def test_a_scanned_pdf_reaches_the_provider_as_page_images(
+    db: AsyncSession, redis_client: Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scanned PDF is sent the way a photo is: one native image part per rendered page, never
+    the PDF's own bytes labelled as an image."""
+    user, workspace, model = await _workspace_with_model(db)
+    model.supports_vision = True
+    await db.flush()
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+    attachment = await _upload_scanned_pdf(
+        db, workspace_id=workspace.id, conversation_id=conversation.id, uploaded_by=user.id
+    )
+    await db.commit()
+
+    captured: list[FakeProvider] = []
+
+    def _capturing_build_provider(
+        provider: Provider, *, api_key: str, base_url: str | None
+    ) -> FakeProvider:
+        instance = FakeProvider(api_key=api_key, base_url=base_url)
+        captured.append(instance)
+        return instance
+
+    monkeypatch.setattr("app.services.chat.build_provider", _capturing_build_provider)
+
+    generation_id = await send_message(
+        db,
+        redis_client,
+        workspace_id=workspace.id,
+        conversation=conversation,
+        content="What's on this invoice?",
+        idempotency_key=None,
+        attachment_ids=[attachment.id],
+    )
+    async for _ in read_events(redis_client, generation_id, block_ms=50):
+        pass
+
+    assert len(captured) == 1
+    sent_turn = captured[0].last_messages[-1]
+    assert [image.mime for image in sent_turn.images] == ["image/jpeg", "image/jpeg"]
+
+
+async def test_a_scanned_pdf_on_a_non_vision_model_is_rejected_pre_flight(
+    db: AsyncSession, redis_client: Redis
+) -> None:
+    """A scan is only readable as images, so it needs a vision model exactly as a photo does."""
+    user, workspace, model = await _workspace_with_model(db)  # supports_vision defaults to False
+    conversation = await create_conversation(
+        db, workspace_id=workspace.id, user=user, model_id=model.id, system_prompt=None
+    )
+    await db.commit()
+    attachment = await _upload_scanned_pdf(
+        db, workspace_id=workspace.id, conversation_id=conversation.id, uploaded_by=user.id
+    )
+    await db.commit()
+
+    with pytest.raises(ModelDoesNotSupportImages):
+        await send_message(
+            db,
+            redis_client,
+            workspace_id=workspace.id,
+            conversation=conversation,
+            content="What's on this invoice?",
+            idempotency_key=None,
+            attachment_ids=[attachment.id],
+        )
+    await db.rollback()
 
 
 async def test_an_image_on_a_non_vision_model_is_rejected_pre_flight(
